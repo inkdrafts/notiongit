@@ -26,6 +26,12 @@ wrangler secret put NOTION_CLIENT_SECRET --env staging
 Repeat for `production`. `.dev.vars.example` contains placeholders only; copy it
 to `.dev.vars` for local work if a future handler needs the names.
 
+The GitHub App registration, permission matrix, callback URLs, non-secret App
+identity variables, and rotation procedure are maintained in the
+[`GitHub App runbook`](github-app-runbook.md). `GITHUB_APP_ID` and
+`GITHUB_APP_SLUG` are configuration values; the App private key and OAuth
+client secret remain Cloudflare secrets.
+
 ## Deployment
 
 Run `bun run build` for the dry-run check. The manual Deploy workflow accepts a
