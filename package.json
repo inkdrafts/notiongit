@@ -1,0 +1,16 @@
+{
+  "name": "notiongit",
+  "private": true,
+  "workspaces": [
+    "spikes/libsodium-workers"
+  ],
+  "scripts": {
+    "test": "npm test --workspace libsodium-workers-spike",
+    "typecheck": "npm run typecheck --workspace libsodium-workers-spike",
+    "deploy:dry-run": "npm run deploy:dry-run --workspace libsodium-workers-spike"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "workerd": true
+  }
+}
