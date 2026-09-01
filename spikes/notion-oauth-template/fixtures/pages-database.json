@@ -1,0 +1,24 @@
+{
+  "object": "database",
+  "id": "SYNTHETIC-pages-db-00000000-0000-0000-0000-000000000001",
+  "title": [{ "type": "text", "text": { "content": "My Renamed Website Sections" } }],
+  "properties": {
+    "Title": { "type": "title", "title": {} },
+    "Slug": { "type": "rich_text", "rich_text": {} },
+    "Type": {
+      "type": "select",
+      "select": { "options": [{ "name": "home" }, { "name": "blog-list" }, { "name": "markdown" }] }
+    },
+    "Nav Order": { "type": "number", "number": { "format": "number" } },
+    "Show in Nav": { "type": "checkbox", "checkbox": {} },
+    "Status": {
+      "type": "select",
+      "select": { "options": [{ "name": "Draft" }, { "name": "Published" }] }
+    },
+    "Description": { "type": "rich_text", "rich_text": {} },
+    "Name": { "type": "rich_text", "rich_text": {} },
+    "Profile Picture": { "type": "rich_text", "rich_text": {} },
+    "Tagline": { "type": "rich_text", "rich_text": {} },
+    "Social Links": { "type": "rich_text", "rich_text": {} }
+  }
+}

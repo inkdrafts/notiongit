@@ -1,0 +1,27 @@
+{
+  "object": "list",
+  "results": [
+    {
+      "object": "block",
+      "id": "SYNTHETIC-pages-db-00000000-0000-0000-0000-000000000001",
+      "type": "child_database",
+      "child_database": { "title": "My Renamed Website Sections" }
+    },
+    {
+      "object": "block",
+      "id": "SYNTHETIC-block-00000000-0000-0000-0000-0000000000a2",
+      "type": "paragraph",
+      "paragraph": { "rich_text": [{ "type": "text", "text": { "content": "Welcome! Edit the databases below." } }] }
+    },
+    {
+      "object": "block",
+      "id": "SYNTHETIC-posts-db-00000000-0000-0000-0000-000000000002",
+      "type": "child_database",
+      "child_database": { "title": "Untitled" }
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false,
+  "type": "block",
+  "block": {}
+}
