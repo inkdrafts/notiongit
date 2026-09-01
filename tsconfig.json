@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "types": [],
+    "typeRoots": ["spikes/libsodium-workers/node_modules/@types"]
+  },
+  "include": [
+    "src",
+    "spikes/libsodium-workers/node_modules/@cloudflare/workers-types/index.d.ts"
+  ]
+}

@@ -6,9 +6,11 @@
     "spikes/notion-oauth-template"
   ],
   "scripts": {
-    "test": "bun run --filter libsodium-workers-spike test && bun run --filter notion-oauth-template-spike test",
-    "typecheck": "bun run --filter libsodium-workers-spike typecheck",
-    "deploy:dry-run": "bun run --filter libsodium-workers-spike deploy:dry-run"
+    "test": "bun test test/index.test.ts && bun run --filter libsodium-workers-spike test && bun run --filter notion-oauth-template-spike test",
+    "typecheck": "spikes/libsodium-workers/node_modules/.bin/tsc -p tsconfig.json && bun run --filter libsodium-workers-spike typecheck",
+    "build": "spikes/libsodium-workers/node_modules/.bin/wrangler deploy --dry-run --env=\"\"",
+    "deploy:dry-run": "bun run build",
+    "dev": "spikes/libsodium-workers/node_modules/.bin/wrangler dev"
   },
   "trustedDependencies": [
     "esbuild",
