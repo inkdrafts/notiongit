@@ -97,13 +97,12 @@ manual registration.
   production callback URLs registered together (`callback_urls` accepts a
   list), rather than the previously ambiguous two-column table that could be
   read as implying two separate Apps.
-- Actual registration (the manifest submission, private key generation, and
-  Cloudflare secret population) still requires a human `inkdrafts` org owner
-  with a browser; this session confirmed via `gh api` that the currently
-  authenticated account (`leandro-llosa`) holds `admin` (owner-equivalent)
-  role in the `inkdrafts` organization and can perform it. This session did
-  not perform it — no browser is available here — so issue #4's development
-  install criterion remains open until a human completes it.
+- Registration completed on 2026-09-01 through the manifest conversion flow.
+  The organization-owned App is `github.com/apps/inkdrafts`, App ID `4798518`;
+  its private key, client ID, and client secret are stored as Cloudflare
+  secrets in both `staging` and `production`. No Marketplace draft or listing
+  was created or submitted. Issue #4's development-install criterion remains
+  open until the smoke test is completed.
 - The development-environment callback URL depends on the Cloudflare Workers
   staging hostname, which is not knowable until staging is actually deployed;
   `docs/github-app-manifest.html` keeps this as an explicit field to fill in

@@ -2,7 +2,8 @@
 
 This runbook is the source of truth for the InkDrafts GitHub App registration,
 the Cloudflare secret names, and the operator checks around the registration.
-It intentionally contains no App ID, client secret, private key, or token.
+The App ID and slug are non-secret configuration values. This file contains no
+client secret, private key, webhook secret, OAuth code, or token.
 
 ## Registration status
 
@@ -20,17 +21,21 @@ public (and therefore installable) from registration, but stays unadvertised
 (no link from `inkdrafts.com`, no Marketplace listing) until the M5 launch
 issue. ADR 0003 also records the two rejected alternatives and why.
 
-Actual registration (submitting the manifest, generating the private key and
-client secret, and populating the Cloudflare secrets below) still requires a
-human `inkdrafts` organization owner with a browser; it has not been
-performed as of this decision being recorded. Do not mark issue #4's
-development-install acceptance criterion complete until that smoke test
-actually happens and its result is recorded in the closing PR.
+**Registered 2026-09-01.** The organization-owned App is
+[`inkdrafts`](https://github.com/apps/inkdrafts), App ID `4798518`. The
+manifest conversion completed successfully, and its generated private key,
+client ID, and client secret were written directly to the approved Cloudflare
+secret stores for both `staging` and `production`. No secret value was written
+to this repository or printed during verification. No GitHub Marketplace draft
+or listing was created or submitted. The development-install acceptance
+criterion remains open until the smoke test below is completed and recorded in
+the closing PR.
 
 ## Registering the App
 
-Use [`docs/github-app-manifest.html`](github-app-manifest.html) — it encodes
-every setting below so nothing has to be retyped by hand:
+The App is already registered; do not repeat this flow unless the existing App
+is intentionally being replaced. [`docs/github-app-manifest.html`](github-app-manifest.html)
+encodes every setting below so nothing has to be retyped by hand:
 
 1. Open `docs/github-app-manifest.html` locally in a browser, signed in as an
    `inkdrafts` organization owner (`admin` role).
@@ -41,20 +46,24 @@ every setting below so nothing has to be retyped by hand:
    the staging callback can be added later (step 6) once the hostname is
    known. Registering the App does not require Cloudflare Workers to exist
    yet; the two are independent.
-3. Review the rendered manifest JSON on the page, then submit. GitHub creates
-   the App and redirects to `https://inkdrafts.com/` with a one-time `?code=`
-   query parameter — this can be ignored; the App is managed afterward
-   through its normal GitHub settings page, not the manifest conversion API.
-4. On the new App's settings page, generate a private key and a client
-   secret (see "Values and approved secret storage" below for where they
-   go), and record the App ID and slug.
+3. Review the rendered manifest JSON on the page, then submit. GitHub redirects
+   to `https://inkdrafts.com/` with a one-time `?code=` query parameter. The
+   code is sensitive and expires after one hour. Do not print it, put it in a
+   command-line argument, or paste it into chat, an issue, or a commit.
+4. Complete the manifest handshake by sending that code server-side to
+   `POST /app-manifests/{code}/conversions` within one hour. Registration is
+   not complete until this succeeds. The response contains the generated
+   private key, client secret, webhook secret, App ID, slug, and other App
+   metadata. Write the private key, client ID, and client secret directly to
+   the approved stores below without logging them. Discard the unused webhook
+   secret because webhook delivery is disabled.
 5. Confirm the App was **not** submitted to GitHub Marketplace. Manifest
    creation never does this on its own, but verify the setting explicitly.
 6. Once staging is deployed and its real hostname is known, add
    `https://<staging hostname>/auth/github/callback` to the App's Callback
    URLs in its settings page. This does not require re-registering the App.
 
-If the manifest flow cannot be used, register manually at
+If the manifest conversion cannot be completed securely, register manually at
 [`inkdrafts` organization App settings](https://github.com/organizations/inkdrafts/settings/apps/new)
 using the target settings below — they are identical to what the manifest
 encodes.
@@ -133,8 +142,8 @@ credentials:
 
 | Variable | Value | Rotation |
 | --- | --- | --- |
-| `GITHUB_APP_ID` | App ID shown in the App settings | Stable for the App |
-| `GITHUB_APP_SLUG` | Public slug from the App URL/settings | Stable unless the App is renamed |
+| `GITHUB_APP_ID` | `4798518` | Stable for the App |
+| `GITHUB_APP_SLUG` | `inkdrafts` | Stable unless the App is renamed |
 
 Store these server-only values as Cloudflare secrets in **both** staging and
 production. `wrangler secret put` prompts interactively; paste the value into
