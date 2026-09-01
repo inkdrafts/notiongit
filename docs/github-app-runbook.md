@@ -34,8 +34,13 @@ every setting below so nothing has to be retyped by hand:
 
 1. Open `docs/github-app-manifest.html` locally in a browser, signed in as an
    `inkdrafts` organization owner (`admin` role).
-2. Enter the real Cloudflare Workers staging hostname in the form field; the
-   development callback URL in the manifest preview updates as you type.
+2. If staging is already deployed, enter its real Cloudflare Workers hostname
+   in the form field; the development callback URL in the manifest preview
+   updates as you type. **If staging hasn't been deployed yet, leave it
+   blank** — the App registers with only the production callback URL, and
+   the staging callback can be added later (step 6) once the hostname is
+   known. Registering the App does not require Cloudflare Workers to exist
+   yet; the two are independent.
 3. Review the rendered manifest JSON on the page, then submit. GitHub creates
    the App and redirects to `https://inkdrafts.com/` with a one-time `?code=`
    query parameter — this can be ignored; the App is managed afterward
@@ -45,6 +50,9 @@ every setting below so nothing has to be retyped by hand:
    go), and record the App ID and slug.
 5. Confirm the App was **not** submitted to GitHub Marketplace. Manifest
    creation never does this on its own, but verify the setting explicitly.
+6. Once staging is deployed and its real hostname is known, add
+   `https://<staging hostname>/auth/github/callback` to the App's Callback
+   URLs in its settings page. This does not require re-registering the App.
 
 If the manifest flow cannot be used, register manually at
 [`inkdrafts` organization App settings](https://github.com/organizations/inkdrafts/settings/apps/new)
@@ -65,8 +73,10 @@ Both callback URLs below are registered on the **same** App
 | Callback URL | `https://notiongit-staging.<account>.workers.dev/auth/github/callback` | `https://inkdrafts.com/auth/github/callback` |
 | Setup URL | blank when OAuth during installation is enabled | blank when OAuth during installation is enabled |
 
-Replace `<account>` with the actual Cloudflare Workers staging hostname.
-Keep callback URLs exact; do not enable wildcard matching.
+Replace `<account>` with the actual Cloudflare Workers staging hostname once
+staging is deployed; until then the App can be registered with only the
+production callback URL and the staging one added later (see "Registering
+the App" above). Keep callback URLs exact; do not enable wildcard matching.
 
 Enable or select:
 
