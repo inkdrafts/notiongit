@@ -6,48 +6,67 @@ It intentionally contains no App ID, client secret, private key, or token.
 
 ## Registration status
 
-The App registration is pending a visibility decision. GitHub's current rules
-do not allow all of the requested constraints to be true at once:
+**Decision recorded 2026-09-01 — see
+[ADR 0003](decisions/0003-github-app-visibility.md).** GitHub's rules do not
+allow all of the originally requested constraints to be true at once: a
+private App can be installed only on the account that owns it, so an
+`inkdrafts`-owned private App could never be installed into an arbitrary
+user's personal account — which is the product's entire onboarding flow.
 
-| Requirement | Consequence |
-| --- | --- |
-| Owner is the `inkdrafts` organization | The App is managed from the organization settings. |
-| Visibility is private | The App can be installed only on its owning organization. |
-| Users install into their personal accounts | The App must be public. |
+**Chosen model: public, direct-install App, owned by the `inkdrafts`
+organization, not listed in GitHub Marketplace.** This supersedes the
+original "private until M5" constraint with "unlisted until M5" — the App is
+public (and therefore installable) from registration, but stays unadvertised
+(no link from `inkdrafts.com`, no Marketplace listing) until the M5 launch
+issue. ADR 0003 also records the two rejected alternatives and why.
 
-Choose one of these operating models before registering the App:
+Actual registration (submitting the manifest, generating the private key and
+client secret, and populating the Cloudflare secrets below) still requires a
+human `inkdrafts` organization owner with a browser; it has not been
+performed as of this decision being recorded. Do not mark issue #4's
+development-install acceptance criterion complete until that smoke test
+actually happens and its result is recorded in the closing PR.
 
-1. **Public, direct-install App (product model):** supports personal-account
-   onboarding and is not listed in GitHub Marketplace. This requires changing
-   the current private-until-M5 constraint.
-2. **Private organization App (development model):** preserves the current
-   private constraint, but the development install must target the `inkdrafts`
-   organization. It does not validate personal-account onboarding.
-3. **Separate private development App:** use an App owned by a maintainer's
-   personal account for a single-account smoke test. It still cannot support
-   general personal-account onboarding.
+## Registering the App
 
-Do not mark the App registration complete until the chosen model is recorded
-on issue #4 and the setting matches it. In every model, do not list the App in
-GitHub Marketplace.
+Use [`docs/github-app-manifest.html`](github-app-manifest.html) — it encodes
+every setting below so nothing has to be retyped by hand:
+
+1. Open `docs/github-app-manifest.html` locally in a browser, signed in as an
+   `inkdrafts` organization owner (`admin` role).
+2. Enter the real Cloudflare Workers staging hostname in the form field; the
+   development callback URL in the manifest preview updates as you type.
+3. Review the rendered manifest JSON on the page, then submit. GitHub creates
+   the App and redirects to `https://inkdrafts.com/` with a one-time `?code=`
+   query parameter — this can be ignored; the App is managed afterward
+   through its normal GitHub settings page, not the manifest conversion API.
+4. On the new App's settings page, generate a private key and a client
+   secret (see "Values and approved secret storage" below for where they
+   go), and record the App ID and slug.
+5. Confirm the App was **not** submitted to GitHub Marketplace. Manifest
+   creation never does this on its own, but verify the setting explicitly.
+
+If the manifest flow cannot be used, register manually at
+[`inkdrafts` organization App settings](https://github.com/organizations/inkdrafts/settings/apps/new)
+using the target settings below — they are identical to what the manifest
+encodes.
 
 ## Target settings
 
-An organization owner or authorized App manager should register the App at
-[`inkdrafts` organization App settings](https://github.com/organizations/inkdrafts/settings/apps/new).
-
-Use these values after the visibility decision is made:
+Both callback URLs below are registered on the **same** App
+(`callback_urls` accepts a list); there is no separate development App.
 
 | GitHub setting | Development | Production |
 | --- | --- | --- |
 | App name | `InkDrafts` | `InkDrafts` |
+| Visibility | Public | Public |
+| Listed in GitHub Marketplace | No | No |
 | Homepage URL | `https://inkdrafts.com/` | `https://inkdrafts.com/` |
 | Callback URL | `https://notiongit-staging.<account>.workers.dev/auth/github/callback` | `https://inkdrafts.com/auth/github/callback` |
 | Setup URL | blank when OAuth during installation is enabled | blank when OAuth during installation is enabled |
 
-Replace `<account>` with the actual Cloudflare Workers staging hostname before
-saving the development callback. Keep callback URLs exact; do not enable
-wildcard matching.
+Replace `<account>` with the actual Cloudflare Workers staging hostname.
+Keep callback URLs exact; do not enable wildcard matching.
 
 Enable or select:
 
@@ -169,14 +188,14 @@ The expected names are `GITHUB_APP_PRIVATE_KEY`, `GITHUB_CLIENT_ID`,
 
 ## Install smoke test
 
-Run this only after the visibility/ownership model is approved and the App
-settings and Cloudflare secrets are populated.
+Run this only after the App is registered per "Registering the App" above and
+the Cloudflare secrets are populated.
 
 1. Deploy the current Worker to staging and confirm the exact staging callback
    URL is reachable.
 2. Start the `/connect/github` flow from staging.
-3. Complete installation and OAuth in a disposable development account that is
-   allowed by the selected App visibility model.
+3. Complete installation and OAuth in a disposable personal GitHub account
+   used only for this test.
 4. Confirm the callback identifies the authenticated login and installation
    without exposing or persisting tokens.
 5. Confirm the installation can access only the permission set above.
@@ -188,6 +207,7 @@ settings and Cloudflare secrets are populated.
 ## References
 
 - [Registering a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app)
+- [Registering a GitHub App from a manifest](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest)
 - [Private versus public GitHub Apps](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/making-a-github-app-public-or-private)
 - [User authorization during installation](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)
 - [Managing private keys](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps)

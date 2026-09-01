@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Register the InkDrafts GitHub App</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; color: #1f2328; }
+  pre { background: #f6f8fa; padding: 1rem; overflow-x: auto; border-radius: 6px; }
+  label { display: block; margin-top: 1.5rem; font-weight: 600; }
+  input[type="text"] { width: 100%; padding: 0.5rem; font-family: ui-monospace, monospace; box-sizing: border-box; margin-top: 0.25rem; }
+  button { margin-top: 1.5rem; padding: 0.75rem 1.5rem; font-size: 1rem; cursor: pointer; }
+  .hint { color: #59636e; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>Register the InkDrafts GitHub App</h1>
+<p>
+  Open this file locally in a browser while signed in to GitHub as an
+  <code>inkdrafts</code> organization owner. Fill in the staging hostname,
+  review the manifest, then submit. See
+  <a href="github-app-runbook.md">github-app-runbook.md</a> and
+  <a href="decisions/0003-github-app-visibility.md">ADR 0003</a> for why
+  these settings were chosen.
+</p>
+
+<label for="stagingHost">Cloudflare Workers staging hostname</label>
+<input type="text" id="stagingHost" placeholder="notiongit-staging.&lt;account&gt;.workers.dev" />
+<p class="hint">Required before submitting — the development callback URL in the manifest below updates as you type.</p>
+
+<h2>Manifest that will be submitted</h2>
+<pre id="preview"></pre>
+
+<form id="manifestForm" method="post" action="https://github.com/organizations/inkdrafts/settings/apps/new">
+  <input type="hidden" name="manifest" id="manifestField" />
+  <button type="submit">Create GitHub App for InkDrafts</button>
+</form>
+
+<p class="hint">
+  After submission, GitHub creates the App and redirects to
+  <code>https://inkdrafts.com/</code> with a one-time <code>?code=</code>
+  query parameter — that can be ignored. Manage the App (generate a private
+  key, generate a client secret, confirm it is not submitted to Marketplace)
+  from its normal GitHub settings page, then store the values per
+  "Values and approved secret storage" in the runbook. Never paste the
+  private key or client secret back into this page, a commit, or an issue.
+</p>
+
+<script>
+function manifest() {
+  var stagingHost = document.getElementById('stagingHost').value.trim();
+  var devCallback = stagingHost
+    ? ('https://' + stagingHost + '/auth/github/callback')
+    : 'https://notiongit-staging.<account>.workers.dev/auth/github/callback';
+  return {
+    name: 'InkDrafts',
+    url: 'https://inkdrafts.com/',
+    description: 'Provisions a Notion-managed Jekyll site into your own GitHub account and enables GitHub Pages.',
+    public: true,
+    redirect_url: 'https://inkdrafts.com/',
+    callback_urls: [
+      devCallback,
+      'https://inkdrafts.com/auth/github/callback'
+    ],
+    request_oauth_on_install: true,
+    setup_on_update: false,
+    default_permissions: {
+      metadata: 'read',
+      administration: 'write',
+      contents: 'write',
+      secrets: 'write',
+      actions: 'write',
+      pages: 'write'
+    }
+  };
+}
+
+function render() {
+  var m = manifest();
+  document.getElementById('preview').textContent = JSON.stringify(m, null, 2);
+  document.getElementById('manifestField').value = JSON.stringify(m);
+}
+
+document.getElementById('stagingHost').addEventListener('input', render);
+document.getElementById('manifestForm').addEventListener('submit', function (e) {
+  if (!document.getElementById('stagingHost').value.trim()) {
+    e.preventDefault();
+    alert('Enter the Cloudflare Workers staging hostname before submitting.');
+    return;
+  }
+  render();
+});
+render();
+</script>
+</body>
+</html>
