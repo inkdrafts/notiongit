@@ -10,8 +10,25 @@ server-only.
 ## Environments and secrets
 
 `wrangler.toml` has separate `staging` and `production` KV and Queue bindings.
-Create the namespaces and queues before deploying, then replace the placeholder
-KV IDs. Local development uses Wrangler's local binding emulators.
+Both are created and deployed (2026-09-01) under Cloudflare account
+`58fbcc5baba3339f96fe72fe81f5ee6f` (account ID is non-secret configuration,
+like the App ID below; never commit an API token), workers.dev subdomain
+`notiongit`:
+
+| Environment | Worker name | URL |
+| --- | --- | --- |
+| staging | `notiongit-staging` | `https://notiongit-staging.notiongit.workers.dev` |
+| production | `notiongit` | `https://notiongit.notiongit.workers.dev` |
+
+Each has served `GET /healthz` successfully. Local development uses
+Wrangler's local binding emulators instead of these live resources.
+
+The manual Deploy GitHub Action workflow additionally needs
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets, which
+are **not yet set** — set them with `gh secret set` (never paste the token
+into a commit, issue, or chat) before relying on that workflow; deploying
+locally with an authenticated `wrangler` CLI, as done here, does not need
+them.
 
 Set secrets with Wrangler; values are never committed or placed in browser code:
 

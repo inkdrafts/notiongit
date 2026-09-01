@@ -4,12 +4,12 @@ compatibility_date = "2026-08-31"
 workers_dev = true
 preview_urls = true
 
-# Create the production namespace with `wrangler kv namespace create JOBS` and
-# replace this placeholder before deploying. Local development uses an isolated
-# in-memory namespace automatically.
+# Same live namespace as [env.production] below — this repo's top-level
+# config and env.production share the Worker name "notiongit". Local
+# development uses an isolated in-memory namespace automatically.
 [[kv_namespaces]]
 binding = "JOBS"
-id = "00000000000000000000000000000000"
+id = "59f940cb5bde46e0ad0a4fe4ccba5919"
 
 # Create this queue once with `wrangler queues create notiongit-provisioning`.
 [[queues.producers]]
@@ -22,15 +22,14 @@ queue = "notiongit-provisioning"
 max_batch_size = 10
 max_batch_timeout = 5
 
-# Non-production environments use separate resources and names. Replace the
-# KV IDs after creating each namespace; never put secrets in this file.
+# Non-production environments use separate resources and names.
 [env.staging]
 name = "notiongit-staging"
 workers_dev = true
 
 [[env.staging.kv_namespaces]]
 binding = "JOBS"
-id = "00000000000000000000000000000000"
+id = "be672c41171a41f287dc4ff1ca32ba24"
 
 [[env.staging.queues.producers]]
 binding = "PROVISIONING_QUEUE"
@@ -47,7 +46,7 @@ workers_dev = true
 
 [[env.production.kv_namespaces]]
 binding = "JOBS"
-id = "00000000000000000000000000000000"
+id = "59f940cb5bde46e0ad0a4fe4ccba5919"
 
 [[env.production.queues.producers]]
 binding = "PROVISIONING_QUEUE"
