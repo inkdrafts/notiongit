@@ -1,0 +1,9 @@
+name = "notiongit-libsodium-spike"
+main = "src/worker.ts"
+compatibility_date = "2026-08-31"
+workers_dev = true
+preview_urls = true
+
+[alias]
+libsodium = "./src/libsodium-worker.ts"
+libsodium-raw = "./node_modules/libsodium/dist/modules-esm/libsodium.mjs"

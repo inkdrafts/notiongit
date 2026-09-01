@@ -1,0 +1,16 @@
+{
+  "name": "notiongit",
+  "private": true,
+  "workspaces": [
+    "spikes/libsodium-workers"
+  ],
+  "scripts": {
+    "test": "bun run --filter libsodium-workers-spike test",
+    "typecheck": "bun run --filter libsodium-workers-spike typecheck",
+    "deploy:dry-run": "bun run --filter libsodium-workers-spike deploy:dry-run"
+  },
+  "trustedDependencies": [
+    "esbuild",
+    "workerd"
+  ]
+}
