@@ -1,0 +1,10 @@
+{
+  "object": "database",
+  "id": "SYNTHETIC-unrelated-db-00000000-0000-0000-0000-000000000003",
+  "title": [{ "type": "text", "text": { "content": "Grocery List" } }],
+  "properties": {
+    "Name": { "type": "title", "title": {} },
+    "Quantity": { "type": "number", "number": { "format": "number" } },
+    "Bought": { "type": "checkbox", "checkbox": {} }
+  }
+}

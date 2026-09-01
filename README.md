@@ -3,7 +3,8 @@ Notion + Git deployment service: provisions a Notion-powered Jekyll site into a 
 
 ## Development
 
-Install dependencies and run the repository checks from the root:
+Install dependencies and run the repository checks from the root with
+[Bun](https://bun.sh):
 
 ```sh
 bun install --frozen-lockfile
@@ -26,3 +27,8 @@ the namespace ID returned by Wrangler and create the provisioning queues. The
 staging and production bindings are intentionally separate. See
 [`docs/architecture.md`](docs/architecture.md) for environment setup, secret
 names, and the deployment workflow.
+
+The Notion OAuth template-duplication spike is documented in
+[`spikes/notion-oauth-template/README.md`](spikes/notion-oauth-template/README.md), and
+the Notion onboarding decision is recorded in
+[`docs/decisions/0002-notion-onboarding.md`](docs/decisions/0002-notion-onboarding.md).

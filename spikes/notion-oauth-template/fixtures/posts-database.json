@@ -1,0 +1,19 @@
+{
+  "object": "database",
+  "id": "SYNTHETIC-posts-db-00000000-0000-0000-0000-000000000002",
+  "title": [{ "type": "text", "text": { "content": "Untitled" } }],
+  "properties": {
+    "Title": { "type": "title", "title": {} },
+    "Slug": { "type": "rich_text", "rich_text": {} },
+    "Status": {
+      "type": "select",
+      "select": { "options": [{ "name": "Draft" }, { "name": "Published" }] }
+    },
+    "Publish Date": { "type": "date", "date": {} },
+    "Tags": { "type": "multi_select", "multi_select": { "options": [] } },
+    "Cover Image": { "type": "rich_text", "rich_text": {} },
+    "Description": { "type": "rich_text", "rich_text": {} },
+    "Canonical URL": { "type": "url", "url": {} },
+    "Featured": { "type": "checkbox", "checkbox": {} }
+  }
+}

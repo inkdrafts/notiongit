@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 
 const url = process.argv[2] ?? process.env.WORKER_URL;
 if (!url) {
-  throw new Error('Usage: npm run smoke -- https://<preview-host>');
+  throw new Error('Usage: bun run smoke -- https://<preview-host>');
 }
 
 async function readExperiment() {
