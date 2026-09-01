@@ -4,6 +4,10 @@ compatibility_date = "2026-08-31"
 workers_dev = true
 preview_urls = true
 
+[vars]
+GITHUB_APP_ID = "4798518"
+GITHUB_APP_SLUG = "inkdrafts"
+
 # Same live namespace as [env.production] below — this repo's top-level
 # config and env.production share the Worker name "notiongit". Local
 # development uses an isolated in-memory namespace automatically.
@@ -27,6 +31,10 @@ max_batch_timeout = 5
 name = "notiongit-staging"
 workers_dev = true
 
+[env.staging.vars]
+GITHUB_APP_ID = "4798518"
+GITHUB_APP_SLUG = "inkdrafts"
+
 [[env.staging.kv_namespaces]]
 binding = "JOBS"
 id = "be672c41171a41f287dc4ff1ca32ba24"
@@ -43,6 +51,10 @@ max_batch_timeout = 5
 [env.production]
 name = "notiongit"
 workers_dev = true
+
+[env.production.vars]
+GITHUB_APP_ID = "4798518"
+GITHUB_APP_SLUG = "inkdrafts"
 
 [[env.production.kv_namespaces]]
 binding = "JOBS"

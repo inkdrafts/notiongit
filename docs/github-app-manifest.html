@@ -15,6 +15,12 @@
 <body>
 <h1>Register the InkDrafts GitHub App</h1>
 <p>
+  <strong>Status:</strong> The App was registered successfully on 2026-09-01
+  as <code>github.com/apps/inkdrafts</code> (App ID <code>4798518</code>).
+  Do not submit this manifest again unless the existing App is intentionally
+  being replaced.
+</p>
+<p>
   Open this file locally in a browser while signed in to GitHub as an
   <code>inkdrafts</code> organization owner. Review the manifest, then
   submit. See <a href="github-app-runbook.md">github-app-runbook.md</a> and
@@ -42,13 +48,15 @@
 </form>
 
 <p class="hint">
-  After submission, GitHub creates the App and redirects to
-  <code>https://inkdrafts.com/</code> with a one-time <code>?code=</code>
-  query parameter — that can be ignored. Manage the App (generate a private
-  key, generate a client secret, confirm it is not submitted to Marketplace)
-  from its normal GitHub settings page, then store the values per
-  "Values and approved secret storage" in the runbook. Never paste the
-  private key or client secret back into this page, a commit, or an issue.
+  After submission, GitHub redirects to <code>https://inkdrafts.com/</code>
+  with a one-time <code>?code=</code> query parameter. The code must be
+  exchanged within one hour using GitHub's
+  <code>POST /app-manifests/{code}/conversions</code> endpoint; registration is
+  not complete until that exchange succeeds. The response contains the App's
+  private key and client secret, so perform the exchange server-side and write
+  those values directly to the approved secret stores described in the
+  runbook. Never paste the code, private key, or client secret into this page,
+  a commit, an issue, chat, or command-line arguments.
 </p>
 
 <script>
