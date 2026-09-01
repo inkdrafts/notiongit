@@ -2,8 +2,15 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
-import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { test } from 'bun:test';
 import sodium from 'libsodium-wrappers';
+
+const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const WRANGLER_BIN = fileURLToPath(
+  new URL('../node_modules/.bin/wrangler', import.meta.url),
+);
+const STARTUP_TIMEOUT_MS = 30_000;
 
 const SYNTHETIC_PLAINTEXT = 'synthetic-actions-secret';
 const SYNTHETIC_PUBLIC_KEY_B64 = 'RwHQhIhFH1RaQJ+1iuPlhYHKQKw/fxFGmM1x3qxzygE=';
@@ -23,12 +30,9 @@ async function availablePort() {
 
 async function startWorker() {
   const port = await availablePort();
-  const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
   const child = spawn(
-    npx,
+    WRANGLER_BIN,
     [
-      '--no-install',
-      'wrangler',
       'dev',
       '--ip',
       '127.0.0.1',
@@ -37,7 +41,7 @@ async function startWorker() {
       '--show-interactive-dev-session=false',
       '--log-level=error',
     ],
-    { cwd: new URL('..', import.meta.url), stdio: ['ignore', 'pipe', 'pipe'] },
+    { cwd: PACKAGE_ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
   );
 
   let output = '';
@@ -79,12 +83,18 @@ async function readExperiment(url) {
   return response.json();
 }
 
-test('sealed boxes round-trip and remain non-deterministic in local workerd', async (t) => {
+test('sealed boxes round-trip and remain non-deterministic in local workerd', async () => {
   const worker = await startWorker();
-  t.after(async () => stopWorker(worker.child));
+  try {
+    await runAssertions(worker.url);
+  } finally {
+    await stopWorker(worker.child);
+  }
+}, STARTUP_TIMEOUT_MS);
 
-  const first = await readExperiment(worker.url);
-  const second = await readExperiment(worker.url);
+async function runAssertions(workerUrl) {
+  const first = await readExperiment(workerUrl);
+  const second = await readExperiment(workerUrl);
 
   assert.equal(first.ok, true);
   assert.equal(second.ok, true);
@@ -119,7 +129,7 @@ test('sealed boxes round-trip and remain non-deterministic in local workerd', as
     assert.equal(sodium.to_string(opened), SYNTHETIC_PLAINTEXT);
   }
 
-  t.diagnostic(
+  console.log(
     JSON.stringify({
       ciphertextLength: first.ciphertextLength,
       initializationCount: second.initializationCount,
@@ -129,4 +139,4 @@ test('sealed boxes round-trip and remain non-deterministic in local workerd', as
       secondTimings: second.timings,
     }),
   );
-});
+}

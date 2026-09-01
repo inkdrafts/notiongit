@@ -106,9 +106,13 @@ Operational failure modes that remain:
 
 ## Consequences and required follow-up
 
-- Keep the version exact and regenerate the Wasm with `npm run wasm:extract`
+- Keep the version exact and regenerate the Wasm with `bun run wasm:extract`
   only when intentionally upgrading. Verify its hash and rerun local and edge
-  tests in the same change.
+  tests in the same change. Keep the explicit `libsodium` dependency version
+  in the spike's `package.json` in sync with the version
+  `libsodium-wrappers` requires, since Bun only symlinks declared
+  dependencies into `node_modules` and the `wrangler.toml` module alias
+  resolves `libsodium` by path.
 - Move the adapter and `sealSecret` into the server-only provisioning layer;
   never include them in browser bundles.
 - Validate GitHub's decoded public key length before encryption and return a

@@ -5,12 +5,12 @@
     "spikes/libsodium-workers"
   ],
   "scripts": {
-    "test": "npm test --workspace libsodium-workers-spike",
-    "typecheck": "npm run typecheck --workspace libsodium-workers-spike",
-    "deploy:dry-run": "npm run deploy:dry-run --workspace libsodium-workers-spike"
+    "test": "bun run --filter libsodium-workers-spike test",
+    "typecheck": "bun run --filter libsodium-workers-spike typecheck",
+    "deploy:dry-run": "bun run --filter libsodium-workers-spike deploy:dry-run"
   },
-  "allowScripts": {
-    "esbuild": true,
-    "workerd": true
-  }
+  "trustedDependencies": [
+    "esbuild",
+    "workerd"
+  ]
 }

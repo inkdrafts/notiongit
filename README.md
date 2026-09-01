@@ -3,12 +3,13 @@ Notion + Git deployment service: provisions a Notion-powered Jekyll site into a 
 
 ## Development
 
-Install dependencies and run the repository checks from the root:
+Install dependencies and run the repository checks from the root with
+[Bun](https://bun.sh):
 
 ```sh
-npm ci
-npm test
-npm run deploy:dry-run
+bun install
+bun run test
+bun run deploy:dry-run
 ```
 
 The initial Cloudflare Workers sealed-box experiment is documented in
