@@ -1,0 +1,10 @@
+{
+  "name": "notiongit",
+  "private": true,
+  "workspaces": [
+    "spikes/notion-oauth-template"
+  ],
+  "scripts": {
+    "test": "npm test --workspace notion-oauth-template-spike"
+  }
+}

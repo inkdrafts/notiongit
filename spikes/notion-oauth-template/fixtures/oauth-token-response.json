@@ -1,0 +1,19 @@
+{
+  "access_token": "SYNTHETIC-ntn-access-token-not-a-real-secret",
+  "token_type": "bearer",
+  "bot_id": "SYNTHETIC-bot-00000000-0000-0000-0000-00000000b001",
+  "workspace_id": "SYNTHETIC-workspace-00000000-0000-0000-0000-0000000w001",
+  "workspace_name": "Redacted Disposable Test Workspace",
+  "workspace_icon": "https://example.com/synthetic-icon.png",
+  "owner": {
+    "type": "user",
+    "user": {
+      "object": "user",
+      "id": "SYNTHETIC-user-00000000-0000-0000-0000-00000000u001",
+      "name": "Redacted Test User",
+      "type": "person",
+      "person": { "email": "redacted@example.com" }
+    }
+  },
+  "duplicated_template_id": "SYNTHETIC-pages-db-00000000-0000-0000-0000-000000000001-PARENT"
+}
