@@ -40,8 +40,8 @@ go/no-go decision.
 From the repository root:
 
 ```sh
-npm ci
-npm test
+bun install
+bun run test
 ```
 
 Or directly in this workspace:

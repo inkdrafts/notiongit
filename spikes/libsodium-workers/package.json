@@ -1,0 +1,24 @@
+{
+  "name": "libsodium-workers-spike",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "bun run typecheck && bun test test/sealed-box.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "smoke": "bun scripts/smoke.mjs",
+    "wasm:extract": "bun scripts/extract-libsodium-wasm.mjs"
+  },
+  "dependencies": {
+    "libsodium": "0.8.4",
+    "libsodium-wrappers": "0.8.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260831.1",
+    "@types/node": "26.4.0",
+    "typescript": "7.0.2",
+    "wrangler": "4.127.1"
+  }
+}
