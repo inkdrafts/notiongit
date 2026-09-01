@@ -28,6 +28,10 @@ staging and production bindings are intentionally separate. See
 [`docs/architecture.md`](docs/architecture.md) for environment setup, secret
 names, and the deployment workflow.
 
+The GitHub App settings, least-privilege permission matrix, callback URLs, and
+credential rotation procedure are documented in
+[`docs/github-app-runbook.md`](docs/github-app-runbook.md).
+
 The Notion OAuth template-duplication spike is documented in
 [`spikes/notion-oauth-template/README.md`](spikes/notion-oauth-template/README.md), and
 the Notion onboarding decision is recorded in

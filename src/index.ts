@@ -10,6 +10,10 @@ export interface Env {
   JOBS: KVNamespace;
   /** Work queue for resumable provisioning jobs. */
   PROVISIONING_QUEUE: Queue<ProvisioningMessage>;
+  /** Non-secret GitHub App identifier from the App settings. */
+  GITHUB_APP_ID: string;
+  /** Non-secret GitHub App slug used to build the installation URL. */
+  GITHUB_APP_SLUG: string;
   /** Server-only secrets configured with `wrangler secret put`. */
   GITHUB_APP_PRIVATE_KEY: string;
   GITHUB_CLIENT_ID: string;

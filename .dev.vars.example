@@ -1,4 +1,6 @@
 # Local-only placeholders. Never put real credentials in this file or in git.
+GITHUB_APP_ID=local-placeholder
+GITHUB_APP_SLUG=local-placeholder
 GITHUB_APP_PRIVATE_KEY=local-placeholder
 GITHUB_CLIENT_ID=local-placeholder
 GITHUB_CLIENT_SECRET=local-placeholder
