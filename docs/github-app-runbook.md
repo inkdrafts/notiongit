@@ -70,13 +70,13 @@ Both callback URLs below are registered on the **same** App
 | Visibility | Public | Public |
 | Listed in GitHub Marketplace | No | No |
 | Homepage URL | `https://inkdrafts.com/` | `https://inkdrafts.com/` |
-| Callback URL | `https://notiongit-staging.<account>.workers.dev/auth/github/callback` | `https://inkdrafts.com/auth/github/callback` |
+| Callback URL | `https://notiongit-staging.notiongit.workers.dev/auth/github/callback` | `https://inkdrafts.com/auth/github/callback` |
 | Setup URL | blank when OAuth during installation is enabled | blank when OAuth during installation is enabled |
 
-Replace `<account>` with the actual Cloudflare Workers staging hostname once
-staging is deployed; until then the App can be registered with only the
-production callback URL and the staging one added later (see "Registering
-the App" above). Keep callback URLs exact; do not enable wildcard matching.
+Staging is deployed (`notiongit-staging.notiongit.workers.dev`, workers.dev
+subdomain `notiongit` — see `docs/architecture.md`), so both callback URLs
+above are real and current. Keep callback URLs exact; do not enable wildcard
+matching.
 
 Enable or select:
 

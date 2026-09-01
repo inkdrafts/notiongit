@@ -23,12 +23,14 @@
 </p>
 
 <label for="stagingHost">Cloudflare Workers staging hostname (optional)</label>
-<input type="text" id="stagingHost" placeholder="notiongit-staging.&lt;account&gt;.workers.dev" />
+<input type="text" id="stagingHost" value="notiongit-staging.notiongit.workers.dev" placeholder="notiongit-staging.&lt;account&gt;.workers.dev" />
 <p class="hint">
-  Leave blank if staging hasn't been deployed yet — the App will register
-  with only the production callback URL below, and you can add the staging
-  callback later from the App's own settings page (Callback URLs accepts a
-  list) once you know the real hostname. No need to redo this flow for that.
+  Pre-filled with the deployed staging Worker's real hostname
+  (<code>notiongit-staging.notiongit.workers.dev</code>). Clear this field if
+  staging isn't deployed yet in your setup — the App will then register with
+  only the production callback URL, and a staging one can be added later from
+  the App's own settings page (Callback URLs accepts a list) without redoing
+  this flow.
 </p>
 
 <h2>Manifest that will be submitted</h2>
