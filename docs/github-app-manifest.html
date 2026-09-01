@@ -16,16 +16,20 @@
 <h1>Register the InkDrafts GitHub App</h1>
 <p>
   Open this file locally in a browser while signed in to GitHub as an
-  <code>inkdrafts</code> organization owner. Fill in the staging hostname,
-  review the manifest, then submit. See
-  <a href="github-app-runbook.md">github-app-runbook.md</a> and
+  <code>inkdrafts</code> organization owner. Review the manifest, then
+  submit. See <a href="github-app-runbook.md">github-app-runbook.md</a> and
   <a href="decisions/0003-github-app-visibility.md">ADR 0003</a> for why
   these settings were chosen.
 </p>
 
-<label for="stagingHost">Cloudflare Workers staging hostname</label>
+<label for="stagingHost">Cloudflare Workers staging hostname (optional)</label>
 <input type="text" id="stagingHost" placeholder="notiongit-staging.&lt;account&gt;.workers.dev" />
-<p class="hint">Required before submitting — the development callback URL in the manifest below updates as you type.</p>
+<p class="hint">
+  Leave blank if staging hasn't been deployed yet — the App will register
+  with only the production callback URL below, and you can add the staging
+  callback later from the App's own settings page (Callback URLs accepts a
+  list) once you know the real hostname. No need to redo this flow for that.
+</p>
 
 <h2>Manifest that will be submitted</h2>
 <pre id="preview"></pre>
@@ -48,19 +52,17 @@
 <script>
 function manifest() {
   var stagingHost = document.getElementById('stagingHost').value.trim();
-  var devCallback = stagingHost
-    ? ('https://' + stagingHost + '/auth/github/callback')
-    : 'https://notiongit-staging.<account>.workers.dev/auth/github/callback';
+  var callbackUrls = ['https://inkdrafts.com/auth/github/callback'];
+  if (stagingHost) {
+    callbackUrls.unshift('https://' + stagingHost + '/auth/github/callback');
+  }
   return {
     name: 'InkDrafts',
     url: 'https://inkdrafts.com/',
     description: 'Provisions a Notion-managed Jekyll site into your own GitHub account and enables GitHub Pages.',
     public: true,
     redirect_url: 'https://inkdrafts.com/',
-    callback_urls: [
-      devCallback,
-      'https://inkdrafts.com/auth/github/callback'
-    ],
+    callback_urls: callbackUrls,
     request_oauth_on_install: true,
     setup_on_update: false,
     default_permissions: {
@@ -81,12 +83,7 @@ function render() {
 }
 
 document.getElementById('stagingHost').addEventListener('input', render);
-document.getElementById('manifestForm').addEventListener('submit', function (e) {
-  if (!document.getElementById('stagingHost').value.trim()) {
-    e.preventDefault();
-    alert('Enter the Cloudflare Workers staging hostname before submitting.');
-    return;
-  }
+document.getElementById('manifestForm').addEventListener('submit', function () {
   render();
 });
 render();
