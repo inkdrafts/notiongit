@@ -5,12 +5,14 @@
     "spikes/libsodium-workers"
   ],
   "scripts": {
-    "test": "npm test --workspace libsodium-workers-spike",
-    "typecheck": "npm run typecheck --workspace libsodium-workers-spike",
-    "deploy:dry-run": "npm run deploy:dry-run --workspace libsodium-workers-spike"
+    "test": "bun test test/index.test.ts && bun run --filter libsodium-workers-spike test",
+    "typecheck": "spikes/libsodium-workers/node_modules/.bin/tsc -p tsconfig.json && bun run --filter libsodium-workers-spike typecheck",
+    "build": "spikes/libsodium-workers/node_modules/.bin/wrangler deploy --dry-run --env=\"\"",
+    "deploy:dry-run": "bun run build",
+    "dev": "spikes/libsodium-workers/node_modules/.bin/wrangler dev"
   },
-  "allowScripts": {
-    "esbuild": true,
-    "workerd": true
-  }
+  "trustedDependencies": [
+    "esbuild",
+    "workerd"
+  ]
 }
