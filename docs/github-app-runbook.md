@@ -27,9 +27,17 @@ manifest conversion completed successfully, and its generated private key,
 client ID, and client secret were written directly to the approved Cloudflare
 secret stores for both `staging` and `production`. No secret value was written
 to this repository or printed during verification. No GitHub Marketplace draft
-or listing was created or submitted. The development-install acceptance
-criterion remains open until the smoke test below is completed and recorded in
-the closing PR.
+or listing was created or submitted.
+
+**Install & Authorize smoke test completed 2026-09-02.** A direct installation
+on a personal GitHub account completed with repository access set to all current
+and future repositories and exactly the permissions documented below. GitHub
+returned to the staging callback with an OAuth code, installation ID, and
+`setup_action=install`; no authorization code or token was retained, exchanged,
+or copied into the repository, issue, or PR. The App was then verified in both
+the account's **Installed GitHub Apps** and **Authorized GitHub Apps** settings.
+The callback returned `501 not_implemented`, as expected: processing the
+callback belongs to issue #9 and is outside issue #4's scope.
 
 ## Registering the App
 
@@ -210,18 +218,26 @@ The expected names are `GITHUB_APP_PRIVATE_KEY`, `GITHUB_CLIENT_ID`,
 Run this only after the App is registered per "Registering the App" above and
 the Cloudflare secrets are populated.
 
-1. Deploy the current Worker to staging and confirm the exact staging callback
-   URL is reachable.
-2. Start the `/connect/github` flow from staging.
-3. Complete installation and OAuth in a disposable personal GitHub account
-   used only for this test.
-4. Confirm the callback identifies the authenticated login and installation
-   without exposing or persisting tokens.
-5. Confirm the installation can access only the permission set above.
-6. Verify the generated repository, Actions secret names, and Pages settings
-   using metadata-only checks. Never attempt to read secret values.
-7. Record the date, environment, App settings reviewer, and result in the PR;
+Before issue #9 implements `/connect/github` and the callback exchange, verify
+the registration with this manual flow:
+
+1. Open `https://github.com/apps/inkdrafts/installations/new` and select a
+   personal GitHub account.
+2. Confirm repository access is **All repositories** and the consent page lists
+   only the permission set above.
+3. Complete **Install & Authorize** and confirm GitHub returns to the exact
+   staging callback with `code`, `installation_id`, and
+   `setup_action=install`. Do not record or exchange the code during this
+   registration-only test.
+4. Confirm InkDrafts appears in both **Installed GitHub Apps** and **Authorized
+   GitHub Apps** for that account.
+5. Record the date, environment, App settings reviewer, and result in the PR;
    do not record account names, repository contents, tokens, or unnecessary IDs.
+
+After issue #9 implements the callback, its end-to-end onboarding tests must
+also confirm that the callback identifies the authenticated login and
+installation without persisting tokens, and that generated repositories,
+Actions secret names, and Pages settings pass metadata-only checks.
 
 ## References
 

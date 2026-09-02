@@ -101,8 +101,11 @@ manual registration.
   The organization-owned App is `github.com/apps/inkdrafts`, App ID `4798518`;
   its private key, client ID, and client secret are stored as Cloudflare
   secrets in both `staging` and `production`. No Marketplace draft or listing
-  was created or submitted. Issue #4's development-install criterion remains
-  open until the smoke test is completed.
+  was created or submitted. Issue #4's personal-account Install & Authorize
+  smoke test completed against staging on 2026-09-02. GitHub returned the
+  expected authorization and installation parameters, and the App appeared in
+  both the account's installed and authorized App settings. Callback processing
+  remains explicitly deferred to issue #9.
 - The development-environment callback URL depends on the Cloudflare Workers
   staging hostname, which is not knowable until staging is actually deployed;
   `docs/github-app-manifest.html` keeps this as an explicit field to fill in
