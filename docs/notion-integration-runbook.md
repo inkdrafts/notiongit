@@ -6,11 +6,17 @@ credentials or user/workspace identifiers.
 
 ## Current status
 
-The repository-side contract is ready. The live public connection and the
-public template page must be created or verified by an authenticated Notion
-maintainer before launch. Record the live template URL only in the Notion
-connection configuration; do not commit it here. A connection client ID and
-secret belong only in Cloudflare secret storage.
+The repository-side contract and live acceptance verification are complete.
+On 2026-09-02, an authenticated Notion maintainer ran the staging OAuth flow
+in a genuinely disposable workspace. Result: **PASS**. The consent flow used
+the developer-provided template; the server-side token exchange returned a
+duplicated template; the API check found exactly one direct-child Pages
+database and one Posts database; schemas, options, sample rows, and the
+`Notion-Version: 2022-06-28` request pin passed; and renaming both database
+titles did not change schema-based role resolution. No credentials, OAuth
+codes, tokens, workspace identifiers, page/database identifiers, or private
+links are recorded here. A connection client ID and secret belong only in
+Cloudflare secret storage.
 
 ## Target connection settings
 
