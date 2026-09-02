@@ -127,10 +127,10 @@ InkDrafts itself creates and never exposes that Notion UI action for.
 Notion's general versioning policy also states: *"We don't currently have
 any plans to stop supporting older API versions."*
 
-**Decision:** the provisioning backend pins an explicit `Notion-Version`
-header older than `2025-09-03` on every Notion API call (exact value to be
-fixed to whatever `notiongit-sync`'s extracted engine already assumes, in
-that repo's own import issue), so `GET /v1/databases/{id}` keeps returning
+**Decision:** the provisioning backend pins `Notion-Version: 2022-06-28` on
+every Notion API call until the database/data-source migration is implemented.
+This is the version used by the current `notiongit-sync` contract, so
+`GET /v1/databases/{id}` keeps returning
 `properties` directly and `identify-databases.mjs`'s single-hop shape stays
 correct. If the backend is ever deliberately migrated to a newer
 `Notion-Version`, this module must first resolve `data_sources[0].id` and

@@ -36,3 +36,6 @@ The Notion OAuth template-duplication spike is documented in
 [`spikes/notion-oauth-template/README.md`](spikes/notion-oauth-template/README.md), and
 the Notion onboarding decision is recorded in
 [`docs/decisions/0002-notion-onboarding.md`](docs/decisions/0002-notion-onboarding.md).
+The production Notion connection and sanitized template build sheet are
+documented in [`docs/notion-integration-runbook.md`](docs/notion-integration-runbook.md)
+and [`docs/notion-template.md`](docs/notion-template.md).
