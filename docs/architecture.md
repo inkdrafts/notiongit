@@ -49,6 +49,11 @@ identity variables, and rotation procedure are maintained in the
 `GITHUB_APP_SLUG` are configuration values; the App private key and OAuth
 client secret remain Cloudflare secrets.
 
+The Notion public connection settings, template schema, API-version pin, and
+credential rotation procedure are maintained in the
+[`Notion integration runbook`](notion-integration-runbook.md) and its
+[`sanitized template build sheet`](notion-template.md).
+
 ## Deployment
 
 Run `bun run build` for the dry-run check. The manual Deploy workflow accepts a
