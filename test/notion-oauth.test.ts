@@ -1,0 +1,215 @@
+import { describe, expect, test } from 'bun:test';
+
+import {
+  NOTION_STATE_COOKIE,
+  NOTION_STATE_PREFIX,
+  route,
+  type Env,
+} from '../src/index';
+
+class MemoryKV {
+  private values = new Map<string, string>();
+  readonly puts: Array<{ key: string; value: string; ttl?: number }> = [];
+
+  async get<T>(key: string, type?: string): Promise<T | string | null> {
+    const value = this.values.get(key);
+    if (value === undefined) return null;
+    return type === 'json' ? JSON.parse(value) as T : value;
+  }
+
+  async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+    this.values.set(key, value);
+    this.puts.push({ key, value, ttl: options?.expirationTtl });
+  }
+}
+
+function env(kv = new MemoryKV()): Partial<Env> {
+  return {
+    JOBS: kv as unknown as KVNamespace,
+    NOTION_CLIENT_ID: 'notion-client-id',
+    NOTION_CLIENT_SECRET: 'notion-client-secret',
+  };
+}
+
+async function start(kv = new MemoryKV()) {
+  const response = await route(
+    new Request('https://staging.example/connect/notion?job_id=job-123'),
+    env(kv),
+  );
+  expect(response.status).toBe(302);
+  const location = new URL(response.headers.get('location')!);
+  const cookie = response.headers.get('set-cookie')!.split(';', 1)[0];
+  return { response, location, cookie, kv };
+}
+
+function callbackUrl(location: URL, cookie: string, params: string): Request {
+  return new Request(`https://staging.example/auth/notion/callback?state=${encodeURIComponent(location.searchParams.get('state')!)}&${params}`, {
+    headers: { Cookie: cookie },
+  });
+}
+
+const TOKEN_RESPONSE = {
+  access_token: 'synthetic-access-token',
+  token_type: 'bearer',
+  refresh_token: 'synthetic-refresh-token',
+  bot_id: 'synthetic-bot-id',
+  workspace_id: 'synthetic-workspace-id',
+  duplicated_template_id: 'synthetic-duplicated-root-id',
+};
+
+describe('Notion OAuth', () => {
+  test('builds an environment-specific authorize URL and stores only signed state metadata', async () => {
+    const { location, cookie, kv } = await start();
+
+    expect(location.origin).toBe('https://api.notion.com');
+    expect(location.pathname).toBe('/v1/oauth/authorize');
+    expect(location.searchParams.get('owner')).toBe('user');
+    expect(location.searchParams.get('client_id')).toBe('notion-client-id');
+    expect(location.searchParams.get('redirect_uri')).toBe('https://staging.example/auth/notion/callback');
+    expect(location.searchParams.get('response_type')).toBe('code');
+    expect(location.searchParams.get('state')).toContain('.');
+    expect(cookie.startsWith(`${NOTION_STATE_COOKIE}=`)).toBe(true);
+    expect(kv.puts[0].key.startsWith(NOTION_STATE_PREFIX)).toBe(true);
+    expect(kv.puts[0].value).not.toContain('access_token');
+    expect(kv.puts[0].value).not.toContain('workspace');
+  });
+
+  test('exchanges the code server-side and passes a redacted continuation', async () => {
+    const { location, cookie, kv } = await start();
+    let continuation: unknown;
+    const requests: Request[] = [];
+
+    const response = await route(
+      callbackUrl(location, cookie, 'code=synthetic-code'),
+      env(kv),
+      {
+        fetcher: async (input, init) => {
+          const request = new Request(input, init);
+          requests.push(request);
+          return Response.json(TOKEN_RESPONSE);
+        },
+        continueOnboarding: (value) => { continuation = value; },
+      },
+    );
+
+    expect(response.status).toBe(202);
+    const responseBody = await response.clone().text();
+    expect(await response.json()).toEqual({
+      ok: true,
+      status: 'notion_authorized',
+      job_id: 'job-123',
+      template: { duplicated: true },
+    });
+    expect(responseBody).not.toContain('synthetic-access-token');
+    expect(continuation).toEqual({
+      jobId: 'job-123',
+      accessToken: 'synthetic-access-token',
+      duplicatedTemplateId: 'synthetic-duplicated-root-id',
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toBe('https://api.notion.com/v1/oauth/token');
+    expect(requests[0].headers.get('notion-version')).toBe('2022-06-28');
+    expect(requests[0].headers.get('authorization')).toMatch(/^Basic /u);
+    expect(await requests[0].json()).toEqual({
+      grant_type: 'authorization_code',
+      code: 'synthetic-code',
+      redirect_uri: 'https://staging.example/auth/notion/callback',
+    });
+    expect(kv.puts.map((put) => put.value).join('\n')).not.toContain('synthetic-access-token');
+    expect(kv.puts.map((put) => put.value).join('\n')).not.toContain('synthetic-duplicated-root-id');
+  });
+
+  test('rejects missing, tampered, and replayed state', async () => {
+    const { location, cookie, kv } = await start();
+    const missing = await route(new Request('https://staging.example/auth/notion/callback?code=x'), env(kv));
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toEqual({ error: 'notion_state_missing' });
+
+    const tamperedState = `${location.searchParams.get('state')}x`;
+    const tampered = await route(
+      new Request(`https://staging.example/auth/notion/callback?state=${encodeURIComponent(tamperedState)}&code=x`, { headers: { Cookie: cookie } }),
+      env(kv),
+    );
+    expect(tampered.status).toBe(400);
+    expect(await tampered.json()).toEqual({ error: 'notion_state_invalid' });
+
+    const success = await route(
+      callbackUrl(location, cookie, 'error=access_denied'),
+      env(kv),
+    );
+    expect(success.status).toBe(400);
+    expect(await success.json()).toEqual({ error: 'notion_authorization_denied' });
+
+    const replay = await route(
+      callbackUrl(location, cookie, 'code=x'),
+      env(kv),
+    );
+    expect(replay.status).toBe(400);
+    expect(await replay.json()).toEqual({ error: 'notion_state_replayed' });
+  });
+
+  test('rejects an expired state record before calling Notion', async () => {
+    const { location, cookie, kv } = await start();
+    const stored = JSON.parse(kv.puts[0].value) as Record<string, unknown>;
+    stored.expiresAt = 1;
+    await kv.put(kv.puts[0].key, JSON.stringify(stored));
+
+    const response = await route(
+      callbackUrl(location, cookie, 'code=x'),
+      env(kv),
+      { fetcher: async () => { throw new Error('Notion must not be called'); } },
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'notion_state_expired' });
+  });
+
+  test('rejects a callback from a different browser flow', async () => {
+    const { location, kv } = await start();
+    const response = await route(
+      new Request(`https://staging.example/auth/notion/callback?state=${encodeURIComponent(location.searchParams.get('state')!)}&code=x`),
+      env(kv),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'notion_state_invalid' });
+  });
+
+  test('does not echo provider errors or credentials', async () => {
+    const { location, cookie, kv } = await start();
+    const response = await route(
+      callbackUrl(location, cookie, 'code=secret-one-time-code'),
+      env(kv),
+      {
+        fetcher: async () => Response.json({
+          error: 'invalid_grant',
+          access_token: 'provider-token-that-must-not-leak',
+          workspace_id: 'private-workspace-id',
+        }, { status: 400 }),
+      },
+    );
+    const body = await response.text();
+    expect(response.status).toBe(400);
+    expect(body).toBe(JSON.stringify({ error: 'notion_authorization_failed' }));
+    expect(body).not.toContain('secret-one-time-code');
+    expect(body).not.toContain('provider-token-that-must-not-leak');
+    expect(body).not.toContain('private-workspace-id');
+  });
+
+  test('accepts a manual-page authorization without a duplicated template', async () => {
+    const { location, cookie, kv } = await start();
+    let duplicate: string | null | undefined;
+    const response = await route(
+      callbackUrl(location, cookie, 'code=synthetic-code'),
+      env(kv),
+      {
+        fetcher: async () => Response.json({
+          ...TOKEN_RESPONSE,
+          duplicated_template_id: null,
+        }),
+        continueOnboarding: ({ duplicatedTemplateId }) => { duplicate = duplicatedTemplateId; },
+      },
+    );
+    expect(response.status).toBe(202);
+    expect(await response.json()).toMatchObject({ template: { duplicated: false } });
+    expect(duplicate).toBeNull();
+  });
+});

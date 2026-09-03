@@ -1,15 +1,20 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  createProvisioningJob,
   createRepositoryWithRetry,
   GENERATED_REPOSITORY_DESCRIPTION,
   GithubRepositoryNameCollisionError,
   isValidGithubRepositoryName,
   route,
+  saveProvisioningJob,
   selectGithubRepositoryDestination,
   selectRepositoryDestination,
   type Env,
+  type ProvisioningJob,
+  type ProvisioningMessage,
 } from '../src/index';
+import worker from '../src/index';
 
 interface MockSequenceEntry {
   status: number;
@@ -24,10 +29,6 @@ interface GenerationMockOptions {
   generate?: MockSequenceEntry[];
   /** Responses for the user-token read of a colliding repository. */
   colliding?: MockSequenceEntry[];
-  /** Responses for the installation-token repository poll. */
-  repository?: MockSequenceEntry[];
-  /** Responses for the installation-token commit poll. */
-  commit?: MockSequenceEntry[];
 }
 
 function mockResponse(entry: MockSequenceEntry): Response {
@@ -37,20 +38,6 @@ function mockResponse(entry: MockSequenceEntry): Response {
   });
 }
 
-function base64(content: string): string {
-  let binary = '';
-  for (const byte of new TextEncoder().encode(content)) binary += String.fromCharCode(byte);
-  return btoa(binary);
-}
-
-const TEMPLATE_CONFIG = `# Neutral template defaults. Provisioning patches url/baseurl.
-title: "NotionGit"
-url: ""
-baseurl: ""
-
-author:
-  name: ""
-`;
 
 function generatedRepositoryBody(name: string): Record<string, unknown> {
   return {
@@ -65,20 +52,23 @@ function generatedRepositoryBody(name: string): Record<string, unknown> {
 }
 
 /**
- * Drive `GET /auth/github/callback` through a full OAuth-on-install flow with
- * scripted generation-phase responses. Returns every outbound request as
+ * Drive `GET /auth/github/callback` through the synchronous OAuth-on-install
+ * prefix — state, code exchange, identity, and repository generation — with
+ * scripted generation-phase responses. Everything after generation runs in
+ * the provisioning queue (see the "provisioning queue" describe block below),
+ * not inside this request. Returns every outbound request as
  * `{method, url, authorization}` plus the parsed generate-call bodies.
  */
 async function runProvisioningCallback(options: GenerationMockOptions = {}) {
   const kv = new MemoryKV();
-  const env = await githubEnv(kv);
+  const queue = new MemoryQueue<ProvisioningMessage>();
+  const env = await githubEnv(kv, queue);
   const { state } = await getInstallState(env);
   const originalFetch = globalThis.fetch;
   const requests: Array<{ method: string; url: string; authorization: string | null }> = [];
   const generateNames: string[] = [];
   const next = (sequence: MockSequenceEntry[] | undefined, fallback: () => MockSequenceEntry): MockSequenceEntry =>
     sequence && sequence.length > 0 ? sequence.shift()! : fallback();
-  let syncDispatched = false;
 
   try {
     globalThis.fetch = async (input, init) => {
@@ -108,82 +98,9 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
           ? entry
           : { ...entry, body: generatedRepositoryBody(body.name) });
       }
-      if (request.url === 'https://api.github.com/app/installations/123/access_tokens') {
-        return Response.json({ token: 'installation-token' });
-      }
-      const pagesMatch = request.url.match(/^https:\/\/api\.github\.com\/repos\/alice\/([^/]+)\/pages$/u);
-      if (pagesMatch) {
-        const name = pagesMatch[1];
-        return mockResponse({
-          status: 201,
-          body: {
-            status: 'built',
-            url: `https://api.github.com/repos/alice/${name}/pages`,
-            html_url: name === 'alice.github.io' ? 'https://alice.github.io' : `https://alice.github.io/${name}`,
-            build_type: 'legacy',
-            source: { branch: 'main', path: '/' },
-          },
-        });
-      }
       const repositoryMatch = request.url.match(/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+$/u);
       if (repositoryMatch && authorization === 'Bearer user-token') {
         return mockResponse(next(options.colliding, () => ({ status: 404 })));
-      }
-      if (repositoryMatch && authorization === 'Bearer installation-token') {
-        return mockResponse(next(options.repository, () => ({
-          status: 200,
-          body: { id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false },
-        })));
-      }
-      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/commits\/main$/u.test(request.url)) {
-        return mockResponse(next(options.commit, () => ({
-          status: 200,
-          body: { sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } },
-        })));
-      }
-      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/contents\/_config\.yml(?:\?ref=main)?$/u.test(request.url)) {
-        if (request.method === 'PUT') {
-          return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
-        }
-        return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
-      }
-      const syncRunsMatch = request.url.match(/^https:\/\/api\.github\.com\/repos\/alice\/([^/]+)\/actions\/workflows\/sync-notion\.yml\/runs\?event=workflow_dispatch&per_page=20$/u);
-      if (syncRunsMatch) {
-        return Response.json({
-          workflow_runs: syncDispatched
-            ? [{
-              id: 555,
-              html_url: `https://github.com/alice/${syncRunsMatch[1]}/actions/runs/555`,
-              status: 'queued',
-              conclusion: null,
-              event: 'workflow_dispatch',
-              created_at: new Date().toISOString(),
-            }]
-            : [],
-        });
-      }
-      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/actions\/workflows\/sync-notion\.yml\/dispatches$/u.test(request.url)) {
-        syncDispatched = true;
-        return new Response(null, { status: 204 });
-      }
-      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/actions\/runs\/555$/u.test(request.url)) {
-        return Response.json({
-          id: 555,
-          html_url: 'https://github.com/alice/repo/actions/runs/555',
-          status: 'completed',
-          conclusion: 'success',
-        });
-      }
-      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/pages\/builds\/latest$/u.test(request.url)) {
-        return Response.json({
-          url: 'https://api.github.com/repos/alice/repo/builds/999',
-          status: 'built',
-          commit: 'generated-head-sha',
-        });
-      }
-      const siteMatch = request.url.match(/^https:\/\/alice\.github\.io\/([^/]*)\/?$/u);
-      if (siteMatch) {
-        return new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html' } });
       }
       throw new Error(`unexpected URL: ${request.url}`);
     };
@@ -192,7 +109,7 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
       new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
       env,
     );
-    return { response, requests, generateNames, kv };
+    return { response, requests, generateNames, kv, queue };
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -200,6 +117,7 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
 
 class MemoryKV {
   private values = new Map<string, string>();
+  private ttls = new Map<string, number>();
 
   async get<T>(key: string, type?: string): Promise<T | string | null> {
     const value = this.values.get(key);
@@ -207,12 +125,30 @@ class MemoryKV {
     return type === 'json' ? JSON.parse(value) as T : value;
   }
 
-  async put(key: string, value: string): Promise<void> {
+  async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
     this.values.set(key, value);
+    if (options?.expirationTtl !== undefined) this.ttls.set(key, options.expirationTtl);
   }
 
   entries(): string[] {
     return [...this.values.values()];
+  }
+
+  ttlFor(key: string): number | undefined {
+    return this.ttls.get(key);
+  }
+}
+
+/** Captures every message sent to the provisioning queue, in order. */
+class MemoryQueue<T> {
+  readonly sent: T[] = [];
+
+  async send(message: T): Promise<void> {
+    this.sent.push(message);
+  }
+
+  async sendBatch(): Promise<void> {
+    throw new Error('MemoryQueue.sendBatch is not used by this project');
   }
 }
 
@@ -238,9 +174,13 @@ function generateThrowawayPrivateKey(): Promise<string> {
   return throwawayPrivateKey;
 }
 
-async function githubEnv(kv = new MemoryKV()): Promise<Partial<Env>> {
+async function githubEnv(
+  kv = new MemoryKV(),
+  queue = new MemoryQueue<ProvisioningMessage>(),
+): Promise<Partial<Env>> {
   return {
     JOBS: kv as unknown as KVNamespace,
+    PROVISIONING_QUEUE: queue as unknown as Queue<ProvisioningMessage>,
     GITHUB_APP_ID: '4798518',
     GITHUB_APP_SLUG: 'inkdrafts',
     GITHUB_APP_PRIVATE_KEY: await generateThrowawayPrivateKey(),
@@ -278,12 +218,12 @@ describe('HTTP foundation', () => {
   });
 
   test('reserves provider callback namespaces', async () => {
-    const response = route(
+    const response = await route(
       new Request('https://example.com/auth/notion/callback?code=redacted'),
     );
 
-    expect(response.status).toBe(501);
-    expect(await response.json()).toEqual({ error: 'not_implemented' });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'notion_configuration_missing' });
   });
 
   test('returns JSON for unknown routes', async () => {
@@ -305,14 +245,14 @@ describe('GitHub App install and authorize flow', () => {
     expect(kv.entries().join('\n')).not.toContain('client-secret');
   });
 
-  test('generates the repository from the template and records only non-secret identity', async () => {
+  test('generates the repository from the template, queues the rest of provisioning, and records only non-secret identity', async () => {
     const kv = new MemoryKV();
-    const env = await githubEnv(kv);
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
     const { state } = await getInstallState(env);
     const originalFetch = globalThis.fetch;
     const requests: Request[] = [];
     const generateBodies: Array<Record<string, unknown>> = [];
-    let syncDispatched = false;
 
     globalThis.fetch = async (input, init) => {
       const request = new Request(input, init);
@@ -350,80 +290,6 @@ describe('GitHub App install and authorize flow', () => {
           description: 'Notion-powered site published with InkDrafts',
         }, { status: 201 });
       }
-      if (request.url === 'https://api.github.com/app/installations/123/access_tokens') {
-        return Response.json({ token: 'installation-token' });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
-        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
-        expect(request.method).toBe('POST');
-        expect(await request.json()).toEqual({ build_type: 'legacy', source: { branch: 'main', path: '/' } });
-        return Response.json({
-          status: 'built',
-          url: 'https://api.github.com/repos/alice/alice.github.io/pages',
-          html_url: 'https://alice.github.io',
-          build_type: 'legacy',
-          source: { branch: 'main', path: '/' },
-        }, { status: 201 });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io') {
-        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
-        return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
-        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
-        return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml' || request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml?ref=main') {
-        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
-        if (request.method === 'PUT') {
-          expect(await request.json()).toMatchObject({ sha: 'config-sha', branch: 'main' });
-          return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
-        }
-        return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/runs?event=workflow_dispatch&per_page=20') {
-        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
-        return Response.json({
-          workflow_runs: syncDispatched
-            ? [{
-              id: 555,
-              html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
-              status: 'queued',
-              conclusion: null,
-              event: 'workflow_dispatch',
-              created_at: new Date().toISOString(),
-            }]
-            : [],
-        });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/dispatches') {
-        expect(request.method).toBe('POST');
-        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
-        expect(await request.json()).toEqual({ ref: 'main', inputs: { allow_bulk_delete: 'false' } });
-        syncDispatched = true;
-        return new Response(null, { status: 204 });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/runs/555') {
-        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
-        return Response.json({
-          id: 555,
-          html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
-          status: 'completed',
-          conclusion: 'success',
-          head_sha: 'generated-head-sha',
-        });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages/builds/latest') {
-        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
-        return Response.json({
-          url: 'https://api.github.com/repos/alice/alice.github.io/builds/999',
-          status: 'built',
-          commit: 'generated-head-sha',
-        });
-      }
-      if (request.url === 'https://alice.github.io/') {
-        return new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html' } });
-      }
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -432,9 +298,10 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
         env,
       );
-      expect(callback.status).toBe(200);
+      expect(callback.status).toBe(202);
       expect(await callback.json()).toEqual({
         ok: true,
+        status: 'provisioning',
         job_id: 'job-123',
         installation_id: 123,
         github: { id: 42, login: 'alice' },
@@ -446,23 +313,6 @@ describe('GitHub App install and authorize flow', () => {
           html_url: 'https://github.com/alice/alice.github.io',
           default_branch: 'main',
         },
-        pages: {
-          status: 'built',
-          url: 'https://api.github.com/repos/alice/alice.github.io/pages',
-          html_url: 'https://alice.github.io',
-          build_type: 'legacy',
-          source: { branch: 'main', path: '/' },
-        },
-        sync: {
-          run_id: 555,
-          html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
-          conclusion: 'success',
-        },
-        deployment: {
-          commit_sha: 'generated-head-sha',
-          build_id: 999,
-          status: 'built',
-        },
       });
       expect(generateBodies).toEqual([{
         name: 'alice.github.io',
@@ -471,36 +321,28 @@ describe('GitHub App install and authorize flow', () => {
         include_all_branches: false,
       }]);
 
-      const stored = await kv.get<Record<string, any>>('github:onboarding-job:job-123', 'json');
-      expect(stored?.status).toBe('site_live');
-      expect(stored?.pages).toMatchObject({
-        status: 'built',
-        htmlUrl: 'https://alice.github.io',
-        buildType: 'legacy',
-        source: { branch: 'main', path: '/' },
-      });
-      expect(stored?.generatedRepository).toMatchObject({
+      // The rest of provisioning (Pages, config, sync, deploy) is now the
+      // durable queue's job, not this request's — see the "provisioning
+      // queue" describe block for those steps.
+      expect(queue.sent).toEqual([{ jobId: 'job-123' }]);
+
+      const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
+      expect(stored?.status).toBe('queued');
+      expect(stored?.data.pages).toBeNull();
+      expect(stored?.data.sync).toBeNull();
+      expect(stored?.data.deployment).toBeNull();
+      expect(Object.values(stored?.steps ?? {}).every((step) => step.status === 'pending')).toBe(true);
+      expect(stored?.data.generatedRepository).toMatchObject({
         id: 1001,
         fullName: 'alice/alice.github.io',
-        headSha: 'generated-head-sha',
-        headTreeSha: 'generated-tree-sha',
+        headSha: null,
+        headTreeSha: null,
         templateHeadSha: 'template-head-sha',
         templateHeadTreeSha: 'template-tree-sha',
         reused: false,
       });
-      expect(stored?.sync).toEqual({
-        runId: 555,
-        htmlUrl: 'https://github.com/alice/alice.github.io/actions/runs/555',
-        conclusion: 'success',
-      });
-      expect(stored?.deployment).toMatchObject({
-        commitSha: 'generated-head-sha',
-        buildId: 999,
-        status: 'built',
-      });
       const persisted = kv.entries().join('\n');
       expect(persisted).not.toContain('user-token');
-      expect(persisted).not.toContain('installation-token');
       expect(persisted).not.toContain('one-time-code');
 
       const replay = await route(
@@ -509,7 +351,69 @@ describe('GitHub App install and authorize flow', () => {
       );
       expect(replay.status).toBe(400);
       expect(await replay.json()).toEqual({ error: 'github_state_replayed' });
-      expect(requests).toHaveLength(19);
+      expect(requests).toHaveLength(6);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('records an enqueue failure on the job instead of leaving it queued forever', async () => {
+    class FailingQueue {
+      readonly sent: unknown[] = [];
+      async send(): Promise<void> {
+        throw new Error('queue unavailable');
+      }
+      async sendBatch(): Promise<void> {
+        throw new Error('MemoryQueue.sendBatch is not used by this project');
+      }
+    }
+    const kv = new MemoryKV();
+    const queue = new FailingQueue();
+    const env = await githubEnv(kv, queue as unknown as MemoryQueue<ProvisioningMessage>);
+    const { state } = await getInstallState(env);
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url === 'https://github.com/login/oauth/access_token') {
+        return Response.json({ access_token: 'user-token', token_type: 'bearer' });
+      }
+      if (request.url === 'https://api.github.com/user') {
+        return Response.json({ id: 42, login: 'alice', type: 'User' });
+      }
+      if (request.url === 'https://api.github.com/user/installations/123') {
+        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+      }
+      if (request.url.startsWith('https://api.github.com/user/repos?')) {
+        return Response.json([]);
+      }
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') {
+        return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
+      }
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/generate') {
+        return Response.json(generatedRepositoryBody('alice.github.io'), { status: 201 });
+      }
+      throw new Error(`unexpected URL: ${request.url}`);
+    }) as typeof fetch;
+
+    try {
+      const callback = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(callback.status).toBe(502);
+      expect(await callback.json()).toEqual({ error: 'github_authorization_unavailable' });
+
+      // The durable record must not sit `queued` with no message and no
+      // trace of why: the enqueue failure is marked on the job itself.
+      const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
+      expect(stored?.status).toBe('dead_letter');
+      expect(stored?.completedAt).not.toBeNull();
+      expect(stored?.steps.verify_repository.status).toBe('failed');
+      expect(stored?.steps.verify_repository.lastError).toEqual({
+        code: 'provisioning_enqueue_failed',
+        retryable: false,
+      });
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -517,11 +421,11 @@ describe('GitHub App install and authorize flow', () => {
 
   test('accepts a setup callback before the OAuth callback', async () => {
     const kv = new MemoryKV();
-    const env = await githubEnv(kv);
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
     const { state } = await getInstallState(env);
     const originalFetch = globalThis.fetch;
     let calls = 0;
-    let syncDispatched = false;
 
     globalThis.fetch = async (input, init) => {
       calls += 1;
@@ -552,64 +456,6 @@ describe('GitHub App install and authorize flow', () => {
           fork: false,
         }, { status: 201 });
       }
-      if (request.url === 'https://api.github.com/app/installations/123/access_tokens') {
-        return Response.json({ token: 'installation-token' });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
-        return Response.json({
-          status: 'built',
-          url: 'https://api.github.com/repos/alice/alice.github.io/pages',
-          html_url: 'https://alice.github.io',
-          build_type: 'legacy',
-          source: { branch: 'main', path: '/' },
-        }, { status: 201 });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io') {
-        return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
-        return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml' || request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml?ref=main') {
-        if (request.method === 'PUT') return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
-        return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/runs?event=workflow_dispatch&per_page=20') {
-        return Response.json({
-          workflow_runs: syncDispatched
-            ? [{
-              id: 555,
-              html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
-              status: 'queued',
-              conclusion: null,
-              event: 'workflow_dispatch',
-              created_at: new Date().toISOString(),
-            }]
-            : [],
-        });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/dispatches') {
-        syncDispatched = true;
-        return new Response(null, { status: 204 });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/runs/555') {
-        return Response.json({
-          id: 555,
-          html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
-          status: 'completed',
-          conclusion: 'success',
-        });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages/builds/latest') {
-        return Response.json({
-          url: 'https://api.github.com/repos/alice/alice.github.io/builds/999',
-          status: 'built',
-          commit: 'generated-head-sha',
-        });
-      }
-      if (request.url === 'https://alice.github.io/') {
-        return new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html' } });
-      }
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -625,8 +471,9 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&setup_action=install`),
         env,
       );
-      expect(callback.status).toBe(200);
-      expect(calls).toBe(20);
+      expect(callback.status).toBe(202);
+      expect(calls).toBe(7);
+      expect(queue.sent).toEqual([{ jobId: 'job-123' }]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -637,14 +484,14 @@ describe('GitHub App install and authorize flow', () => {
       owned: [generatedRepositoryBody('alice.github.io')],
     });
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
     const body = await response.json() as Record<string, any>;
     expect(body.repository).toMatchObject({ name: 'alice.github.io', id: 1001 });
     expect(requests.some((request) => request.url.endsWith('/generate'))).toBe(false);
     expect(requests.some((request) => request.url.includes('notiongit-template/commits'))).toBe(false);
 
-    const stored = await kv.get<Record<string, any>>('github:onboarding-job:job-123', 'json');
-    expect(stored?.generatedRepository).toMatchObject({ reused: true, fullName: 'alice/alice.github.io' });
+    const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
+    expect(stored?.data.generatedRepository).toMatchObject({ reused: true, fullName: 'alice/alice.github.io' });
   });
 
   test('adopts its own colliding repository instead of advancing to a new name', async () => {
@@ -653,13 +500,13 @@ describe('GitHub App install and authorize flow', () => {
       colliding: [{ status: 200, body: generatedRepositoryBody('alice.github.io') }],
     });
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
     expect(generateNames).toEqual(['alice.github.io']);
     const body = await response.json() as Record<string, any>;
     expect(body.repository).toMatchObject({ name: 'alice.github.io' });
 
-    const stored = await kv.get<Record<string, any>>('github:onboarding-job:job-123', 'json');
-    expect(stored?.generatedRepository).toMatchObject({ reused: true });
+    const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
+    expect(stored?.data.generatedRepository).toMatchObject({ reused: true });
   });
 
   test('advances to the next deterministic name when a foreign repository holds the first', async () => {
@@ -679,7 +526,7 @@ describe('GitHub App install and authorize flow', () => {
       }],
     });
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
     expect(generateNames).toEqual(['alice.github.io', 'alice-inkdrafts']);
     const body = await response.json() as Record<string, any>;
     expect(body.repository).toMatchObject({
@@ -689,7 +536,7 @@ describe('GitHub App install and authorize flow', () => {
   });
 
   test('surfaces a secondary rate limit distinctly with retry guidance and no job record', async () => {
-    const { response, kv } = await runProvisioningCallback({
+    const { response, kv, queue } = await runProvisioningCallback({
       generate: [{ status: 403, headers: { 'retry-after': '60' } }],
     });
 
@@ -697,95 +544,7 @@ describe('GitHub App install and authorize flow', () => {
     expect(await response.json()).toEqual({ error: 'github_generate_rate_limited', retry_after_seconds: 60 });
     expect(await kv.get('github:onboarding-job:job-123')).toBeNull();
     expect(kv.entries().join('\n')).not.toContain('user-token');
-  });
-
-  test('resumes the correlated sync run on retry instead of dispatching a duplicate', async () => {
-    const kv = new MemoryKV();
-    const env = await githubEnv(kv);
-    const originalFetch = globalThis.fetch;
-    let dispatchCalls = 0;
-    let conclusion: 'failure' | 'success' = 'failure';
-    const owned = [generatedRepositoryBody('alice.github.io')];
-
-    globalThis.fetch = async (input, init) => {
-      const request = new Request(input, init);
-      if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
-      if (request.url === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
-      if (request.url === 'https://api.github.com/user/installations/123') {
-        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
-      }
-      if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json(owned);
-      if (request.url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io') {
-        return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
-        return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml' || request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml?ref=main') {
-        if (request.method === 'PUT') return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
-        return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
-        return Response.json({
-          status: 'built',
-          url: 'https://api.github.com/repos/alice/alice.github.io/pages',
-          html_url: 'https://alice.github.io',
-          build_type: 'legacy',
-          source: { branch: 'main', path: '/' },
-        }, { status: 201 });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/runs?event=workflow_dispatch&per_page=20') {
-        return Response.json({
-          workflow_runs: dispatchCalls > 0
-            ? [{ id: 555, html_url: 'https://github.com/alice/alice.github.io/actions/runs/555', status: 'queued', conclusion: null, event: 'workflow_dispatch', created_at: new Date().toISOString() }]
-            : [],
-        });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/dispatches') {
-        dispatchCalls += 1;
-        return new Response(null, { status: 204 });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/runs/555') {
-        return Response.json({ id: 555, html_url: 'https://github.com/alice/alice.github.io/actions/runs/555', status: 'completed', conclusion });
-      }
-      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages/builds/latest') {
-        return Response.json({
-          url: 'https://api.github.com/repos/alice/alice.github.io/builds/999',
-          status: 'built',
-          commit: 'generated-head-sha',
-        });
-      }
-      if (request.url === 'https://alice.github.io/') return new Response('ok', { status: 200 });
-      throw new Error(`unexpected URL: ${request.url}`);
-    };
-
-    try {
-      const { state: state1 } = await getInstallState(env);
-      const first = await route(
-        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state1)}&code=code-one&installation_id=123&setup_action=install`),
-        env,
-      );
-      expect(first.status).toBe(502);
-      expect(await first.json()).toEqual({ error: 'github_sync_run_failed' });
-      expect(dispatchCalls).toBe(1);
-      expect(await kv.get<Record<string, any>>('github:onboarding-sync-run:job-123', 'json')).toMatchObject({ runId: 555 });
-      expect(await kv.get('github:onboarding-job:job-123')).toBeNull();
-
-      conclusion = 'success';
-      const { state: state2 } = await getInstallState(env);
-      const second = await route(
-        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state2)}&code=code-two&installation_id=123&setup_action=install`),
-        env,
-      );
-      expect(second.status).toBe(200);
-      expect(dispatchCalls).toBe(1);
-      const stored = await kv.get<Record<string, any>>('github:onboarding-job:job-123', 'json');
-      expect(stored?.status).toBe('site_live');
-      expect(stored?.sync).toMatchObject({ runId: 555, conclusion: 'success' });
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+    expect(queue.sent).toEqual([]);
   });
 
   test.each([
@@ -896,5 +655,122 @@ describe('Repository naming and GitHub Pages destinations', () => {
       url: 'https://alice.github.io/alice-inkdrafts-3',
       baseurl: '/alice-inkdrafts-3',
     });
+  });
+});
+
+interface FakeMessage {
+  id: string;
+  timestamp: Date;
+  body: ProvisioningMessage;
+  attempts: number;
+  acked: boolean;
+  retried: { delaySeconds?: number } | null;
+  retry(options?: { delaySeconds?: number }): void;
+  ack(): void;
+}
+
+function fakeMessage(body: ProvisioningMessage): FakeMessage {
+  const message: FakeMessage = {
+    id: 'message-1',
+    timestamp: new Date(0),
+    body,
+    attempts: 1,
+    acked: false,
+    retried: null,
+    retry(options) { message.retried = options ?? {}; },
+    ack() { message.acked = true; },
+  };
+  return message;
+}
+
+function fakeBatch(messages: FakeMessage[]) {
+  return {
+    messages,
+    queue: 'notiongit-provisioning',
+    metadata: {},
+    retryAll() { messages.forEach((message) => message.retry()); },
+    ackAll() { messages.forEach((message) => message.ack()); },
+  };
+}
+
+const FAKE_EXECUTION_CONTEXT = { waitUntil() {}, passThroughOnException() {}, props: {} };
+
+describe('provisioning queue consumer', () => {
+  test('acks a malformed message body instead of retrying forever', async () => {
+    const env = await githubEnv();
+    const message = fakeMessage({ jobId: '' });
+    await worker.queue!(fakeBatch([message]) as any, env as Env, FAKE_EXECUTION_CONTEXT as any);
+    expect(message.acked).toBe(true);
+    expect(message.retried).toBeNull();
+  });
+
+  test('acks after advancing a step and enqueues no continuation the message need not carry', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    const job = createProvisioningJob({
+      jobId: 'job-1',
+      installationId: 123,
+      identity: { id: 42, login: 'alice', accountType: 'User' },
+      repository: { name: 'alice.github.io', url: 'https://alice.github.io', baseurl: '', kind: 'apex' },
+      generatedRepository: {
+        id: 1001,
+        fullName: 'alice/alice.github.io',
+        name: 'alice.github.io',
+        htmlUrl: 'https://github.com/alice/alice.github.io',
+        defaultBranch: 'main',
+        templateFullName: 'inkdrafts/notiongit-template',
+        templateHeadSha: 't',
+        templateHeadTreeSha: 't2',
+        headSha: 'generated-head-sha',
+        headTreeSha: 'generated-tree-sha',
+        reused: false,
+      },
+      now: Date.now(),
+    });
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, job);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') {
+        return Response.json({ token: 'installation-token' });
+      }
+      if (url === 'https://api.github.com/repos/alice/alice.github.io') {
+        return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
+      }
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
+        return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    };
+
+    try {
+      const message = fakeMessage({ jobId: 'job-1' });
+      await worker.queue!(fakeBatch([message]) as any, env as Env, FAKE_EXECUTION_CONTEXT as any);
+      expect(message.acked).toBe(true);
+      expect(message.retried).toBeNull();
+      expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
+      const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-1', 'json');
+      expect(stored?.steps.verify_repository.status).toBe('succeeded');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('retries a message when the job cannot be processed', async () => {
+    const env = await githubEnv();
+    const brokenJobs = {
+      get() { throw new Error('KV outage'); },
+      put() { throw new Error('KV outage'); },
+    };
+    const message = fakeMessage({ jobId: 'job-1' });
+    await worker.queue!(
+      fakeBatch([message]) as any,
+      { ...env, JOBS: brokenJobs as unknown as KVNamespace } as Env,
+      FAKE_EXECUTION_CONTEXT as any,
+    );
+    expect(message.acked).toBe(false);
+    expect(message.retried).toEqual({});
   });
 });
