@@ -43,6 +43,7 @@ import {
   resolveNotionTemplateDatabases,
   saveNotionTemplateResolution,
 } from './notion-template';
+import { LANDING_PAGE } from './landing-page';
 
 
 export {
@@ -259,6 +260,8 @@ export type {
   TemplateDatabaseRole,
 } from './notion-template';
 
+export { LANDING_PAGE } from './landing-page';
+
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
   JOBS: KVNamespace;
@@ -313,12 +316,6 @@ function json(data: unknown, status = 200): Response {
 function html(document: string, status = 200): Response {
   return new Response(document, { status, headers: HTML_HEADERS });
 }
-
-const LANDING_PAGE = `<!doctype html>
-<html lang="en">
-  <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>InkDrafts</title></head>
-  <body><main><h1>InkDrafts</h1><p>Notion-powered publishing for GitHub Pages.</p></main></body>
-</html>`;
 
 type StatePhase = 'pending' | 'setup_received' | 'consumed';
 
