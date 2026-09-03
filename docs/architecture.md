@@ -54,6 +54,17 @@ credential rotation procedure are maintained in the
 [`Notion integration runbook`](notion-integration-runbook.md) and its
 [`sanitized template build sheet`](notion-template.md).
 
+## GitHub Pages provisioning
+
+After the generated repository's `main` commit is readable through the App
+installation, the Worker calls the Pages API with `build_type: legacy` and
+`source: { branch: main, path: / }`. A `409` is treated as an idempotent
+existing-site result: the current site is inspected and updated only when its
+source or explicit build type is incompatible. Provider 404, validation,
+permission, and rate-limit failures are surfaced as distinct job errors;
+network and 5xx failures use a bounded retry. KV stores only Pages status,
+URLs, and the desired source metadata.
+
 ## Deployment
 
 Run `bun run build` for the dry-run check. The manual Deploy workflow accepts a

@@ -23,8 +23,9 @@ The Worker entrypoint is [`src/index.ts`](src/index.ts). It exposes
 and handles the signed callback at `GET /auth/github/callback`. The callback
 exchanges the OAuth code server-side, verifies that the authenticated personal
 account owns the installation, selects a collision-safe repository destination,
-generates that repository from `inkdrafts/notiongit-template`, and stores only
-GitHub identity, installation, destination, and non-secret generated-repository
+generates that repository from `inkdrafts/notiongit-template`, enables legacy
+GitHub Pages from `main:/`, and stores only GitHub identity, installation,
+destination, generated-repository metadata, and non-secret Pages status/URL
 metadata in `JOBS`; OAuth and installation tokens are never persisted or
 returned to browser code. It also wires the `PROVISIONING_QUEUE` Queue binding.
 
@@ -39,7 +40,8 @@ an empty Jekyll `baseurl`. If that name is occupied, it tries the project-site
 sequence `<login>-inkdrafts`, `<login>-inkdrafts-2`, and so on, mapping each to
 `https://<login>.github.io/<repository>` with `baseurl: /<repository>`.
 
-Generation is implemented in [`src/repository-generation.ts`](src/repository-generation.ts).
+Generation is implemented in [`src/repository-generation.ts`](src/repository-generation.ts),
+and Pages reconciliation is implemented in [`src/github-pages.ts`](src/github-pages.ts).
 It happens inside the callback while the short-lived user access token is still
 in memory, because creating a repository from a template requires
 user-to-server authentication; the call sets public visibility and the product
@@ -63,6 +65,16 @@ names, and the deployment workflow.
 The GitHub App settings, least-privilege permission matrix, callback URLs, and
 credential rotation procedure are documented in
 [`docs/github-app-runbook.md`](docs/github-app-runbook.md).
+
+The read-only development-repository Pages acceptance check is opt-in:
+
+```sh
+GITHUB_PAGES_INTEGRATION_REPOSITORY=OWNER/REPO \
+GITHUB_PAGES_INTEGRATION_TOKEN=... bun run test:pages-integration
+```
+
+It verifies that the repository reports `main:/` and legacy Pages without
+changing it.
 
 The Notion OAuth template-duplication spike is documented in
 [`spikes/notion-oauth-template/README.md`](spikes/notion-oauth-template/README.md), and
