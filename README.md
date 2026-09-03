@@ -23,9 +23,10 @@ The Worker entrypoint is [`src/index.ts`](src/index.ts). It exposes
 and handles the signed callback at `GET /auth/github/callback`. The callback
 exchanges the OAuth code server-side, verifies that the authenticated personal
 account owns the installation, selects a collision-safe repository destination,
-and stores only GitHub identity, installation, and destination metadata in
-`JOBS`; OAuth and installation tokens are never persisted or returned to browser
-code. It also wires the `PROVISIONING_QUEUE` Queue binding.
+generates that repository from `inkdrafts/notiongit-template`, and stores only
+GitHub identity, installation, destination, and non-secret generated-repository
+metadata in `JOBS`; OAuth and installation tokens are never persisted or
+returned to browser code. It also wires the `PROVISIONING_QUEUE` Queue binding.
 
 `/connect/github` accepts an optional `job_id` (or `jobId`) and generates one
 when omitted. The signed state expires after ten minutes and is marked consumed
@@ -36,10 +37,22 @@ Repository naming is deterministic. InkDrafts first tries the exact lowercase
 `<login>.github.io` repository, which maps to `https://<login>.github.io` with
 an empty Jekyll `baseurl`. If that name is occupied, it tries the project-site
 sequence `<login>-inkdrafts`, `<login>-inkdrafts-2`, and so on, mapping each to
-`https://<login>.github.io/<repository>` with `baseurl: /<repository>`. The
-selection is an availability check, not a reservation; repository generation
-must use `createRepositoryWithRetry` and advance on GitHub's `422` name-collision
-response to handle races safely.
+`https://<login>.github.io/<repository>` with `baseurl: /<repository>`.
+
+Generation is implemented in [`src/repository-generation.ts`](src/repository-generation.ts).
+It happens inside the callback while the short-lived user access token is still
+in memory, because creating a repository from a template requires
+user-to-server authentication; the call sets public visibility and the product
+description `Notion-powered site published with InkDrafts`. That description is
+also the idempotency marker: a retry that finds an owned non-fork repository
+carrying it adopts that repository instead of creating a duplicate, and a `422`
+name collision first checks whether the occupier is InkDrafts' own before
+advancing to the next deterministic name. Once GitHub returns the repository,
+the Worker verifies it with an installation token — polling with exponential
+backoff until `main` reports a readable initial commit — so success also proves
+the App installation received the repository. Timeout, rate limit, exhausted
+names, and unavailability surface as distinct JSON errors, each resumable by
+restarting the flow.
 
 Before a real deployment, replace the KV placeholder in `wrangler.toml` with
 the namespace ID returned by Wrangler and create the provisioning queues. The

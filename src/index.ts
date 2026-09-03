@@ -3,14 +3,22 @@
  *
  * GitHub's OAuth code and all access tokens are deliberately kept inside the
  * request that uses them. KV contains only the signed-state replay marker and
- * the resulting GitHub identity/installation and destination metadata.
+ * the resulting GitHub identity/installation, destination, and generated
+ * repository metadata.
  */
 
 import {
   GithubRepositoryApiError,
-  selectGithubRepositoryDestination,
+  listOwnedGithubRepositories,
   type RepositoryDestination,
 } from './repository-naming';
+import {
+  awaitGeneratedRepositoryCommit,
+  generateOrReuseRepository,
+  GithubGenerateError,
+  type GeneratedRepositoryIdentity,
+} from './repository-generation';
+
 
 export {
   createRepositoryWithRetry,
@@ -24,6 +32,26 @@ export {
   selectRepositoryDestination,
 } from './repository-naming';
 export type { RepositoryDestination } from './repository-naming';
+
+export {
+  awaitGeneratedRepositoryCommit,
+  findReusableGeneratedRepository,
+  GENERATED_REPOSITORY_DESCRIPTION,
+  generateOrReuseRepository,
+  generateRepositoryFromTemplate,
+  getTemplateHead,
+  GithubGenerateError,
+  isInkdraftsGeneratedRepository,
+  reuseCollidingRepository,
+  TEMPLATE_REPOSITORY_FULL_NAME,
+  TEMPLATE_REPOSITORY_NAME,
+  TEMPLATE_REPOSITORY_OWNER,
+} from './repository-generation';
+export type {
+  GeneratedRepositoryIdentity,
+  GeneratedRepositoryPollOptions,
+  GithubGenerateErrorCode,
+} from './repository-generation';
 
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
@@ -57,6 +85,7 @@ export interface GithubOnboardingResult {
   installationId: number;
   identity: GithubIdentity;
   repository: RepositoryDestination;
+  generatedRepository: GeneratedRepositoryIdentity;
 }
 
 const GITHUB_API = 'https://api.github.com';
@@ -117,10 +146,11 @@ interface GithubStateRecord {
 interface GithubJobRecord {
   version: 1;
   jobId: string;
-  status: 'github_authorized';
+  status: 'repository_generated';
   installationId: number;
   identity: GithubIdentity;
   repository: RepositoryDestination;
+  generatedRepository: GeneratedRepositoryIdentity;
   completedAt: number;
 }
 
@@ -492,6 +522,14 @@ function authError(error: unknown): Response {
   if (error instanceof GithubRepositoryApiError) {
     if (error.status === 400 || error.status === 401) return json({ error: 'github_authorization_failed' }, 400);
   }
+  if (error instanceof GithubGenerateError) {
+    // Timeout, rate limit, and unavailable are distinct on purpose: each has a
+    // different recovery path and all are resumable by restarting the flow,
+    // which reuses an already-generated repository instead of duplicating it.
+    const body: Record<string, unknown> = { error: error.code };
+    if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
+    return json(body, error.status);
+  }
   // Deliberately do not expose provider response bodies, OAuth codes, tokens,
   // private keys, or exception messages to the browser.
   return json({ error: 'github_authorization_unavailable' }, 502);
@@ -561,6 +599,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   try {
     let identity: GithubIdentity | undefined;
     let repository: RepositoryDestination | undefined;
+    let generatedRepository: GeneratedRepositoryIdentity | undefined;
     let selectedInstallationId = installationId || record.installationId;
 
     if (code) {
@@ -579,9 +618,17 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       const userInstallation = await getUserInstallation(accessToken, selectedInstallationId);
       const installationIdentityForUser = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
       identity = installationIdentityForUser;
-      // Selection happens while the short-lived OAuth token is in memory.
-      // Only non-secret destination metadata is retained in the job record.
-      repository = await selectGithubRepositoryDestination(accessToken, identity.login);
+      // Generation happens while the short-lived OAuth token is in memory:
+      // creating a repository from the template requires user-to-server
+      // authentication. An earlier attempt's generated repository is reused
+      // instead of duplicated. Only non-secret destination and repository
+      // identity metadata is retained in the job record.
+      const ownedRepositories = await listOwnedGithubRepositories(accessToken);
+      ({ destination: repository, identity: generatedRepository } = await generateOrReuseRepository(
+        accessToken,
+        identity.login,
+        ownedRepositories,
+      ));
     } else {
       // This supports a setup callback arriving before the OAuth callback. The
       // App JWT proves that the installation belongs to this App; the later
@@ -598,15 +645,30 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       return json({ status: 'awaiting_authorization', job_id: record.jobId }, 202);
     }
 
-    if (!identity || !repository) return json({ error: 'github_identity_missing' }, 400);
+    if (!identity || !repository || !generatedRepository) return json({ error: 'github_identity_missing' }, 400);
+
+    // Verification uses the installation token: the repository was added to
+    // the installation automatically, so a readable `main` commit also proves
+    // the App can act on the repository for every later provisioning step.
+    const installationToken = await createGithubInstallationToken(
+      env as Pick<Env, 'GITHUB_APP_ID' | 'GITHUB_APP_PRIVATE_KEY'>,
+      selectedInstallationId,
+    );
+    const usable = await awaitGeneratedRepositoryCommit(`Bearer ${installationToken}`, generatedRepository.fullName);
+    generatedRepository = {
+      ...generatedRepository,
+      headSha: usable.headSha,
+      headTreeSha: usable.headTreeSha,
+    };
 
     const completed: GithubJobRecord = {
       version: 1,
       jobId: record.jobId,
-      status: 'github_authorized',
+      status: 'repository_generated',
       installationId: selectedInstallationId,
       identity,
       repository,
+      generatedRepository,
       completedAt: Date.now(),
     };
     await env.JOBS.put(jobKey(record.jobId), JSON.stringify(completed), { expirationTtl: JOB_TTL_SECONDS });
@@ -624,6 +686,9 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
         name: repository.name,
         url: repository.url,
         baseurl: repository.baseurl,
+        id: generatedRepository.id,
+        html_url: generatedRepository.htmlUrl,
+        default_branch: generatedRepository.defaultBranch,
       },
     });
   } catch (error) {
