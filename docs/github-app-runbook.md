@@ -234,10 +234,32 @@ the registration with this manual flow:
 5. Record the date, environment, App settings reviewer, and result in the PR;
    do not record account names, repository contents, tokens, or unnecessary IDs.
 
-After issue #9 implements the callback, its end-to-end onboarding tests must
+The end-to-end onboarding tests must
 also confirm that the callback identifies the authenticated login and
 installation without persisting tokens, and that generated repositories,
 Actions secret names, and Pages settings pass metadata-only checks.
+
+## Implemented callback contract
+
+The Worker starts the flow at `GET /connect/github`. Callers may supply the
+onboarding job as `job_id` (or `jobId`); if omitted, the Worker creates one.
+The response is a redirect to
+`https://github.com/apps/inkdrafts/installations/new` with a ten-minute,
+HMAC-signed `state` value. The state is bound to that job and its nonce is
+stored in `JOBS` only to enforce expiry and replay protection.
+
+GitHub returns to `GET /auth/github/callback`. The Worker exchanges `code`
+server-side, calls `/user` to identify the authenticated account, and calls
+`/user/installations/{installation_id}` to prove that the installation belongs
+to that account. Suspended installations, organization installations, missing
+installations, mismatched accounts, denied authorization, invalid state, and
+replayed state fail with a generic JSON error. A successful response contains
+only `job_id`, `installation_id`, and the authenticated GitHub login/id.
+
+The OAuth access token is held only for the callback request and is never
+logged, returned, or written to KV. Provisioning can call the exported
+installation-token helper when it needs a short-lived token; that token is
+also returned only to the in-process caller and is never persisted.
 
 ## References
 
