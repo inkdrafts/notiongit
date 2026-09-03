@@ -10,6 +10,7 @@ import {
   loadProvisioningJob,
   saveProvisioningJob,
   tryAcquireProvisioningLock,
+  PROVISIONING_JOB_PREFIX,
   PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
   PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS,
   PROVISIONING_STEP_MAX_ATTEMPTS,
@@ -22,6 +23,7 @@ import { GithubSyncError } from '../src/notion-sync';
 import { GithubDeployError } from '../src/site-deployment';
 import { GithubGenerateError } from '../src/repository-generation';
 import { GithubAppAuthError } from '../src/github-app-auth';
+import { accountLeaseKey, GLOBAL_RATE_KEY, type AccountLease, type GlobalRateState } from '../src/provisioning-throttle';
 
 class MemoryKV {
   private values = new Map<string, string>();
@@ -670,14 +672,18 @@ describe('processProvisioningMessage', () => {
     await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
     const { fetcher, calls } = pipelineFetch();
 
-    // Fail exactly the third KV put: the saves per delivery are the locked
-    // record, the in-progress record, then the completed result.
-    let puts = 0;
+    // Fail exactly the completed-result save: the job-record writes per
+    // delivery are the locked record, the in-progress record, then the
+    // completed result. The gate's lease and counter writes carry other key
+    // prefixes and don't count.
+    let jobPuts = 0;
     const flakyKv = {
       get: kv.get.bind(kv),
       put: async (key: string, value: string, options?: unknown) => {
-        puts += 1;
-        if (puts === 3) throw new Error('kv write blip');
+        if (key.startsWith(PROVISIONING_JOB_PREFIX)) {
+          jobPuts += 1;
+          if (jobPuts === 3) throw new Error('kv write blip');
+        }
         return kv.put(key, value, options as never);
       },
     } as unknown as KVNamespace;
@@ -915,5 +921,151 @@ describe('processProvisioningMessage', () => {
     expect(queue.sendOptions[0]).toEqual({ delaySeconds: 45 });
     const job = await loadProvisioningJob(env.JOBS, 'job-1');
     expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_app_auth_failed', retryable: true });
+  });
+});
+
+/** Seeds the global rate counter as exhausted for the fixed window that
+ * contains `nowMs`, so every budgeted gate pass is refused. */
+async function exhaustGlobalBudget(kv: MemoryKV, nowMs: number): Promise<void> {
+  const state: GlobalRateState = {
+    version: 1,
+    minuteBucket: Math.floor(nowMs / 60_000),
+    hourBucket: Math.floor(nowMs / 3_600_000),
+    minuteCount: 30,
+    hourCount: 240,
+  };
+  await kv.put(GLOBAL_RATE_KEY, JSON.stringify(state), { expirationTtl: 7200 });
+}
+
+async function putAccountLease(kv: MemoryKV, lease: AccountLease, accountId = 42): Promise<void> {
+  await kv.put(accountLeaseKey(accountId), JSON.stringify(lease), { expirationTtl: 1800 });
+}
+
+describe('provisioning throttle gate', () => {
+  test('a gate wait parks the job queued with a breadcrumb and a fresh delayed message, minting no token', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    await exhaustGlobalBudget(kv, 18_000);
+
+    const outcome = await processProvisioningMessage(
+      'job-1',
+      env,
+      { fetcher: unreachableFetch(), sleep: async () => {}, now: () => 18_000, rng: () => 0 },
+    );
+
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
+    expect(queue.sendOptions[0]?.delaySeconds).toBeGreaterThanOrEqual(1);
+
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('queued');
+    expect(job?.lock).toBeNull();
+    expect(job?.steps.configure_pages.attempts).toBe(0);
+    expect(job?.steps.configure_pages.status).toBe('pending');
+    expect(job?.wait?.reason).toBe('global_throttled');
+    expect(job?.wait?.updatedAt).toBe(18_000);
+    expect(job?.wait?.untilMs).toBe(18_000 + queue.sendOptions[0]!.delaySeconds! * 1000);
+  });
+
+  test('five consecutive gate refusals never consume an attempt nor dead-letter', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    await exhaustGlobalBudget(kv, 18_000);
+    const runtime = { fetcher: unreachableFetch(), sleep: async () => {}, now: () => 18_000, rng: () => 0 };
+
+    for (let pass = 0; pass < 5; pass += 1) {
+      expect(await processProvisioningMessage('job-1', env, runtime)).toEqual({ outcome: 'acked' });
+    }
+
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('queued');
+    expect(job?.steps.configure_pages.attempts).toBe(0);
+    expect(queue.sent).toHaveLength(5);
+  });
+
+  test('the wait breadcrumb clears when the step next books', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    await exhaustGlobalBudget(kv, 18_000);
+    const gatedRuntime = { fetcher: unreachableFetch(), sleep: async () => {}, now: () => 18_000, rng: () => 0 };
+
+    await processProvisioningMessage('job-1', env, gatedRuntime);
+    expect((await loadProvisioningJob(env.JOBS, 'job-1'))?.wait).not.toBeNull();
+
+    // The window rolls: the next delivery re-evaluates and books the step.
+    await kv.put(GLOBAL_RATE_KEY, JSON.stringify({
+      version: 1,
+      minuteBucket: Math.floor(78_000 / 60_000),
+      hourBucket: Math.floor(78_000 / 3_600_000),
+      minuteCount: 0,
+      hourCount: 0,
+    }), { expirationTtl: 7200 });
+    const { fetcher, calls } = pipelineFetch();
+    const outcome = await processProvisioningMessage(
+      'job-1',
+      env,
+      { fetcher, sleep: async () => {}, now: () => 78_000, rng: () => 0 },
+    );
+
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(calls.mint_token).toBe(1);
+    expect(calls.configure_pages).toBe(1);
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.steps.configure_pages.status).toBe('succeeded');
+    expect(job?.wait).toBeNull();
+  });
+
+  test('a foreign live lease supersedes the job terminally without touching a provider', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    await putAccountLease(kv, { version: 1, jobId: 'job-0', expiresAt: 30_000 });
+
+    const outcome = await processProvisioningMessage(
+      'job-1',
+      env,
+      { fetcher: unreachableFetch(), sleep: async () => {}, now: () => 18_000, rng: () => 0 },
+    );
+
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(queue.sent).toEqual([]);
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('failed');
+    expect(job?.completedAt).toBe(18_000);
+    expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_provisioning_superseded', retryable: false });
+    // The live owner keeps the lease; the superseded duplicate never steals it.
+    expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-0' });
+  });
+
+  test('a read step renews the account lease without consuming budget', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, makeJob());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io') {
+        return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
+      }
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
+        return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 18_000, rng: () => 0 });
+
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(await kv.get(GLOBAL_RATE_KEY)).toBeNull();
+    const lease = JSON.parse(await kv.get(accountLeaseKey(42)) as string) as AccountLease;
+    expect(lease).toMatchObject({ version: 1, jobId: 'job-1', expiresAt: 18_000 + 1800_000 });
   });
 });

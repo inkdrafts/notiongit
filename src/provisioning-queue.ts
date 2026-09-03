@@ -40,9 +40,15 @@ import {
   type ProvisioningJob,
   type ProvisioningStepName,
 } from './provisioning-job';
-import { jitteredDelaySeconds, saveTerminalProvisioningJob } from './provisioning-throttle';
+import {
+  gateProvisioningStep,
+  jitteredDelaySeconds,
+  provisioningThrottleConfig,
+  saveTerminalProvisioningJob,
+  type ProvisioningThrottleVars,
+} from './provisioning-throttle';
 
-export interface ProvisioningQueueEnv extends GithubAppAuthEnv {
+export interface ProvisioningQueueEnv extends GithubAppAuthEnv, ProvisioningThrottleVars {
   JOBS: KVNamespace;
   PROVISIONING_QUEUE: Queue<{ jobId: string }>;
 }
@@ -258,8 +264,52 @@ export async function processProvisioningMessage(
   const step = nextPendingStep(locked);
   if (!step) {
     const finishedMs = now();
-    await saveProvisioningJob(env.JOBS, { ...locked, status: 'succeeded', lock: null, completedAt: finishedMs, updatedAt: finishedMs });
+    await saveTerminalProvisioningJob(env, { ...locked, status: 'succeeded', lock: null, completedAt: finishedMs, updatedAt: finishedMs });
     return { outcome: 'acked' };
+  }
+
+  // One gate pass before any token spend: it supersedes a duplicate that
+  // lost this account to another job, renews the account lease (every step,
+  // so slow poll steps keep it), and — content-creating steps only —
+  // consumes the global mutation budget.
+  const gate = await gateProvisioningStep(env.JOBS, locked, step, provisioningThrottleConfig(env), now(), rng);
+  if (gate.action === 'superseded') {
+    const supersededMs = now();
+    await saveTerminalProvisioningJob(env, {
+      ...locked,
+      status: 'failed',
+      steps: {
+        ...locked.steps,
+        [step]: {
+          ...locked.steps[step],
+          status: 'failed',
+          updatedAt: supersededMs,
+          lastError: { code: 'github_provisioning_superseded', retryable: false },
+        },
+      },
+      lock: null,
+      updatedAt: supersededMs,
+      completedAt: supersededMs,
+    });
+    return { outcome: 'acked' };
+  }
+  if (gate.action === 'wait') {
+    const waitMs = now();
+    // Stay queued, unlocked, and unbilled: a wait is not an attempt. The
+    // breadcrumb carries reason and time only, and is cleared when the step
+    // next books below.
+    await saveProvisioningJob(env.JOBS, {
+      ...locked,
+      status: 'queued',
+      lock: null,
+      wait: { reason: gate.reason, untilMs: waitMs + gate.delaySeconds * 1000, updatedAt: waitMs },
+    });
+    try {
+      await env.PROVISIONING_QUEUE.send({ jobId }, { delaySeconds: gate.delaySeconds });
+      return { outcome: 'acked' };
+    } catch {
+      return { outcome: 'retry', delaySeconds: gate.delaySeconds };
+    }
   }
 
   let installationToken: string;
@@ -272,6 +322,7 @@ export async function processProvisioningMessage(
   const inProgressMs = now();
   const inProgress: ProvisioningJob = {
     ...locked,
+    wait: null,
     steps: { ...locked.steps, [step]: { ...locked.steps[step], status: 'in_progress', updatedAt: inProgressMs } },
   };
   await saveProvisioningJob(env.JOBS, inProgress);

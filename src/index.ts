@@ -30,6 +30,7 @@ import {
   nextPendingStep,
   saveProvisioningJob,
 } from './provisioning-job';
+import { saveTerminalProvisioningJob } from './provisioning-throttle';
 import { processProvisioningMessage } from './provisioning-queue';
 import {
   beginNotionAuthorization,
@@ -803,7 +804,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       // then let the request surface as a 502.
       const failedStep = nextPendingStep(job);
       if (failedStep) {
-        await saveProvisioningJob(env.JOBS, {
+        await saveTerminalProvisioningJob(env as Pick<Env, 'JOBS'>, {
           ...job,
           status: 'dead_letter',
           steps: {
