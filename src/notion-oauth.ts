@@ -7,6 +7,7 @@
  * returned to the browser.
  */
 
+import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import type { NotionTemplateErrorCode } from './notion-template';
 
 export const NOTION_AUTHORIZATION_URL = 'https://api.notion.com/v1/oauth/authorize';
@@ -22,7 +23,7 @@ const JSON_HEADERS = {
   'cache-control': 'no-store',
 };
 
-export interface NotionOAuthEnv {
+export interface NotionOAuthEnv extends ObservabilityEnv {
   JOBS: KVNamespace;
   NOTION_CLIENT_ID: string;
   NOTION_CLIENT_SECRET: string;
@@ -247,6 +248,7 @@ export async function beginNotionAuthorization(
   const requestedJobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
   const jobId = requestedJobId || crypto.randomUUID();
   if (!validJobId(jobId)) return response({ error: 'invalid_job_id' }, 400);
+  emitProvisioningEvent(env, { type: 'consent_started', jobId, ts: Date.now(), provider: 'notion' });
 
   const now = Math.floor(Date.now() / 1000);
   const payload: NotionStatePayload = {
@@ -401,6 +403,14 @@ export async function finishNotionCallback(
     };
     await options.continueOnboarding?.(continuation);
 
+    emitProvisioningEvent(env, {
+      type: 'consent_completed',
+      jobId: payload.jobId,
+      ts: Date.now(),
+      provider: 'notion',
+      templateDuplicated: continuation.duplicatedTemplateId !== null,
+    });
+
     const summary: NotionOAuthSummary = {
       ok: true,
       status: 'notion_authorized',
@@ -409,6 +419,13 @@ export async function finishNotionCallback(
     };
     return response(summary, 202, clearCookieHeaders);
   } catch (error) {
+    emitProvisioningEvent(env, {
+      type: 'consent_failed',
+      jobId: payload.jobId,
+      ts: Date.now(),
+      provider: 'notion',
+      errorCode: error instanceof NotionOAuthError ? error.code : 'notion_unavailable',
+    });
     if (error instanceof NotionOAuthError) {
       const body: Record<string, unknown> = { error: error.code };
       // Only non-secret schema metadata the continuation attached on purpose.
