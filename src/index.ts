@@ -13,36 +13,23 @@ import {
   type RepositoryDestination,
 } from './repository-naming';
 import {
-  awaitGeneratedRepositoryCommit,
   generateOrReuseRepository,
   GithubGenerateError,
   type GeneratedRepositoryIdentity,
 } from './repository-generation';
 import {
-  configureGithubPages,
-  GithubPagesError,
-  type GithubPagesIdentity,
-} from './github-pages';
-import {
   GithubActionsSecretsError,
 } from './actions-secrets';
 import {
-  patchRepositoryConfig,
-  GithubConfigError,
-} from './repository-config';
+  getAppInstallation,
+  GithubAppAuthError,
+  type GithubInstallationAccount,
+} from './github-app-auth';
 import {
-  awaitNotionSyncRun,
-  dispatchAndCorrelateNotionSync,
-  GithubSyncError,
-  type NotionSyncRunIdentity,
-} from './notion-sync';
-import {
-  awaitPagesBuildForCommit,
-  getRepositoryMainHeadSha,
-  verifyPublicSiteReachable,
-  GithubDeployError,
-  type GithubPagesBuildIdentity,
-} from './site-deployment';
+  createProvisioningJob,
+  saveProvisioningJob,
+} from './provisioning-job';
+import { processProvisioningMessage } from './provisioning-queue';
 
 
 export {
@@ -156,6 +143,57 @@ export type {
   SiteVerifyOptions,
 } from './site-deployment';
 
+export {
+  createGithubInstallationToken,
+  getAppInstallation,
+  GithubAppAuthError,
+} from './github-app-auth';
+export type { GithubAppAuthEnv, GithubInstallationAccount } from './github-app-auth';
+
+export {
+  createProvisioningJob,
+  isTerminalProvisioningStatus,
+  loadProvisioningJob,
+  nextPendingStep,
+  provisioningJobKey,
+  provisioningRetryDelaySeconds,
+  saveProvisioningJob,
+  tryAcquireProvisioningLock,
+  PROVISIONING_JOB_PREFIX,
+  PROVISIONING_JOB_TTL_SECONDS,
+  PROVISIONING_JOB_VERSION,
+  PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
+  PROVISIONING_LOCK_TTL_MS,
+  PROVISIONING_STEP_MAX_ATTEMPTS,
+  PROVISIONING_STEP_ORDER,
+} from './provisioning-job';
+export type {
+  CreateProvisioningJobParams,
+  NotionSyncProgress,
+  ProvisioningJob,
+  ProvisioningJobData,
+  ProvisioningJobIdentity,
+  ProvisioningJobLock,
+  ProvisioningJobStatus,
+  ProvisioningStepError,
+  ProvisioningStepName,
+  ProvisioningStepState,
+  ProvisioningStepStatus,
+  SiteDeploymentProgress,
+  SyncDispatchMarker,
+} from './provisioning-job';
+
+export { PROVISIONING_STEP_HANDLERS } from './provisioning-steps';
+export type { ProvisioningStepHandler, StepRunnerContext } from './provisioning-steps';
+
+export { classifyProvisioningError, processProvisioningMessage } from './provisioning-queue';
+export type {
+  ProvisioningErrorClassification,
+  ProvisioningMessageOutcome,
+  ProvisioningQueueEnv,
+  ProvisioningRuntimeOptions,
+} from './provisioning-queue';
+
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
   JOBS: KVNamespace;
@@ -183,41 +221,12 @@ export interface GithubIdentity {
   accountType: 'User' | 'Organization';
 }
 
-export interface GithubOnboardingResult {
-  jobId: string;
-  installationId: number;
-  identity: GithubIdentity;
-  repository: RepositoryDestination;
-  generatedRepository: GeneratedRepositoryIdentity;
-  pages: GithubPagesIdentity;
-  sync: NotionSyncStatus;
-  deployment: SiteDeploymentStatus;
-}
-
-/** Non-secret sync progress, correlated once and reused across retries. */
-export interface NotionSyncStatus {
-  runId: number;
-  htmlUrl: string;
-  conclusion: string | null;
-}
-
-/** Non-secret deployment progress, recorded only once the site answers. */
-export interface SiteDeploymentStatus {
-  commitSha: string;
-  buildId: number | null;
-  status: GithubPagesBuildIdentity['status'];
-  verifiedAt: number;
-}
-
 const GITHUB_API = 'https://api.github.com';
 const GITHUB_INSTALL_URL = 'https://github.com/apps';
 const GITHUB_API_VERSION = '2022-11-28';
 const STATE_TTL_SECONDS = 10 * 60;
 const STATE_REPLAY_TTL_SECONDS = 60 * 60;
-const JOB_TTL_SECONDS = 24 * 60 * 60;
 const STATE_PREFIX = 'github:oauth-state:';
-const JOB_PREFIX = 'github:onboarding-job:';
-const SYNC_RUN_PREFIX = 'github:onboarding-sync-run:';
 
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
@@ -265,34 +274,10 @@ interface GithubStateRecord {
   identity?: GithubIdentity;
 }
 
-interface GithubJobRecord {
-  version: 1;
-  jobId: string;
-  status: 'site_live';
-  installationId: number;
-  identity: GithubIdentity;
-  repository: RepositoryDestination;
-  generatedRepository: GeneratedRepositoryIdentity;
-  pages: GithubPagesIdentity;
-  sync: NotionSyncStatus;
-  deployment: SiteDeploymentStatus;
-  completedAt: number;
-}
-
 interface GithubUserResponse {
   id?: number;
   login?: string;
   type?: string;
-}
-
-interface GithubInstallationResponse {
-  account?: {
-    id?: number;
-    login?: string;
-    type?: string;
-  };
-  suspended_at?: string | null;
-  suspended_by?: unknown;
 }
 
 interface GithubInstallationsResponse {
@@ -410,26 +395,6 @@ function stateKey(nonce: string): string {
   return `${STATE_PREFIX}${nonce}`;
 }
 
-function jobKey(jobId: string): string {
-  return `${JOB_PREFIX}${jobId}`;
-}
-
-function syncRunKey(jobId: string): string {
-  return `${SYNC_RUN_PREFIX}${jobId}`;
-}
-
-/**
- * The dispatched run is correlated once and persisted immediately, before
- * this Worker waits on it. A retry that reaches this step again resumes by
- * polling the same run instead of dispatching a second one — this is what
- * keeps a partially completed job from creating unbounded workflow runs.
- */
-interface SyncRunRecord {
-  version: 1;
-  runId: number;
-  htmlUrl: string;
-}
-
 function validJobId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 }
@@ -512,8 +477,8 @@ async function getAuthenticatedGithubUser(accessToken: string): Promise<GithubId
 async function getUserInstallation(
   accessToken: string,
   installationId: number,
-): Promise<GithubInstallationResponse> {
-  return githubRequest<GithubInstallationResponse>(`/user/installations/${installationId}`, {
+): Promise<GithubInstallationAccount> {
+  return githubRequest<GithubInstallationAccount>(`/user/installations/${installationId}`, {
     headers: githubHeaders(`Bearer ${accessToken}`),
   });
 }
@@ -533,7 +498,7 @@ async function findUserInstallation(
 }
 
 function installationIdentity(
-  installation: GithubInstallationResponse,
+  installation: GithubInstallationAccount,
 ): GithubIdentity {
   const account = installation.account;
   if (!account || !Number.isSafeInteger(account.id) || !account.login) throw new GithubApiError(502);
@@ -543,7 +508,7 @@ function installationIdentity(
 }
 
 function assertUsablePersonalInstallation(
-  installation: GithubInstallationResponse,
+  installation: GithubInstallationAccount,
   authenticatedUser?: GithubIdentity,
 ): GithubIdentity {
   if (installation.suspended_at || installation.suspended_by) {
@@ -562,92 +527,6 @@ function assertUsablePersonalInstallation(
   return identity;
 }
 
-function derLength(length: number): Uint8Array {
-  if (length < 128) return Uint8Array.of(length);
-  const bytes: number[] = [];
-  for (let value = length; value > 0; value = Math.floor(value / 256)) bytes.unshift(value & 0xff);
-  return Uint8Array.of(0x80 | bytes.length, ...bytes);
-}
-
-function concatBytes(...parts: Uint8Array[]): Uint8Array {
-  const result = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
-  let offset = 0;
-  for (const part of parts) {
-    result.set(part, offset);
-    offset += part.length;
-  }
-  return result;
-}
-
-function pemToPkcs8(pem: string): ArrayBuffer {
-  const pkcs1 = pem.includes('BEGIN RSA PRIVATE KEY');
-  const label = pkcs1 ? 'RSA PRIVATE KEY' : 'PRIVATE KEY';
-  const match = pem.match(new RegExp(`-----BEGIN ${label}-----\\s*([A-Za-z0-9+/=\\s]+?)\\s*-----END ${label}-----`));
-  if (!match) throw new Error('invalid private key');
-  const der = Uint8Array.from(atob(match[1].replace(/\s+/gu, '')), (character) => character.charCodeAt(0));
-  if (!pkcs1) return der.buffer as ArrayBuffer;
-
-  const algorithm = Uint8Array.of(
-    0x30, 0x0d,
-    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
-    0x05, 0x00,
-  );
-  const version = Uint8Array.of(0x02, 0x01, 0x00);
-  const octet = concatBytes(Uint8Array.of(0x04), derLength(der.length), der);
-  const pkcs8Content = concatBytes(version, algorithm, octet);
-  return concatBytes(Uint8Array.of(0x30), derLength(pkcs8Content.length), pkcs8Content).buffer as ArrayBuffer;
-}
-
-async function createAppJwt(env: Pick<Env, 'GITHUB_APP_ID' | 'GITHUB_APP_PRIVATE_KEY'>): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  const header = base64UrlEncode(textEncoder.encode(JSON.stringify({ alg: 'RS256', typ: 'JWT' })));
-  const payload = base64UrlEncode(textEncoder.encode(JSON.stringify({
-    iat: now - 60,
-    exp: now + 9 * 60,
-    iss: env.GITHUB_APP_ID,
-  })));
-  const key = await crypto.subtle.importKey(
-    'pkcs8',
-    pemToPkcs8(env.GITHUB_APP_PRIVATE_KEY),
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, textEncoder.encode(`${header}.${payload}`));
-  return `${header}.${payload}.${base64UrlEncode(new Uint8Array(signature))}`;
-}
-
-/**
- * Mint an installation token for the next provisioning operation.
- *
- * The token is returned to the caller so it can be used immediately; this
- * module never stores it. Callers should not put the result in a job record.
- */
-export async function createGithubInstallationToken(
-  env: Pick<Env, 'GITHUB_APP_ID' | 'GITHUB_APP_PRIVATE_KEY'>,
-  installationId: number,
-): Promise<string> {
-  if (!Number.isSafeInteger(installationId) || installationId <= 0) throw new Error('invalid installation id');
-  const jwt = await createAppJwt(env);
-  const response = await fetch(`${GITHUB_API}/app/installations/${installationId}/access_tokens`, {
-    method: 'POST',
-    headers: githubHeaders(`Bearer ${jwt}`),
-  });
-  const body = await readJson<{ token?: string }>(response);
-  if (!response.ok || !body?.token) throw new GithubApiError(response.status || 502);
-  return body.token;
-}
-
-async function getAppInstallation(
-  env: Pick<Env, 'GITHUB_APP_ID' | 'GITHUB_APP_PRIVATE_KEY'>,
-  installationId: number,
-): Promise<GithubInstallationResponse> {
-  const jwt = await createAppJwt(env);
-  return githubRequest<GithubInstallationResponse>(`/app/installations/${installationId}`, {
-    headers: githubHeaders(`Bearer ${jwt}`),
-  });
-}
-
 function authError(error: unknown): Response {
   if (error instanceof Error) {
     switch (error.message) {
@@ -656,7 +535,7 @@ function authError(error: unknown): Response {
       case 'github_account_mismatch': return json({ error: error.message }, 403);
     }
   }
-  if (error instanceof GithubApiError) {
+  if (error instanceof GithubApiError || error instanceof GithubAppAuthError) {
     if (error.status === 404) return json({ error: 'github_installation_missing' }, 400);
     if (error.status === 400 || error.status === 401) return json({ error: 'github_authorization_failed' }, 400);
   }
@@ -671,28 +550,12 @@ function authError(error: unknown): Response {
     if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
     return json(body, error.status);
   }
-  if (error instanceof GithubPagesError) {
-    const body: Record<string, unknown> = { error: error.code };
-    if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
-    return json(body, error.status);
-  }
   if (error instanceof GithubActionsSecretsError) {
     return json({ error: error.code }, error.status);
   }
-  if (error instanceof GithubSyncError) {
-    const body: Record<string, unknown> = { error: error.code };
-    if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
-    return json(body, error.status);
-  }
-  if (error instanceof GithubDeployError) {
-    return json({ error: error.code }, error.status);
-  }
-  if (error instanceof GithubConfigError) {
-    if (error.status === 400 || error.status === 401) {
-      return json({ error: 'github_authorization_failed' }, 400);
-    }
-    return json({ error: error.code }, error.status);
-  }
+  // Pages, config-patch, sync-dispatch, and deploy failures no longer surface
+  // here: those steps run in the durable provisioning queue (see
+  // `provisioning-queue.ts`), not inside this synchronous request.
   // Deliberately do not expose provider response bodies, OAuth codes, tokens,
   // private keys, or exception messages to the browser.
   return json({ error: 'github_authorization_unavailable' }, 502);
@@ -730,7 +593,7 @@ async function beginGithubInstall(request: Request, env: Partial<Env>): Promise<
 }
 
 async function finishGithubCallback(request: Request, env: Partial<Env>): Promise<Response> {
-  if (!env.JOBS || !env.GITHUB_APP_ID || !env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+  if (!env.JOBS || !env.PROVISIONING_QUEUE || !env.GITHUB_APP_ID || !env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
     return json({ error: 'github_configuration_missing' }, 500);
   }
   const url = new URL(request.url);
@@ -810,75 +673,35 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
 
     if (!identity || !repository || !generatedRepository) return json({ error: 'github_identity_missing' }, 400);
 
-    // Verification uses the installation token: the repository was added to
-    // the installation automatically, so a readable `main` commit also proves
-    // the App can act on the repository for every later provisioning step.
-    const installationToken = await createGithubInstallationToken(
-      env as Pick<Env, 'GITHUB_APP_ID' | 'GITHUB_APP_PRIVATE_KEY'>,
-      selectedInstallationId,
-    );
-    const usable = await awaitGeneratedRepositoryCommit(`Bearer ${installationToken}`, generatedRepository.fullName);
-    await patchRepositoryConfig(installationToken, generatedRepository.fullName, repository);
-    generatedRepository = {
-      ...generatedRepository,
-      headSha: usable.headSha,
-      headTreeSha: usable.headTreeSha,
-    };
-
-    // Pages configuration uses the installation token, whose Pages and
-    // Administration permissions are the least privilege needed for this
-    // operation. A 409 is reconciled by configureGithubPages, so retries after
-    // a partial callback never create or mutate a second repository.
-    const pages = await configureGithubPages(installationToken, generatedRepository.fullName);
-
-    // The dispatched run is correlated and persisted before this Worker waits
-    // on it, so a retry that reaches this step again resumes the same run
-    // instead of dispatching a duplicate — a partially completed job can
-    // never create an unbounded number of workflow runs.
-    let syncRunRecord = await env.JOBS.get<SyncRunRecord>(syncRunKey(record.jobId), 'json');
-    if (!syncRunRecord || syncRunRecord.version !== 1) {
-      const correlated = await dispatchAndCorrelateNotionSync(installationToken, generatedRepository.fullName);
-      syncRunRecord = { version: 1, runId: correlated.runId, htmlUrl: correlated.htmlUrl };
-      await env.JOBS.put(syncRunKey(record.jobId), JSON.stringify(syncRunRecord), { expirationTtl: JOB_TTL_SECONDS });
-    }
-    const syncRun: NotionSyncRunIdentity = await awaitNotionSyncRun(
-      installationToken,
-      generatedRepository.fullName,
-      syncRunRecord.runId,
-    );
-
-    // Pages rebuilds automatically on every push to `main`, so the build to
-    // wait for is identified by matching the commit the sync run left behind
-    // (or the repository's existing HEAD, when the run changed nothing)
-    // rather than by an id this Worker mints.
-    const headSha = await getRepositoryMainHeadSha(installationToken, generatedRepository.fullName);
-    if (!pages.htmlUrl) throw new GithubDeployError('github_deploy_unavailable', 502);
-    const build = await awaitPagesBuildForCommit(installationToken, generatedRepository.fullName, headSha);
-    await verifyPublicSiteReachable(pages.htmlUrl);
-
-    const completed: GithubJobRecord = {
-      version: 1,
+    // Everything after this point — verifying the generated repository is
+    // readable, patching its config, enabling Pages, dispatching and
+    // awaiting the Notion sync, and awaiting the resulting deploy — no
+    // longer needs the short-lived OAuth token in memory: each step mints
+    // its own installation token from `selectedInstallationId`, a durable,
+    // non-secret identifier. So it moves off this request and onto the
+    // durable provisioning queue, which can retry any step independently
+    // and survives this Worker restarting mid-pipeline.
+    const job = createProvisioningJob({
       jobId: record.jobId,
-      status: 'site_live',
       installationId: selectedInstallationId,
       identity,
       repository,
       generatedRepository,
-      pages,
-      sync: { runId: syncRun.runId, htmlUrl: syncRun.htmlUrl, conclusion: syncRun.conclusion },
-      deployment: { commitSha: headSha, buildId: build.buildId, status: build.status, verifiedAt: Date.now() },
-      completedAt: Date.now(),
-    };
-    await env.JOBS.put(jobKey(record.jobId), JSON.stringify(completed), { expirationTtl: JOB_TTL_SECONDS });
+      now: Date.now(),
+    });
+    await saveProvisioningJob(env.JOBS, job);
     await env.JOBS.put(
       stateKey(payload.nonce),
       JSON.stringify({ ...record, phase: 'consumed', installationId: selectedInstallationId, identity }),
       { expirationTtl: STATE_REPLAY_TTL_SECONDS },
     );
+    await env.PROVISIONING_QUEUE.send({ jobId: job.jobId });
+
     return json({
       ok: true,
-      job_id: completed.jobId,
-      installation_id: completed.installationId,
+      status: 'provisioning',
+      job_id: job.jobId,
+      installation_id: job.installationId,
       github: { id: identity.id, login: identity.login },
       repository: {
         name: repository.name,
@@ -888,24 +711,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
         html_url: generatedRepository.htmlUrl,
         default_branch: generatedRepository.defaultBranch,
       },
-      pages: {
-        status: pages.status,
-        url: pages.url,
-        html_url: pages.htmlUrl,
-        build_type: pages.buildType,
-        source: pages.source,
-      },
-      sync: {
-        run_id: syncRun.runId,
-        html_url: syncRun.htmlUrl,
-        conclusion: syncRun.conclusion,
-      },
-      deployment: {
-        commit_sha: headSha,
-        build_id: build.buildId,
-        status: build.status,
-      },
-    });
+    }, 202);
   } catch (error) {
     return authError(error);
   }
@@ -943,21 +749,32 @@ export function route(request: Request, env: Partial<Env> = {}): Response | Prom
   );
 }
 
-const worker: ExportedHandler<Env> = {
+const worker: ExportedHandler<Env, ProvisioningMessage> = {
   fetch(request, env) {
     return route(request, env);
   },
 
-  async queue(batch) {
-    // The consumer is deliberately a seam until the durable job model lands.
-    // Do not log message bodies: future messages may contain sensitive state.
-    console.info('provisioning queue received a batch', {
-      queue: batch.queue,
-      messageCount: batch.messages.length,
-    });
-
+  async queue(batch, env) {
+    // Do not log message bodies: they may reference a job whose future
+    // steps carry provider identifiers.
     for (const message of batch.messages) {
-      message.retry();
+      try {
+        const jobId = message.body?.jobId;
+        if (typeof jobId !== 'string' || !validJobId(jobId)) {
+          message.ack();
+          continue;
+        }
+        const outcome = await processProvisioningMessage(jobId, env, {});
+        if (outcome.outcome === 'retry') message.retry({ delaySeconds: outcome.delaySeconds });
+        else message.ack();
+      } catch {
+        // An unexpected failure means this job's KV record could not be
+        // read or written. Retry it: Cloudflare's own backoff and
+        // max_retries/dead-letter-queue act as the outer safety net for
+        // this, rather than the application-level classification in
+        // `processProvisioningMessage`.
+        message.retry();
+      }
     }
   },
 };

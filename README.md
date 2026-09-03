@@ -23,30 +23,43 @@ The Worker entrypoint is [`src/index.ts`](src/index.ts). It exposes
 and handles the signed callback at `GET /auth/github/callback`. The callback
 exchanges the OAuth code server-side, verifies that the authenticated personal
 account owns the installation, selects a collision-safe repository destination,
-generates that repository from `inkdrafts/notiongit-template`, enables legacy
-GitHub Pages from `main:/`, dispatches the generated repository's own Notion
-sync workflow and waits for it to complete, then waits for the matching Pages
-build and confirms the public site actually answers before declaring success.
-It stores only GitHub identity, installation, destination, generated-repository
+and generates that repository from `inkdrafts/notiongit-template` — the only
+part of provisioning that needs the short-lived OAuth token in memory. It then
+persists a durable `ProvisioningJob` record and enqueues it on
+`PROVISIONING_QUEUE`, responding `202` with only the GitHub identity and
+repository destination known so far. Everything after that — verifying the
+generated repository, enabling legacy GitHub Pages from `main:/`, dispatching
+the generated repository's own Notion sync workflow and waiting for it to
+complete, then waiting for the matching Pages build and confirming the public
+site actually answers — runs as durable, independently retriable steps in the
+provisioning queue consumer, implemented in
+[`src/provisioning-job.ts`](src/provisioning-job.ts),
+[`src/provisioning-steps.ts`](src/provisioning-steps.ts), and
+[`src/provisioning-queue.ts`](src/provisioning-queue.ts). The job record
+stores only GitHub identity, installation, destination, generated-repository
 metadata, non-secret Pages status/URL metadata, and non-secret sync/deployment
 progress (run id and URL, conclusion, commit sha, build id and status) in
 `JOBS`; OAuth and installation tokens are never persisted or returned to
-browser code. It also wires the `PROVISIONING_QUEUE` Queue binding.
+browser code — every queue step mints its own installation token from the
+job's durable installation id (see
+[`src/github-app-auth.ts`](src/github-app-auth.ts)) and discards it when the
+step returns. See [`docs/architecture.md`](docs/architecture.md) for the full
+job schema, locking, retry/dead-letter behavior, and sequence.
 
-The sync dispatch and deploy-verification steps are implemented in
+The sync dispatch and deploy-verification provider calls are implemented in
 [`src/notion-sync.ts`](src/notion-sync.ts) and
 [`src/site-deployment.ts`](src/site-deployment.ts). `workflow_dispatch` never
 returns a run id, so the dispatched run is correlated by snapshotting the
 workflow's run ids immediately before dispatch and adopting the first new
 `workflow_dispatch` run created afterward; that correlation is persisted
-before the Worker waits on it, so a retry resumes polling the same run
-instead of dispatching a duplicate. Once the run completes, the Worker waits
+before the queue step waits on it, so a retry resumes polling the same run
+instead of dispatching a duplicate. Once the run completes, the queue waits
 for the Pages build matching the resulting commit and then the public URL
 itself, since a build finishing does not guarantee the CDN in front of it
 already serves the new content. Workflow failure, Pages build failure,
 polling timeout, and unreachable-URL propagation each surface as a distinct
-job error. See [`docs/architecture.md`](docs/architecture.md) for the full
-sequence.
+step error, classified as retryable or terminal by
+[`src/provisioning-queue.ts`](src/provisioning-queue.ts).
 
 `/connect/github` accepts an optional `job_id` (or `jobId`) and generates one
 when omitted. The signed state expires after ten minutes and is marked consumed
@@ -61,23 +74,26 @@ sequence `<login>-inkdrafts`, `<login>-inkdrafts-2`, and so on, mapping each to
 
 Generation is implemented in [`src/repository-generation.ts`](src/repository-generation.ts),
 and Pages reconciliation is implemented in [`src/github-pages.ts`](src/github-pages.ts).
-It happens inside the callback while the short-lived user access token is still
-in memory, because creating a repository from a template requires
+Generation happens inside the callback while the short-lived user access token
+is still in memory, because creating a repository from a template requires
 user-to-server authentication; the call sets public visibility and the product
 description `Notion-powered site published with InkDrafts`. That description is
 also the idempotency marker: a retry that finds an owned non-fork repository
 carrying it adopts that repository instead of creating a duplicate, and a `422`
 name collision first checks whether the occupier is InkDrafts' own before
-advancing to the next deterministic name. Once GitHub returns the repository,
-the Worker verifies it with an installation token — polling with exponential
-backoff until `main` reports a readable initial commit — so success also proves
-the App installation received the repository. Timeout, rate limit, exhausted
-names, and unavailability surface as distinct JSON errors, each resumable by
-restarting the flow.
+advancing to the next deterministic name. Timeout, rate limit, exhausted
+names, and unavailability surface as distinct JSON errors from the callback,
+each resumable by restarting the flow. Once GitHub returns the repository,
+the queue's first step (`verify_repository`) verifies it with a freshly minted
+installation token — polling with exponential backoff until `main` reports a
+readable initial commit — so success also proves the App installation
+received the repository.
 
 Before a real deployment, replace the KV placeholder in `wrangler.toml` with
-the namespace ID returned by Wrangler and create the provisioning queues. The
-staging and production bindings are intentionally separate. See
+the namespace ID returned by Wrangler and create the provisioning queues named
+in `wrangler.toml`, including each environment's dead-letter queue (for
+example, `wrangler queues create notiongit-provisioning-dlq`). The staging and
+production bindings are intentionally separate. See
 [`docs/architecture.md`](docs/architecture.md) for environment setup, secret
 names, and the deployment workflow.
 

@@ -19,16 +19,24 @@ GITHUB_APP_SLUG = "inkdrafts"
 binding = "JOBS"
 id = "59f940cb5bde46e0ad0a4fe4ccba5919"
 
-# Create this queue once with `wrangler queues create notiongit-provisioning`.
+# Create this queue once with `wrangler queues create notiongit-provisioning`,
+# and the dead-letter queue once with
+# `wrangler queues create notiongit-provisioning-dlq`.
 [[queues.producers]]
 binding = "PROVISIONING_QUEUE"
 queue = "notiongit-provisioning"
 
-# The handler currently retries messages until the durable job model is added.
+# Each queue message advances one durable job by one step (see
+# `provisioning-queue.ts`); a step the application classifies as terminal is
+# acked immediately (the job's own record becomes its permanent record of
+# that failure), so `max_retries`/`dead_letter_queue` here are the platform's
+# own backstop for the case the consumer throws unexpectedly.
 [[queues.consumers]]
 queue = "notiongit-provisioning"
 max_batch_size = 10
 max_batch_timeout = 5
+max_retries = 6
+dead_letter_queue = "notiongit-provisioning-dlq"
 
 # Non-production environments use separate resources and names.
 [env.staging]
@@ -51,6 +59,8 @@ queue = "notiongit-staging-provisioning"
 queue = "notiongit-staging-provisioning"
 max_batch_size = 10
 max_batch_timeout = 5
+max_retries = 6
+dead_letter_queue = "notiongit-staging-provisioning-dlq"
 
 [env.production]
 name = "notiongit"
@@ -72,3 +82,5 @@ queue = "notiongit-provisioning"
 queue = "notiongit-provisioning"
 max_batch_size = 10
 max_batch_timeout = 5
+max_retries = 6
+dead_letter_queue = "notiongit-provisioning-dlq"
