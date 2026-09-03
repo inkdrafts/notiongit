@@ -18,7 +18,18 @@ The initial Cloudflare Workers sealed-box experiment is documented in
 the hosting decision is recorded in
 [`docs/decisions/0001-sealed-box-on-workers.md`](docs/decisions/0001-sealed-box-on-workers.md).
 
-The Worker entrypoint is [`src/index.ts`](src/index.ts). It exposes
+The Worker entrypoint is [`src/index.ts`](src/index.ts). `GET /` serves the
+public landing page ([`src/landing-page.ts`](src/landing-page.ts)): a
+self-contained, server-rendered document with no client JavaScript and no
+external requests (fonts, scripts, or images), so its core content and the
+single `/connect/notion` call to action work with JavaScript disabled. It
+explains what InkDrafts creates, owns, and costs; the real three-stage
+onboarding flow and why each provider's permissions are requested; and
+privacy/security notes and links to the three public repositories. It
+deliberately never links `/connect/github` or the App install page — the
+GitHub App stays unadvertised from inkdrafts.com until the M5 launch issue
+(see [`docs/github-app-runbook.md`](docs/github-app-runbook.md)). It also
+exposes
 `GET /healthz`, starts Notion-first onboarding at `GET /connect/notion?job_id=...`,
 and handles the signed Notion callback at `GET /auth/notion/callback`. The Notion
 callback exchanges the code server-side and, while the access token is still
