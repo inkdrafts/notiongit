@@ -8,6 +8,7 @@ import {
   isValidGithubRepositoryName,
   route,
   saveProvisioningJob,
+  saveNotionTemplateResolution,
   selectGithubRepositoryDestination,
   selectRepositoryDestination,
   type Env,
@@ -177,8 +178,9 @@ function generateThrowawayPrivateKey(): Promise<string> {
 async function githubEnv(
   kv = new MemoryKV(),
   queue = new MemoryQueue<ProvisioningMessage>(),
+  withValidatedTemplate = true,
 ): Promise<Partial<Env>> {
-  return {
+  const env = {
     JOBS: kv as unknown as KVNamespace,
     PROVISIONING_QUEUE: queue as unknown as Queue<ProvisioningMessage>,
     GITHUB_APP_ID: '4798518',
@@ -189,6 +191,30 @@ async function githubEnv(
     NOTION_CLIENT_ID: 'not-used',
     NOTION_CLIENT_SECRET: 'not-used',
   };
+  if (withValidatedTemplate) await saveNotionTemplateResolution(env.JOBS, {
+    version: 1,
+    jobId: 'job-123',
+    resolution: {
+      pagesDatabaseId: '11111111-1111-4111-8111-111111111111',
+      postsDatabaseId: '22222222-2222-4222-8222-222222222222',
+      templateSchemaVersion: 1,
+      scannedDatabaseCount: 2,
+      pagesSchema: {
+        databaseId: '11111111-1111-4111-8111-111111111111',
+        propertyTypes: {
+          Slug: 'rich_text', Type: 'select', 'Nav Order': 'number', 'Show in Nav': 'checkbox', Status: 'select',
+        },
+        optionNames: { Type: ['home', 'blog-list', 'blog', 'markdown'], Status: ['Draft', 'Published'] },
+      },
+      postsSchema: {
+        databaseId: '22222222-2222-4222-8222-222222222222',
+        propertyTypes: { Slug: 'rich_text', 'Publish Date': 'date', Tags: 'multi_select', Status: 'select' },
+        optionNames: { Status: ['Draft', 'Published'] },
+      },
+      resolvedAt: Date.now(),
+    },
+  });
+  return env;
 }
 
 async function getInstallState(env: Partial<Env>): Promise<{ state: string; jobId: string }> {
@@ -235,6 +261,46 @@ describe('HTTP foundation', () => {
 });
 
 describe('GitHub App install and authorize flow', () => {
+  test('blocks GitHub connection until Notion schema validation has completed', async () => {
+    const env = await githubEnv(new MemoryKV(), new MemoryQueue<ProvisioningMessage>(), false);
+
+    const response = await route(new Request('https://example.com/connect/github?job_id=job-123'), env);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: 'notion_template_not_validated',
+      message: 'Connect Notion and complete the Pages and Posts database check before connecting GitHub.',
+    });
+  });
+
+  test('rechecks the validated schema before exchanging the GitHub code', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    const { state } = await getInstallState(env);
+    await kv.put('notion:template-resolution:job-123', JSON.stringify({ version: 1, jobId: 'job-123' }));
+    const originalFetch = globalThis.fetch;
+    let providerCalls = 0;
+    globalThis.fetch = (async () => {
+      providerCalls += 1;
+      throw new Error('GitHub must not be contacted');
+    }) as typeof fetch;
+
+    try {
+      const response = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code`),
+        env,
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: 'notion_template_not_validated',
+        message: 'Connect Notion and complete the Pages and Posts database check before connecting GitHub.',
+      });
+      expect(providerCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test('creates a signed, expiring install URL bound to the onboarding job', async () => {
     const kv = new MemoryKV();
     const env = await githubEnv(kv);

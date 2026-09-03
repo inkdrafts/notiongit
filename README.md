@@ -94,17 +94,23 @@ role matches nothing), `notion_template_database_ambiguous` (a fingerprint
 matched more than one database, or a database matched both — never guessed),
 `notion_template_not_duplicated` (the authorization used manual page selection;
 the programmatic-creation fallback of ADR 0002 §2 is future work),
-`notion_template_root_unavailable`, `notion_template_root_empty`, and
-`notion_template_unavailable`. The resolution — normalized database IDs plus a
-non-secret schema summary (property types and select options) for the later
-schema-validation step — is persisted under
-`notion:template-resolution:<job id>` in `JOBS`; the access token is never
+`notion_template_root_unavailable`, `notion_template_root_empty`,
+`notion_template_schema_invalid`, and `notion_template_unavailable`. A
+successful resolution then validates every required property consumed by the
+sync engine, checks its required select values (`Published` and all supported
+Pages `Type` values), and checks optional fallback fields when they are
+present. Missing fields, wrong types, and unsupported options are returned per
+database with plain-language remediation. The normalized database IDs and
+non-secret validated schema summary are persisted under
+`notion:template-resolution:<job id>` in `JOBS`; `/connect/github` refuses to
+start until that record exists and still validates. The access token is never
 persisted, and page content (titles, rows, text) is never read.
 
-`/connect/notion` and `/connect/github` accept an optional `job_id` (or `jobId`)
-and generate one when omitted. Both signed states expire after ten minutes and
-are replay-tracked in KV. Notion additionally binds the state to an HttpOnly,
-Secure, SameSite cookie. Neither flow stores OAuth codes or user tokens.
+`/connect/notion` accepts an optional `job_id` (or `jobId`) and generates one
+when omitted. `/connect/github` requires the job id from a successful Notion
+validation. Both signed states expire after ten minutes and are replay-tracked
+in KV. Notion additionally binds the state to an HttpOnly, Secure, SameSite
+cookie. Neither flow stores OAuth codes or user tokens.
 
 Repository naming is deterministic. InkDrafts first tries the exact lowercase
 `<login>.github.io` repository, which maps to `https://<login>.github.io` with

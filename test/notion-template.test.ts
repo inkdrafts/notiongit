@@ -15,6 +15,7 @@ import {
   NotionTemplateError,
   resolveNotionTemplateDatabases,
   saveNotionTemplateResolution,
+  validateNotionTemplateSchemas,
 } from '../src/notion-template';
 
 // Synthetic identifiers only — no real workspace IDs, tokens, or content.
@@ -38,7 +39,10 @@ function pagesProperties(): Record<string, unknown> {
   return {
     Title: { type: 'title' },
     Slug: { type: 'rich_text' },
-    Type: { type: 'select', select: { options: [{ name: 'home' }, { name: 'blog' }] } },
+    Type: {
+      type: 'select',
+      select: { options: [{ name: 'home' }, { name: 'blog-list' }, { name: 'blog' }, { name: 'markdown' }] },
+    },
     'Nav Order': { type: 'number' },
     'Show in Nav': { type: 'checkbox' },
     Status: { type: 'select', select: { options: [{ name: 'Draft' }, { name: 'Published' }] } },
@@ -238,6 +242,93 @@ describe('Notion template resolution', () => {
     expect(rootChildrenCalls[1].url.searchParams.get('page_size')).toBe('100');
     // The token never leaks into the result.
     expect(JSON.stringify(resolution)).not.toContain(TOKEN);
+  });
+
+  test('rejects a missing required property with a per-database validation issue', async () => {
+    const pages = pagesProperties();
+    delete pages['Nav Order'];
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pages)]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
+
+    const error = await caught(resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }));
+
+    expect(templateErrorCode(error)).toBe('notion_template_schema_invalid');
+    expect((error as NotionTemplateError).details).toMatchObject({
+      validation: { pages: { valid: false, issues: [{ code: 'missing_property', property: 'Nav Order' }] } },
+    });
+  });
+
+  test('rejects a wrong property type with the expected and actual types', async () => {
+    const posts = postsProperties();
+    posts.Tags = { type: 'rich_text' };
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, posts)]);
+
+    const error = await caught(resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }));
+
+    expect(templateErrorCode(error)).toBe('notion_template_schema_invalid');
+    expect((error as NotionTemplateError).details).toMatchObject({
+      validation: {
+        posts: {
+          issues: [{ code: 'wrong_property_type', property: 'Tags', expectedTypes: ['multi_select'], actualType: 'rich_text' }],
+        },
+      },
+    });
+  });
+
+  test('rejects unsupported select options before onboarding succeeds', async () => {
+    const pages = pagesProperties();
+    (pages.Type as { select: { options: Array<{ name: string }> } }).select.options.push({ name: 'portfolio' });
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pages)]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
+
+    const error = await caught(resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }));
+
+    expect(templateErrorCode(error)).toBe('notion_template_schema_invalid');
+    expect((error as NotionTemplateError).details).toMatchObject({
+      validation: { pages: { issues: [{ code: 'unsupported_option', property: 'Type', unsupportedOptions: ['portfolio'] }] } },
+    });
+  });
+
+  test('rejects a select that cannot provide the Published workflow value', async () => {
+    const posts = postsProperties();
+    (posts.Status as { select: { options: Array<{ name: string }> } }).select.options = [{ name: 'Draft' }];
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, posts)]);
+
+    const error = await caught(resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }));
+
+    expect(templateErrorCode(error)).toBe('notion_template_schema_invalid');
+    expect((error as NotionTemplateError).details).toMatchObject({
+      validation: { posts: { issues: [{ code: 'unsupported_option', property: 'Status', requiredOptions: ['Published'] }] } },
+    });
+  });
+
+  test('allows optional fallback fields to be absent but validates them when present', () => {
+    const valid = validateNotionTemplateSchemas({
+      pagesSchema: {
+        databaseId: PAGES_DB,
+        propertyTypes: { Slug: 'rich_text', Type: 'select', 'Nav Order': 'number', 'Show in Nav': 'checkbox', Status: 'select' },
+        optionNames: { Type: ['home', 'blog-list', 'blog', 'markdown'], Status: ['Published'] },
+      },
+      postsSchema: {
+        databaseId: POSTS_DB,
+        propertyTypes: { Slug: 'rich_text', 'Publish Date': 'date', Tags: 'multi_select', Status: 'select' },
+        optionNames: { Status: ['Published'] },
+      },
+    });
+
+    expect(valid.valid).toBe(true);
+    expect(valid.pages.issues).toEqual([]);
+    expect(valid.posts.issues).toEqual([]);
   });
 
   test('retries an eventually-consistent empty root and then resolves', async () => {

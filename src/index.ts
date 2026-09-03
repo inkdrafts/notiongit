@@ -2,9 +2,9 @@
  * InkDrafts' edge entrypoint.
  *
  * GitHub's OAuth code and all access tokens are deliberately kept inside the
- * request that uses them. KV contains only the signed-state replay marker and
- * the resulting GitHub identity/installation, destination, and generated
- * repository metadata.
+ * request that uses them. KV contains only signed-state replay markers,
+ * validated non-secret Notion schema metadata, and the resulting GitHub
+ * identity/installation, destination, and generated repository metadata.
  */
 
 import {
@@ -39,9 +39,12 @@ import {
   type NotionOAuthRouteOptions,
 } from './notion-oauth';
 import {
+  loadNotionTemplateResolution,
   NotionTemplateError,
+  NOTION_TEMPLATE_SCHEMA_VERSION,
   resolveNotionTemplateDatabases,
   saveNotionTemplateResolution,
+  validateNotionTemplateSchemas,
 } from './notion-template';
 import { LANDING_PAGE } from './landing-page';
 
@@ -241,18 +244,25 @@ export {
   NOTION_TEMPLATE_RESOLUTION_TTL_SECONDS,
   NOTION_TEMPLATE_SCHEMA_VERSION,
   PAGES_FINGERPRINT,
+  PAGES_SCHEMA_CONTRACT,
   POSTS_FINGERPRINT,
+  POSTS_SCHEMA_CONTRACT,
   resolveNotionTemplateDatabases,
   RESOLUTION_INITIAL_DELAY_MS,
   RESOLUTION_MAX_ATTEMPTS,
   RESOLUTION_MAX_DELAY_MS,
   saveNotionTemplateResolution,
+  validateNotionTemplateSchemas,
   TEMPLATE_MAX_BLOCK_PAGE_FETCHES,
   TEMPLATE_MAX_CANDIDATE_DATABASES,
   TEMPLATE_MAX_WALK_DEPTH,
 } from './notion-template';
 export type {
+  NotionDatabaseSchemaValidation,
   NotionDatabaseSchemaSummary,
+  NotionSchemaValidationIssue,
+  NotionSchemaValidationIssueCode,
+  NotionTemplateSchemaValidation,
   NotionTemplateErrorCode,
   NotionTemplateResolution,
   NotionTemplateResolutionRecord,
@@ -461,6 +471,26 @@ function validJobId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 }
 
+const NOTION_TEMPLATE_NOT_VALIDATED_MESSAGE =
+  'Connect Notion and complete the Pages and Posts database check before connecting GitHub.';
+
+async function hasValidatedNotionTemplate(env: Pick<Env, 'JOBS'>, jobId: string): Promise<boolean> {
+  const record = await loadNotionTemplateResolution(env.JOBS, jobId);
+  if (!record || !record.resolution || record.resolution.templateSchemaVersion !== NOTION_TEMPLATE_SCHEMA_VERSION) return false;
+  try {
+    return validateNotionTemplateSchemas(record.resolution).valid;
+  } catch {
+    return false;
+  }
+}
+
+function notionTemplateNotValidatedResponse(): Response {
+  return json({
+    error: 'notion_template_not_validated',
+    message: NOTION_TEMPLATE_NOT_VALIDATED_MESSAGE,
+  }, 400);
+}
+
 function validInstallationId(value: string | null): number | null {
   if (!value || !/^\d{1,20}$/u.test(value)) return null;
   const parsed = Number(value);
@@ -631,6 +661,9 @@ async function beginGithubInstall(request: Request, env: Partial<Env>): Promise<
   const requestedJobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
   const jobId = requestedJobId || crypto.randomUUID();
   if (!validJobId(jobId)) return json({ error: 'invalid_job_id' }, 400);
+  if (!await hasValidatedNotionTemplate(env as Pick<Env, 'JOBS'>, jobId)) {
+    return notionTemplateNotValidatedResponse();
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const payload: SignedStatePayload = {
@@ -674,6 +707,9 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   }
   if (record.phase === 'consumed') return json({ error: 'github_state_replayed' }, 400);
   if (record.expiresAt <= Math.floor(Date.now() / 1000)) return json({ error: 'github_state_expired' }, 400);
+  if (!await hasValidatedNotionTemplate(env as Pick<Env, 'JOBS'>, record.jobId)) {
+    return notionTemplateNotValidatedResponse();
+  }
 
   const installationId = validInstallationId(url.searchParams.get('installation_id'));
   const code = url.searchParams.get('code');

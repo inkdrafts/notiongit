@@ -48,6 +48,53 @@ export const POSTS_FINGERPRINT = {
   },
 } as const;
 
+/**
+ * The sync engine's complete database contract. The five/four properties in
+ * `required` are also the schema fingerprint used to identify each database.
+ * The remaining fields are deliberately optional because the engine has a
+ * documented fallback when they are absent. An optional field is still
+ * checked when present: a wrong Notion type would otherwise become a silent
+ * no-op in the first scheduled sync.
+ */
+export const PAGES_SCHEMA_CONTRACT = {
+  required: {
+    Slug: { names: ['Slug', 'slug'], types: ['rich_text'] },
+    Type: {
+      names: ['Type', 'type'],
+      types: ['select'],
+      options: ['home', 'blog-list', 'blog', 'markdown'],
+      allowedOptions: ['home', 'blog-list', 'blog', 'markdown'],
+    },
+    'Nav Order': { names: ['Nav Order', 'Nav order', 'Order'], types: ['number'] },
+    'Show in Nav': { names: ['Show in Nav', 'Show In Nav', 'Nav'], types: ['checkbox'] },
+    Status: { names: ['Status'], types: ['select'], options: ['Published'], allowedOptions: ['Draft', 'Published'] },
+  },
+  optional: {
+    Title: { names: ['Title', 'title', 'Name'], types: ['title', 'rich_text'] },
+    Description: { names: ['Description', 'Excerpt', 'Summary'], types: ['rich_text'] },
+    Name: { names: ['Name', 'Display Name', 'Author Name'], types: ['rich_text'] },
+    'Profile Picture': { names: ['Profile Picture', 'Avatar', 'Photo'], types: ['rich_text'] },
+    Tagline: { names: ['Tagline', 'Short Bio', 'Subtitle'], types: ['rich_text'] },
+    'Social Links': { names: ['Social Links', 'Socials', 'Links'], types: ['rich_text'] },
+  },
+} as const;
+
+export const POSTS_SCHEMA_CONTRACT = {
+  required: {
+    Slug: { names: ['Slug', 'slug'], types: ['rich_text'] },
+    'Publish Date': { names: ['Publish Date', 'Date', 'Published'], types: ['date'] },
+    Tags: { names: ['Tags'], types: ['multi_select'] },
+    Status: { names: ['Status'], types: ['select'], options: ['Published'], allowedOptions: ['Draft', 'Published'] },
+  },
+  optional: {
+    Title: { names: ['Title', 'title', 'Name'], types: ['title', 'rich_text'] },
+    Description: { names: ['Description', 'Excerpt', 'Summary'], types: ['rich_text'] },
+    'Cover Image': { names: ['Cover Image'], types: ['files'] },
+    'Canonical URL': { names: ['Canonical URL'], types: ['url'] },
+    Featured: { names: ['Featured'], types: ['checkbox'] },
+  },
+} as const;
+
 const FINGERPRINTS = [PAGES_FINGERPRINT, POSTS_FINGERPRINT] as const;
 
 /**
@@ -111,6 +158,7 @@ export type NotionTemplateErrorCode =
   | 'notion_template_root_empty'
   | 'notion_template_database_missing'
   | 'notion_template_database_ambiguous'
+  | 'notion_template_schema_invalid'
   | 'notion_template_unavailable';
 
 /** Distinct, actionable failure modes; `details` carries only non-secret schema metadata. */
@@ -164,6 +212,33 @@ export interface NotionTemplateResolveOptions {
   maxDelayMs?: number;
   fetcher?: typeof fetch;
   sleep?: (milliseconds: number) => Promise<void>;
+}
+
+export type NotionSchemaValidationIssueCode =
+  | 'missing_property'
+  | 'wrong_property_type'
+  | 'unsupported_option';
+
+export interface NotionSchemaValidationIssue {
+  code: NotionSchemaValidationIssueCode;
+  property: string;
+  expectedTypes?: string[];
+  actualType?: string | null;
+  requiredOptions?: string[];
+  unsupportedOptions?: string[];
+}
+
+export interface NotionDatabaseSchemaValidation {
+  database: TemplateDatabaseRole;
+  valid: boolean;
+  issues: NotionSchemaValidationIssue[];
+  remediation: string;
+}
+
+export interface NotionTemplateSchemaValidation {
+  valid: boolean;
+  pages: NotionDatabaseSchemaValidation;
+  posts: NotionDatabaseSchemaValidation;
 }
 
 /**
@@ -340,6 +415,106 @@ function summarizeDatabase(databaseId: string, properties: Record<string, Notion
   return { databaseId, propertyTypes, optionNames };
 }
 
+type SchemaPropertyContract = {
+  names: readonly string[];
+  types: readonly string[];
+  options?: readonly string[];
+  allowedOptions?: readonly string[];
+};
+
+function findSchemaProperty(
+  summary: NotionDatabaseSchemaSummary,
+  contract: SchemaPropertyContract,
+): { name: string; type: string } | null {
+  for (const name of contract.names) {
+    const type = summary.propertyTypes[name];
+    if (typeof type === 'string') return { name, type };
+  }
+  return null;
+}
+
+function normalizedOption(role: TemplateDatabaseRole, property: string, option: string): string {
+  // The sync engine deliberately accepts page Type values case-insensitively;
+  // Status is sent to Notion as an exact query value and remains case-sensitive.
+  return role === 'pages' && property === 'Type' ? option.toLowerCase() : option;
+}
+
+function validateDatabaseSchema(
+  role: TemplateDatabaseRole,
+  summary: NotionDatabaseSchemaSummary,
+  contract: {
+    required: Readonly<Record<string, SchemaPropertyContract>>;
+    optional: Readonly<Record<string, SchemaPropertyContract>>;
+  },
+): NotionDatabaseSchemaValidation {
+  const issues: NotionSchemaValidationIssue[] = [];
+  const validateProperty = (property: string, requirement: SchemaPropertyContract, required: boolean): void => {
+    const actual = findSchemaProperty(summary, requirement);
+    if (!actual) {
+      if (required) issues.push({ code: 'missing_property', property });
+      return;
+    }
+
+    if (!requirement.types.includes(actual.type)) {
+      issues.push({
+        code: 'wrong_property_type',
+        property,
+        expectedTypes: [...requirement.types],
+        actualType: actual.type,
+      });
+      return;
+    }
+
+    if (!requirement.options) return;
+    const actualOptions = summary.optionNames[actual.name] ?? [];
+    const requiredOptions = requirement.options.filter(
+      (option) => !actualOptions.some(
+        (actualOption) => normalizedOption(role, property, actualOption) === normalizedOption(role, property, option),
+      ),
+    );
+    const allowedOptions = requirement.allowedOptions ?? requirement.options;
+    const unsupportedOptions = actualOptions.filter(
+      (option) => !allowedOptions.some(
+        (allowed) => normalizedOption(role, property, option) === normalizedOption(role, property, allowed),
+      ),
+    );
+    if (requiredOptions.length > 0 || unsupportedOptions.length > 0) {
+      issues.push({
+        code: 'unsupported_option',
+        property,
+        ...(requiredOptions.length > 0 ? { requiredOptions } : {}),
+        ...(unsupportedOptions.length > 0 ? { unsupportedOptions } : {}),
+      });
+    }
+  };
+
+  for (const [property, requirement] of Object.entries(contract.required)) {
+    validateProperty(property, requirement, true);
+  }
+  for (const [property, requirement] of Object.entries(contract.optional)) {
+    validateProperty(property, requirement, false);
+  }
+
+  return {
+    database: role,
+    valid: issues.length === 0,
+    issues,
+    remediation:
+      role === 'pages'
+        ? 'Open the Pages database in Notion and restore the listed fields and select values, or change each field to the expected type.'
+        : 'Open the Posts database in Notion and restore the listed fields and select values, or change each field to the expected type.',
+  };
+}
+
+/** Validate both resolved databases without reading any rows or page content. */
+export function validateNotionTemplateSchemas(
+  resolution: Pick<NotionTemplateResolution, 'pagesSchema' | 'postsSchema'>,
+): NotionTemplateSchemaValidation {
+  const pages = validateDatabaseSchema('pages', resolution.pagesSchema, PAGES_SCHEMA_CONTRACT);
+  const posts = validateDatabaseSchema('posts', resolution.postsSchema, POSTS_SCHEMA_CONTRACT);
+  return { valid: pages.valid && posts.valid, pages, posts };
+}
+
 interface FingerprintScore {
   role: TemplateDatabaseRole;
   score: number;
@@ -354,7 +529,10 @@ function scoreFingerprint(
   const missing: FingerprintScore['missing'] = [];
   let hits = 0;
   for (const [propertyName, expectedType] of requiredEntries) {
-    const actual = properties[propertyName];
+    const contract = fingerprint.role === 'pages'
+      ? PAGES_SCHEMA_CONTRACT.required[propertyName as keyof typeof PAGES_SCHEMA_CONTRACT.required]
+      : POSTS_SCHEMA_CONTRACT.required[propertyName as keyof typeof POSTS_SCHEMA_CONTRACT.required];
+    const actual = contract?.names.map((name) => properties[name]).find((property) => property !== undefined);
     const actualType = typeof actual?.type === 'string' ? actual.type : null;
     if (actualType === expectedType) hits += 1;
     else missing.push({ property: propertyName, expectedType, actualType });
@@ -378,8 +556,16 @@ function identifyTemplateDatabase(databaseId: string, database: NotionDatabaseRe
   } as Record<TemplateDatabaseRole, FingerprintScore>;
 
   const passing = FINGERPRINTS.filter((fingerprint) => scores[fingerprint.role].score >= MATCH_THRESHOLD);
+  // Keep a near-match associated with its most likely role long enough for
+  // validation to report the exact missing/wrong property. Without this,
+  // Posts with one broken required field (3/4 hits) would only produce the
+  // much less useful database-level "missing" error.
+  const likely = passing.length === 0
+    ? FINGERPRINTS.filter((fingerprint) => scores[fingerprint.role].score >= 0.6)
+    : [];
+  const candidates = passing.length > 0 ? passing : likely;
   const identity: DatabaseIdentity =
-    passing.length === 1 ? passing[0].role : passing.length > 1 ? 'ambiguous' : 'unrecognized';
+    candidates.length === 1 ? candidates[0].role : candidates.length > 1 ? 'ambiguous' : 'unrecognized';
 
   return {
     summary: summarizeDatabase(databaseId, properties),
@@ -501,7 +687,7 @@ export async function resolveNotionTemplateDatabases(
       const pages = identified.find((candidate) => candidate.identity === 'pages');
       const posts = identified.find((candidate) => candidate.identity === 'posts');
       if (!pages || !posts) continue;
-      return {
+      const resolution: NotionTemplateResolution = {
         pagesDatabaseId: pages.summary.databaseId,
         postsDatabaseId: posts.summary.databaseId,
         templateSchemaVersion: NOTION_TEMPLATE_SCHEMA_VERSION,
@@ -510,6 +696,14 @@ export async function resolveNotionTemplateDatabases(
         postsSchema: posts.summary,
         resolvedAt: Date.now(),
       };
+      const validation = validateNotionTemplateSchemas(resolution);
+      if (!validation.valid) {
+        throw new NotionTemplateError('notion_template_schema_invalid', 422, {
+          validation,
+          remediation: 'Update the matching database schemas in Notion, then reconnect Notion so InkDrafts can validate them again.',
+        });
+      }
+      return resolution;
     }
 
     // A role is missing: if some candidates could not be fetched this may
