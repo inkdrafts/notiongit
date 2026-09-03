@@ -253,8 +253,16 @@ server-side, calls `/user` to identify the authenticated account, and calls
 `/user/installations/{installation_id}` to prove that the installation belongs
 to that account. Suspended installations, organization installations, missing
 installations, mismatched accounts, denied authorization, invalid state, and
-replayed state fail with a generic JSON error. A successful response contains
-only `job_id`, `installation_id`, and the authenticated GitHub login/id.
+replayed state fail with a generic JSON error. The callback also checks the
+authenticated user's owned repositories and returns the selected destination
+before provisioning: `repository.name`, `repository.url`, and
+`repository.baseurl`.
+
+The naming policy first tries the exact lowercase `<login>.github.io` name for
+the apex site. If it is occupied, the project-site sequence is
+`<login>-inkdrafts`, `<login>-inkdrafts-2`, and so on. The selection is not a
+reservation; the repository-generation operation must retry with the next
+candidate when GitHub returns a `422` name collision.
 
 The OAuth access token is held only for the callback request and is never
 logged, returned, or written to KV. Provisioning can call the exported

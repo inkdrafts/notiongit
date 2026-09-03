@@ -22,14 +22,24 @@ The Worker entrypoint is [`src/index.ts`](src/index.ts). It exposes
 `GET /healthz`, starts the GitHub App flow at `GET /connect/github?job_id=...`,
 and handles the signed callback at `GET /auth/github/callback`. The callback
 exchanges the OAuth code server-side, verifies that the authenticated personal
-account owns the installation, and stores only GitHub identity and installation
-metadata in `JOBS`; OAuth and installation tokens are never persisted or
-returned to browser code. It also wires the `PROVISIONING_QUEUE` Queue binding.
+account owns the installation, selects a collision-safe repository destination,
+and stores only GitHub identity, installation, and destination metadata in
+`JOBS`; OAuth and installation tokens are never persisted or returned to browser
+code. It also wires the `PROVISIONING_QUEUE` Queue binding.
 
 `/connect/github` accepts an optional `job_id` (or `jobId`) and generates one
 when omitted. The signed state expires after ten minutes and is marked consumed
 after a successful callback, so a callback URL cannot be reused for a second
 authorization.
+
+Repository naming is deterministic. InkDrafts first tries the exact lowercase
+`<login>.github.io` repository, which maps to `https://<login>.github.io` with
+an empty Jekyll `baseurl`. If that name is occupied, it tries the project-site
+sequence `<login>-inkdrafts`, `<login>-inkdrafts-2`, and so on, mapping each to
+`https://<login>.github.io/<repository>` with `baseurl: /<repository>`. The
+selection is an availability check, not a reservation; repository generation
+must use `createRepositoryWithRetry` and advance on GitHub's `422` name-collision
+response to handle races safely.
 
 Before a real deployment, replace the KV placeholder in `wrangler.toml` with
 the namespace ID returned by Wrangler and create the provisioning queues. The
