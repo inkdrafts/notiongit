@@ -253,21 +253,63 @@ server-side, calls `/user` to identify the authenticated account, and calls
 `/user/installations/{installation_id}` to prove that the installation belongs
 to that account. Suspended installations, organization installations, missing
 installations, mismatched accounts, denied authorization, invalid state, and
-replayed state fail with a generic JSON error. The callback also checks the
-authenticated user's owned repositories and returns the selected destination
-before provisioning: `repository.name`, `repository.url`, and
-`repository.baseurl`.
+replayed state fail with a generic JSON error.
 
 The naming policy first tries the exact lowercase `<login>.github.io` name for
 the apex site. If it is occupied, the project-site sequence is
 `<login>-inkdrafts`, `<login>-inkdrafts-2`, and so on. The selection is not a
-reservation; the repository-generation operation must retry with the next
-candidate when GitHub returns a `422` name collision.
+reservation, so generation retries with the next candidate when GitHub returns
+a `422` name collision.
 
-The OAuth access token is held only for the callback request and is never
-logged, returned, or written to KV. Provisioning can call the exported
-installation-token helper when it needs a short-lived token; that token is
-also returned only to the in-process caller and is never persisted.
+Generation runs in the same callback request, while the short-lived user access
+token is still in memory, because `POST
+/repos/inkdrafts/notiongit-template/generate` requires user-to-server
+authentication. The request creates a **public** repository carrying the
+description `Notion-powered site published with InkDrafts` (the product
+description and the idempotency marker). Before creating anything, the Worker
+scans the account's owned repositories for a non-fork repository that already
+carries the marker and adopts it — retries never mint duplicates. When GitHub
+refuses a name with `422`, the Worker reads the occupier with the user token:
+an InkDrafts repository is adopted, a foreign repository advances the selection
+to the next deterministic name, and an *unreadable* occupier fails with
+`github_generate_unavailable` rather than guessing.
+
+After generation the Worker mints an installation token and polls
+`GET /repos/{owner}/{repo}` plus `GET /repos/{owner}/{repo}/commits/main` with
+bounded exponential backoff (250 ms doubling to an 8 s cap, at most 8 attempts,
+≈24 s worst case) until the repository reports `main` with a readable initial
+commit. Polling is mandatory, not defensive: generation is asynchronous, and
+the first repository response can report a placeholder default branch (an
+observed `master` on a `main`-default template) with no readable commit until
+the copy settles. Verification deliberately uses the installation token: the
+installation's repository access is set to all repositories, so success also
+proves the App can act on the new repository for every later provisioning
+step. A poll that never converges is a distinct `github_generate_timeout`.
+
+Failure taxonomy, each with a different recovery path and each resumable by
+restarting the flow (which adopts the already-generated repository):
+
+| JSON error | HTTP | Meaning |
+| --- | --- | --- |
+| `github_generate_rate_limited` | 429 | GitHub's content-generation secondary limit; `retry_after_seconds` echoes GitHub's `Retry-After`. |
+| `github_generate_timeout` | 504 | The repository exists but never reported a readable `main` commit in time. |
+| `github_generate_name_exhausted` | 409 | Every deterministic candidate name belonged to a foreign repository. |
+| `github_generate_unavailable` | 502 | GitHub failed before or during generation, or the response was unusable. |
+| `github_generate_branch_mismatch` | 502 | The repository reported itself as a fork. |
+
+A successful callback writes the job record with status `repository_generated`
+and a non-secret `generatedRepository` identity: repository id, full name,
+HTML URL, default branch, template full name, the template `main` HEAD SHA and
+tree SHA at generation time, the verified `main` HEAD SHA and tree SHA, and
+whether the repository was adopted from an earlier attempt. GitHub rewrites
+the template history into a fresh initial commit, so commit SHAs never match
+the template; equality of the two recorded **tree** SHAs is the check that the
+generated repository contains the expected template revision. The response
+adds `id`, `html_url`, and `default_branch` to the `repository` destination
+object.
+
+The OAuth access token and the installation token are held only for the
+callback request and are never logged, returned, or written to KV.
 
 ## References
 

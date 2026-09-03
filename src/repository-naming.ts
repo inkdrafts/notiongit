@@ -17,8 +17,18 @@ export interface RepositoryDestination {
   kind: 'apex' | 'project';
 }
 
+/**
+ * The repository fields the owned-repository listing keeps. The full GitHub
+ * response object is trimmed to what selection and generation reuse need.
+ */
 export interface GithubRepositorySummary {
   name?: string;
+  id?: number;
+  full_name?: string;
+  html_url?: string;
+  default_branch?: string;
+  description?: string | null;
+  fork?: boolean;
 }
 
 export class GithubRepositoryApiError extends Error {
@@ -142,14 +152,15 @@ async function readJson<T>(response: Response): Promise<T | null> {
 }
 
 /**
- * List every repository owned by the authenticated personal account.
- * Tokens are used only in the request and are never included in an error.
+ * List every repository owned by the authenticated personal account with the
+ * fields selection and generation reuse need. Tokens are used only in the
+ * request and are never included in an error.
  */
 export async function listOwnedGithubRepositories(
   accessToken: string,
   fetcher: typeof fetch = fetch,
-): Promise<string[]> {
-  const names: string[] = [];
+): Promise<GithubRepositorySummary[]> {
+  const summaries: GithubRepositorySummary[] = [];
   for (let page = 1; page <= 100; page += 1) {
     const url = new URL(`${GITHUB_API}/user/repos`);
     url.searchParams.set('affiliation', 'owner');
@@ -160,9 +171,9 @@ export async function listOwnedGithubRepositories(
     const repositories = await readJson<GithubRepositorySummary[]>(response);
     if (!Array.isArray(repositories)) throw new GithubRepositoryApiError(502);
     for (const repository of repositories) {
-      if (repository && typeof repository.name === 'string') names.push(repository.name);
+      if (repository && typeof repository.name === 'string') summaries.push(repository);
     }
-    if (repositories.length < 100) return names;
+    if (repositories.length < 100) return summaries;
   }
   throw new GithubRepositoryApiError(502);
 }
@@ -173,7 +184,10 @@ export async function selectGithubRepositoryDestination(
   login: string,
   fetcher: typeof fetch = fetch,
 ): Promise<RepositoryDestination> {
-  const names = await listOwnedGithubRepositories(accessToken, fetcher);
+  const summaries = await listOwnedGithubRepositories(accessToken, fetcher);
+  const names = summaries
+    .map((repository) => repository.name)
+    .filter((name): name is string => typeof name === 'string');
   return selectRepositoryDestination(login, names);
 }
 
