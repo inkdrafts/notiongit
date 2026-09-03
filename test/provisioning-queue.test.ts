@@ -11,6 +11,7 @@ import {
   saveProvisioningJob,
   tryAcquireProvisioningLock,
   PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
+  PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS,
   PROVISIONING_STEP_MAX_ATTEMPTS,
   type CreateProvisioningJobParams,
   type ProvisioningJob,
@@ -38,9 +39,11 @@ class MemoryKV {
 
 class MemoryQueue<T> {
   readonly sent: T[] = [];
+  readonly sendOptions: Array<{ delaySeconds?: number } | null> = [];
 
-  async send(message: T): Promise<void> {
+  async send(message: T, options?: { delaySeconds?: number }): Promise<void> {
     this.sent.push(message);
+    this.sendOptions.push(options ?? null);
   }
 
   async sendBatch(): Promise<void> {
@@ -200,6 +203,16 @@ describe('classifyProvisioningError', () => {
   test('retries a rate-limited Pages call and passes through its retry-after', () => {
     const classification = classifyProvisioningError(new GithubPagesError('github_pages_rate_limited', 429, 42));
     expect(classification).toEqual({ code: 'github_pages_rate_limited', retryable: true, retryAfterSeconds: 42 });
+  });
+
+  test('retries a rate-limited config patch and passes through its retry-after', () => {
+    expect(classifyProvisioningError(new GithubConfigError('github_config_rate_limited', 429, 90)))
+      .toEqual({ code: 'github_config_rate_limited', retryable: true, retryAfterSeconds: 90 });
+  });
+
+  test('passes an app-auth 429 retry-after through', () => {
+    expect(classifyProvisioningError(new GithubAppAuthError(429, 45)))
+      .toEqual({ code: 'github_app_auth_failed', retryable: true, retryAfterSeconds: 45 });
   });
 
   test('dead-letters a permission-denied Pages call', () => {
@@ -378,13 +391,29 @@ describe('processProvisioningMessage', () => {
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
-    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000 });
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 });
     expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 30 });
     const job = await loadProvisioningJob(env.JOBS, 'job-1');
     expect(job?.status).toBe('queued');
     expect(job?.lock).toBeNull();
     expect(job?.steps.configure_pages).toMatchObject({ status: 'pending', attempts: 1 });
     expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_pages_unavailable', retryable: true });
+  });
+
+  test('a retryable failure carries bounded jitter from the injected rng', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/pages') return new Response(null, { status: 503 });
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    // 30s base backoff + floor(0.5 · 30 · 0.25) of jitter.
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0.5 });
+    expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 33 });
   });
 
   test('an ambiguous dispatch failure keeps the persisted marker, so the retry correlates instead of dispatching again', async () => {
@@ -426,7 +455,7 @@ describe('processProvisioningMessage', () => {
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
-    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 2_000, lockOwner: () => 'attempt-1' });
+    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 2_000, lockOwner: () => 'attempt-1', rng: () => 0 });
     expect(first).toEqual({ outcome: 'retry', delaySeconds: 30 });
 
     const afterFailure = await loadProvisioningJob(env.JOBS, 'job-1');
@@ -577,7 +606,7 @@ describe('processProvisioningMessage', () => {
     // finds a matching run in time and times out — a retryable failure that
     // happens strictly after runDispatchSync's own successful pre-dispatch
     // marker write, distinct from the POST itself failing.
-    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 8_000 });
+    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 8_000, rng: () => 0 });
     expect(first).toEqual({ outcome: 'retry', delaySeconds: 30 });
     expect(dispatchCalls).toBe(1);
     const afterFailure = await loadProvisioningJob(env.JOBS, 'job-1');
@@ -653,7 +682,7 @@ describe('processProvisioningMessage', () => {
       },
     } as unknown as KVNamespace;
 
-    const outcome = await processProvisioningMessage('job-1', { ...env, JOBS: flakyKv }, { fetcher, sleep: async () => {}, now: () => 15_000 });
+    const outcome = await processProvisioningMessage('job-1', { ...env, JOBS: flakyKv }, { fetcher, sleep: async () => {}, now: () => 15_000, rng: () => 0 });
     expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 30 });
 
     // The success was never durable, so the standard failure path applies:
@@ -789,5 +818,102 @@ describe('processProvisioningMessage', () => {
     expect(stored?.status).toBe('dead_letter');
     expect(stored?.steps.await_deploy_build.lastError).toEqual({ code: 'github_deploy_build_failed', retryable: false });
     expect(queue.sent).toEqual([]);
+  });
+
+  test('a rate-limited step failure rides a fresh delayed message instead of the platform retry', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        return new Response(null, { status: 429, headers: { 'retry-after': '120' } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 });
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
+    expect(queue.sendOptions[0]).toEqual({ delaySeconds: 120 });
+
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('queued');
+    expect(job?.lock).toBeNull();
+    expect(job?.steps.configure_pages).toMatchObject({ status: 'pending', attempts: 1 });
+    expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_pages_rate_limited', retryable: true });
+  });
+
+  test('repeated rate-limited failures bypass the five-attempt ceiling and dead-letter only at 24', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        return new Response(null, { status: 403, headers: { 'retry-after': '60' } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const runtime = { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 };
+    for (let attempt = 1; attempt < PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS; attempt += 1) {
+      const outcome = await processProvisioningMessage('job-1', env, runtime);
+      expect(outcome).toEqual({ outcome: 'acked' });
+      const job = await loadProvisioningJob(env.JOBS, 'job-1');
+      expect(job?.status).toBe('queued');
+      expect(job?.steps.configure_pages.attempts).toBe(attempt);
+    }
+
+    const final = await processProvisioningMessage('job-1', env, runtime);
+    expect(final).toEqual({ outcome: 'acked' });
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('dead_letter');
+    expect(job?.steps.configure_pages.attempts).toBe(PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS);
+    expect(job?.completedAt).toBe(4_000);
+  });
+
+  test('a rate-limited retry whose fresh send fails falls back to a platform retry with the same delay', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const brokenQueue: Queue<{ jobId: string }> = {
+      send: async () => { throw new Error('queue outage'); },
+    } as unknown as Queue<{ jobId: string }>;
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        return new Response(null, { status: 429, headers: { 'retry-after': '90' } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const outcome = await processProvisioningMessage(
+      'job-1',
+      { ...env, PROVISIONING_QUEUE: brokenQueue },
+      { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 },
+    );
+    expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 90 });
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('queued');
+  });
+
+  test('a rate-limited installation-token mint rides the fresh-message path too', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const fetcher = (async () => new Response(null, { status: 403, headers: { 'retry-after': '45' } })) as typeof fetch;
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 });
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
+    expect(queue.sendOptions[0]).toEqual({ delaySeconds: 45 });
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_app_auth_failed', retryable: true });
   });
 });

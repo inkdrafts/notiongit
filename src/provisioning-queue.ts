@@ -35,10 +35,12 @@ import {
   tryAcquireProvisioningLock,
   PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS,
   PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
+  PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS,
   PROVISIONING_STEP_MAX_ATTEMPTS,
   type ProvisioningJob,
   type ProvisioningStepName,
 } from './provisioning-job';
+import { jitteredDelaySeconds, saveTerminalProvisioningJob } from './provisioning-throttle';
 
 export interface ProvisioningQueueEnv extends GithubAppAuthEnv {
   JOBS: KVNamespace;
@@ -50,6 +52,9 @@ export interface ProvisioningRuntimeOptions {
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
   lockOwner?: () => string;
+  /** Injectable [0,1) random source for bounded backoff jitter; tests pin
+   * delays by injecting a constant. */
+  rng?: () => number;
 }
 
 export type ProvisioningMessageOutcome =
@@ -74,7 +79,11 @@ const RETRYABLE_SYNC_CODES = new Set([
 
 const RETRYABLE_PAGES_CODES = new Set(['github_pages_rate_limited', 'github_pages_unavailable']);
 
-const RETRYABLE_CONFIG_CODES = new Set(['github_config_conflict', 'github_config_unavailable']);
+const RETRYABLE_CONFIG_CODES = new Set([
+  'github_config_conflict',
+  'github_config_rate_limited',
+  'github_config_unavailable',
+]);
 
 const RETRYABLE_GENERATE_CODES = new Set([
   'github_generate_rate_limited',
@@ -91,7 +100,7 @@ const RETRYABLE_DEPLOY_CODES = new Set([
 /** Maps every provisioning error this queue can encounter to a retry decision. */
 export function classifyProvisioningError(error: unknown): ProvisioningErrorClassification {
   if (error instanceof GithubConfigError) {
-    return { code: error.code, retryable: RETRYABLE_CONFIG_CODES.has(error.code), retryAfterSeconds: null };
+    return { code: error.code, retryable: RETRYABLE_CONFIG_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
   }
   if (error instanceof GithubPagesError) {
     return { code: error.code, retryable: RETRYABLE_PAGES_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
@@ -109,7 +118,7 @@ export function classifyProvisioningError(error: unknown): ProvisioningErrorClas
     return { code: error.code, retryable: RETRYABLE_GENERATE_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
   }
   if (error instanceof GithubAppAuthError) {
-    return { code: 'github_app_auth_failed', retryable: error.status >= 500 || error.status === 429, retryAfterSeconds: null };
+    return { code: 'github_app_auth_failed', retryable: error.status >= 500 || error.status === 429, retryAfterSeconds: error.retryAfterSeconds };
   }
   // An unrecognized error (a network throw, a bug) is treated as transient.
   // The per-step attempt ceiling still bounds it to a handful of tries
@@ -118,13 +127,15 @@ export function classifyProvisioningError(error: unknown): ProvisioningErrorClas
 }
 
 async function recordStepFailure(
-  env: Pick<ProvisioningQueueEnv, 'JOBS'>,
+  env: Pick<ProvisioningQueueEnv, 'JOBS' | 'PROVISIONING_QUEUE'>,
   job: ProvisioningJob,
   step: ProvisioningStepName,
   error: unknown,
   now: number,
+  rng: () => number,
 ): Promise<ProvisioningMessageOutcome> {
   const classification = classifyProvisioningError(error);
+  const { retryAfterSeconds } = classification;
   // The step handler may have persisted data directly to KV after this
   // attempt's snapshot was taken — the sync dispatch marker is written this
   // way exactly so it survives an ambiguous dispatch failure. Re-read the
@@ -133,7 +144,11 @@ async function recordStepFailure(
   const persisted = await loadProvisioningJob(env.JOBS, job.jobId);
   const base = persisted ?? job;
   const attempts = base.steps[step].attempts + 1;
-  const terminal = !classification.retryable || attempts >= PROVISIONING_STEP_MAX_ATTEMPTS;
+  // A failure carrying GitHub's own Retry-After never counts against the
+  // regular step ceiling: honoring the provider's pacing must not
+  // dead-letter the job, so these attempts get their own, much larger bound.
+  const terminal = !classification.retryable
+    || attempts >= (retryAfterSeconds !== null ? PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS : PROVISIONING_STEP_MAX_ATTEMPTS);
 
   const updated: ProvisioningJob = {
     ...base,
@@ -151,11 +166,25 @@ async function recordStepFailure(
     updatedAt: now,
     completedAt: terminal ? now : null,
   };
+  if (terminal) {
+    await saveTerminalProvisioningJob(env, updated);
+    return { outcome: 'acked' };
+  }
   await saveProvisioningJob(env.JOBS, updated);
 
-  if (terminal) return { outcome: 'acked' };
-  const delaySeconds = classification.retryAfterSeconds ?? provisioningRetryDelaySeconds(attempts);
-  return { outcome: 'retry', delaySeconds };
+  if (retryAfterSeconds !== null) {
+    // Rate-limited failures ride the fresh-message transport, like gate
+    // waits: message.retry() would let the platform's max_retries=6
+    // dead-letter a healthy job after six genuine GitHub rate limits.
+    const delaySeconds = jitteredDelaySeconds(retryAfterSeconds, rng, 0.05);
+    try {
+      await env.PROVISIONING_QUEUE.send({ jobId: job.jobId }, { delaySeconds });
+      return { outcome: 'acked' };
+    } catch {
+      return { outcome: 'retry', delaySeconds };
+    }
+  }
+  return { outcome: 'retry', delaySeconds: jitteredDelaySeconds(provisioningRetryDelaySeconds(attempts), rng) };
 }
 
 /**
@@ -208,6 +237,7 @@ export async function processProvisioningMessage(
     sleep = defaultSleep,
     now = () => Date.now(),
     lockOwner = () => crypto.randomUUID(),
+    rng = Math.random,
   } = runtime;
 
   const job = await loadProvisioningJob(env.JOBS, jobId);
@@ -236,7 +266,7 @@ export async function processProvisioningMessage(
   try {
     installationToken = await createGithubInstallationToken(env, locked.installationId, fetcher);
   } catch (error) {
-    return recordStepFailure(env, locked, step, error, now());
+    return recordStepFailure(env, locked, step, error, now(), rng);
   }
 
   const inProgressMs = now();
@@ -262,7 +292,7 @@ export async function processProvisioningMessage(
       updatedAt: completionMs,
     };
   } catch (error) {
-    return recordStepFailure(env, inProgress, step, error, now());
+    return recordStepFailure(env, inProgress, step, error, now(), rng);
   }
 
   const remainingStep = nextPendingStep(stepSucceeded);
@@ -278,7 +308,7 @@ export async function processProvisioningMessage(
     // and resets the step to `pending`. That re-run is safe — six steps are
     // idempotent and `dispatch_sync`'s marker was persisted by the handler
     // itself, before its external call.
-    return recordStepFailure(env, inProgress, step, error, now());
+    return recordStepFailure(env, inProgress, step, error, now(), rng);
   }
 
   if (remainingStep) {

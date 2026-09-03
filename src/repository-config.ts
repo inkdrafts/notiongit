@@ -16,17 +16,22 @@ export const CONFIG_PATCH_COMMIT_MESSAGE = 'chore: configure Jekyll site URLs fo
 export type GithubConfigErrorCode =
   | 'github_config_unavailable'
   | 'github_config_conflict'
-  | 'github_config_invalid';
+  | 'github_config_invalid'
+  | 'github_config_rate_limited';
 
 export class GithubConfigError extends Error {
   readonly code: GithubConfigErrorCode;
   readonly status: number;
+  /** Seconds GitHub asked the caller to wait, parsed from a 403/429
+   * `Retry-After`; null when the failure carries no pacing instruction. */
+  readonly retryAfterSeconds: number | null;
 
-  constructor(code: GithubConfigErrorCode, status: number) {
+  constructor(code: GithubConfigErrorCode, status: number, retryAfterSeconds: number | null = null) {
     super(code);
     this.name = 'GithubConfigError';
     this.code = code;
     this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -96,6 +101,13 @@ async function readJson<T>(response: Response): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+function retryAfterSeconds(response: Response): number | null {
+  const value = response.headers.get('retry-after');
+  if (value === null) return null;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : null;
 }
 
 interface ConfigLine {
@@ -285,6 +297,12 @@ export async function patchRepositoryConfig(
     if (response.status === 409) {
       if (attempt < maxAttempts) continue;
       throw new GithubConfigError('github_config_conflict', 409);
+    }
+    if (response.status === 403 || response.status === 429) {
+      const retryAfter = retryAfterSeconds(response);
+      if (retryAfter !== null || response.status === 429) {
+        throw new GithubConfigError('github_config_rate_limited', 429, retryAfter);
+      }
     }
     throw new GithubConfigError('github_config_unavailable', response.status || 502);
   }
