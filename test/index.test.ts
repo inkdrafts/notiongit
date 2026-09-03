@@ -218,12 +218,12 @@ describe('HTTP foundation', () => {
   });
 
   test('reserves provider callback namespaces', async () => {
-    const response = route(
+    const response = await route(
       new Request('https://example.com/auth/notion/callback?code=redacted'),
     );
 
-    expect(response.status).toBe(501);
-    expect(await response.json()).toEqual({ error: 'not_implemented' });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'notion_configuration_missing' });
   });
 
   test('returns JSON for unknown routes', async () => {

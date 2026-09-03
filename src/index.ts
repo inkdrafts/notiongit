@@ -30,6 +30,11 @@ import {
   saveProvisioningJob,
 } from './provisioning-job';
 import { processProvisioningMessage } from './provisioning-queue';
+import {
+  beginNotionAuthorization,
+  finishNotionCallback,
+  type NotionOAuthRouteOptions,
+} from './notion-oauth';
 
 
 export {
@@ -193,6 +198,30 @@ export type {
   ProvisioningQueueEnv,
   ProvisioningRuntimeOptions,
 } from './provisioning-queue';
+
+export {
+  beginNotionAuthorization,
+  exchangeNotionAuthorizationCode,
+  finishNotionCallback,
+  NOTION_API_VERSION,
+  NOTION_AUTHORIZATION_URL,
+  NOTION_STATE_COOKIE,
+  NOTION_STATE_PREFIX,
+  NOTION_STATE_REPLAY_TTL_SECONDS,
+  NOTION_STATE_TTL_SECONDS,
+  NOTION_TOKEN_URL,
+  NotionOAuthError,
+  signNotionState,
+} from './notion-oauth';
+export type {
+  NotionOAuthContinuation,
+  NotionOAuthContinuationHandler,
+  NotionOAuthEnv,
+  NotionOAuthErrorCode,
+  NotionOAuthRouteOptions,
+  NotionOAuthSummary,
+  NotionStatePayload,
+} from './notion-oauth';
 
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
@@ -717,7 +746,11 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   }
 }
 
-export function route(request: Request, env: Partial<Env> = {}): Response | Promise<Response> {
+export function route(
+  request: Request,
+  env: Partial<Env> = {},
+  options: NotionOAuthRouteOptions = {},
+): Response | Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === 'GET' && url.pathname === '/') {
@@ -732,12 +765,16 @@ export function route(request: Request, env: Partial<Env> = {}): Response | Prom
     return beginGithubInstall(request, env);
   }
 
+  if (request.method === 'GET' && url.pathname === '/connect/notion') {
+    return beginNotionAuthorization(request, env);
+  }
+
   if (request.method === 'GET' && url.pathname === '/auth/github/callback') {
     return finishGithubCallback(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/notion/callback') {
-    return json({ error: 'not_implemented' }, 501);
+    return finishNotionCallback(request, env, options);
   }
 
   return json(

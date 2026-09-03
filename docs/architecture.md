@@ -58,6 +58,24 @@ credential rotation procedure are maintained in the
 [`Notion integration runbook`](notion-integration-runbook.md) and its
 [`sanitized template build sheet`](notion-template.md).
 
+## Notion authorization continuation
+
+`GET /connect/notion` creates a ten-minute HMAC-signed state containing only a
+job reference and nonce. The nonce is replay-tracked in `JOBS` and copied into
+an HttpOnly, Secure, SameSite cookie so a callback from a different browser
+flow is rejected. `GET /auth/notion/callback` validates and consumes that state
+before exchanging Notion's one-time code at `/v1/oauth/token`, using the
+environment-derived callback URL and the pinned `Notion-Version: 2022-06-28`
+header.
+
+The exchange result is handed directly to the request-local onboarding
+continuation as `{ jobId, accessToken, duplicatedTemplateId }`. The access and
+refresh tokens, workspace metadata, OAuth code, and duplicated-root ID are not
+written to KV, queue messages, cookies, logs, or browser responses. Until the
+database resolver is wired in issue #7, the route's default continuation is a
+no-op; tests inject the continuation to prove the handoff. The HTTP response
+contains only the job ID and whether template duplication occurred.
+
 ## Durable provisioning job queue
 
 Provisioning spans several third-party API calls over 60–120 seconds and can
