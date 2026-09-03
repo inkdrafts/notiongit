@@ -78,6 +78,7 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
   const generateNames: string[] = [];
   const next = (sequence: MockSequenceEntry[] | undefined, fallback: () => MockSequenceEntry): MockSequenceEntry =>
     sequence && sequence.length > 0 ? sequence.shift()! : fallback();
+  let syncDispatched = false;
 
   try {
     globalThis.fetch = async (input, init) => {
@@ -145,6 +146,44 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
           return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
         }
         return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
+      }
+      const syncRunsMatch = request.url.match(/^https:\/\/api\.github\.com\/repos\/alice\/([^/]+)\/actions\/workflows\/sync-notion\.yml\/runs\?event=workflow_dispatch&per_page=20$/u);
+      if (syncRunsMatch) {
+        return Response.json({
+          workflow_runs: syncDispatched
+            ? [{
+              id: 555,
+              html_url: `https://github.com/alice/${syncRunsMatch[1]}/actions/runs/555`,
+              status: 'queued',
+              conclusion: null,
+              event: 'workflow_dispatch',
+              created_at: new Date().toISOString(),
+            }]
+            : [],
+        });
+      }
+      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/actions\/workflows\/sync-notion\.yml\/dispatches$/u.test(request.url)) {
+        syncDispatched = true;
+        return new Response(null, { status: 204 });
+      }
+      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/actions\/runs\/555$/u.test(request.url)) {
+        return Response.json({
+          id: 555,
+          html_url: 'https://github.com/alice/repo/actions/runs/555',
+          status: 'completed',
+          conclusion: 'success',
+        });
+      }
+      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/pages\/builds\/latest$/u.test(request.url)) {
+        return Response.json({
+          url: 'https://api.github.com/repos/alice/repo/builds/999',
+          status: 'built',
+          commit: 'generated-head-sha',
+        });
+      }
+      const siteMatch = request.url.match(/^https:\/\/alice\.github\.io\/([^/]*)\/?$/u);
+      if (siteMatch) {
+        return new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html' } });
       }
       throw new Error(`unexpected URL: ${request.url}`);
     };
@@ -273,6 +312,7 @@ describe('GitHub App install and authorize flow', () => {
     const originalFetch = globalThis.fetch;
     const requests: Request[] = [];
     const generateBodies: Array<Record<string, unknown>> = [];
+    let syncDispatched = false;
 
     globalThis.fetch = async (input, init) => {
       const request = new Request(input, init);
@@ -341,6 +381,49 @@ describe('GitHub App install and authorize flow', () => {
         }
         return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
       }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/runs?event=workflow_dispatch&per_page=20') {
+        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
+        return Response.json({
+          workflow_runs: syncDispatched
+            ? [{
+              id: 555,
+              html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
+              status: 'queued',
+              conclusion: null,
+              event: 'workflow_dispatch',
+              created_at: new Date().toISOString(),
+            }]
+            : [],
+        });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/dispatches') {
+        expect(request.method).toBe('POST');
+        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
+        expect(await request.json()).toEqual({ ref: 'main', inputs: { allow_bulk_delete: 'false' } });
+        syncDispatched = true;
+        return new Response(null, { status: 204 });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/runs/555') {
+        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
+        return Response.json({
+          id: 555,
+          html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
+          status: 'completed',
+          conclusion: 'success',
+          head_sha: 'generated-head-sha',
+        });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages/builds/latest') {
+        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
+        return Response.json({
+          url: 'https://api.github.com/repos/alice/alice.github.io/builds/999',
+          status: 'built',
+          commit: 'generated-head-sha',
+        });
+      }
+      if (request.url === 'https://alice.github.io/') {
+        return new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      }
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -370,6 +453,16 @@ describe('GitHub App install and authorize flow', () => {
           build_type: 'legacy',
           source: { branch: 'main', path: '/' },
         },
+        sync: {
+          run_id: 555,
+          html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
+          conclusion: 'success',
+        },
+        deployment: {
+          commit_sha: 'generated-head-sha',
+          build_id: 999,
+          status: 'built',
+        },
       });
       expect(generateBodies).toEqual([{
         name: 'alice.github.io',
@@ -379,7 +472,7 @@ describe('GitHub App install and authorize flow', () => {
       }]);
 
       const stored = await kv.get<Record<string, any>>('github:onboarding-job:job-123', 'json');
-      expect(stored?.status).toBe('pages_enabled');
+      expect(stored?.status).toBe('site_live');
       expect(stored?.pages).toMatchObject({
         status: 'built',
         htmlUrl: 'https://alice.github.io',
@@ -395,6 +488,16 @@ describe('GitHub App install and authorize flow', () => {
         templateHeadTreeSha: 'template-tree-sha',
         reused: false,
       });
+      expect(stored?.sync).toEqual({
+        runId: 555,
+        htmlUrl: 'https://github.com/alice/alice.github.io/actions/runs/555',
+        conclusion: 'success',
+      });
+      expect(stored?.deployment).toMatchObject({
+        commitSha: 'generated-head-sha',
+        buildId: 999,
+        status: 'built',
+      });
       const persisted = kv.entries().join('\n');
       expect(persisted).not.toContain('user-token');
       expect(persisted).not.toContain('installation-token');
@@ -406,7 +509,7 @@ describe('GitHub App install and authorize flow', () => {
       );
       expect(replay.status).toBe(400);
       expect(await replay.json()).toEqual({ error: 'github_state_replayed' });
-      expect(requests).toHaveLength(12);
+      expect(requests).toHaveLength(19);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -418,6 +521,7 @@ describe('GitHub App install and authorize flow', () => {
     const { state } = await getInstallState(env);
     const originalFetch = globalThis.fetch;
     let calls = 0;
+    let syncDispatched = false;
 
     globalThis.fetch = async (input, init) => {
       calls += 1;
@@ -470,6 +574,42 @@ describe('GitHub App install and authorize flow', () => {
         if (request.method === 'PUT') return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
         return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
       }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/runs?event=workflow_dispatch&per_page=20') {
+        return Response.json({
+          workflow_runs: syncDispatched
+            ? [{
+              id: 555,
+              html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
+              status: 'queued',
+              conclusion: null,
+              event: 'workflow_dispatch',
+              created_at: new Date().toISOString(),
+            }]
+            : [],
+        });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/dispatches') {
+        syncDispatched = true;
+        return new Response(null, { status: 204 });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/runs/555') {
+        return Response.json({
+          id: 555,
+          html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
+          status: 'completed',
+          conclusion: 'success',
+        });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages/builds/latest') {
+        return Response.json({
+          url: 'https://api.github.com/repos/alice/alice.github.io/builds/999',
+          status: 'built',
+          commit: 'generated-head-sha',
+        });
+      }
+      if (request.url === 'https://alice.github.io/') {
+        return new Response('<!doctype html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      }
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -486,7 +626,7 @@ describe('GitHub App install and authorize flow', () => {
         env,
       );
       expect(callback.status).toBe(200);
-      expect(calls).toBe(13);
+      expect(calls).toBe(20);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -557,6 +697,95 @@ describe('GitHub App install and authorize flow', () => {
     expect(await response.json()).toEqual({ error: 'github_generate_rate_limited', retry_after_seconds: 60 });
     expect(await kv.get('github:onboarding-job:job-123')).toBeNull();
     expect(kv.entries().join('\n')).not.toContain('user-token');
+  });
+
+  test('resumes the correlated sync run on retry instead of dispatching a duplicate', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    const originalFetch = globalThis.fetch;
+    let dispatchCalls = 0;
+    let conclusion: 'failure' | 'success' = 'failure';
+    const owned = [generatedRepositoryBody('alice.github.io')];
+
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+      if (request.url === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
+      if (request.url === 'https://api.github.com/user/installations/123') {
+        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+      }
+      if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json(owned);
+      if (request.url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io') {
+        return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
+        return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml' || request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml?ref=main') {
+        if (request.method === 'PUT') return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
+        return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        return Response.json({
+          status: 'built',
+          url: 'https://api.github.com/repos/alice/alice.github.io/pages',
+          html_url: 'https://alice.github.io',
+          build_type: 'legacy',
+          source: { branch: 'main', path: '/' },
+        }, { status: 201 });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/runs?event=workflow_dispatch&per_page=20') {
+        return Response.json({
+          workflow_runs: dispatchCalls > 0
+            ? [{ id: 555, html_url: 'https://github.com/alice/alice.github.io/actions/runs/555', status: 'queued', conclusion: null, event: 'workflow_dispatch', created_at: new Date().toISOString() }]
+            : [],
+        });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/workflows/sync-notion.yml/dispatches') {
+        dispatchCalls += 1;
+        return new Response(null, { status: 204 });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/actions/runs/555') {
+        return Response.json({ id: 555, html_url: 'https://github.com/alice/alice.github.io/actions/runs/555', status: 'completed', conclusion });
+      }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages/builds/latest') {
+        return Response.json({
+          url: 'https://api.github.com/repos/alice/alice.github.io/builds/999',
+          status: 'built',
+          commit: 'generated-head-sha',
+        });
+      }
+      if (request.url === 'https://alice.github.io/') return new Response('ok', { status: 200 });
+      throw new Error(`unexpected URL: ${request.url}`);
+    };
+
+    try {
+      const { state: state1 } = await getInstallState(env);
+      const first = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state1)}&code=code-one&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(first.status).toBe(502);
+      expect(await first.json()).toEqual({ error: 'github_sync_run_failed' });
+      expect(dispatchCalls).toBe(1);
+      expect(await kv.get<Record<string, any>>('github:onboarding-sync-run:job-123', 'json')).toMatchObject({ runId: 555 });
+      expect(await kv.get('github:onboarding-job:job-123')).toBeNull();
+
+      conclusion = 'success';
+      const { state: state2 } = await getInstallState(env);
+      const second = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state2)}&code=code-two&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(second.status).toBe(200);
+      expect(dispatchCalls).toBe(1);
+      const stored = await kv.get<Record<string, any>>('github:onboarding-job:job-123', 'json');
+      expect(stored?.status).toBe('site_live');
+      expect(stored?.sync).toMatchObject({ runId: 555, conclusion: 'success' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test.each([
