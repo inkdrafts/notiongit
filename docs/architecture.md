@@ -3,8 +3,9 @@
 The Worker is deliberately a thin foundation. HTTP handlers translate requests
 into application operations; provider clients (`repository-naming.ts`,
 `repository-generation.ts`, `repository-config.ts`, `github-pages.ts`,
-`notion-sync.ts`, `site-deployment.ts`, `github-app-auth.ts`) contain GitHub
-API code; the durable job queue (`provisioning-job.ts`, `provisioning-steps.ts`,
+`notion-sync.ts`, `site-deployment.ts`, `github-app-auth.ts`,
+`notion-template.ts`) contain GitHub and Notion API code; the durable job
+queue (`provisioning-job.ts`, `provisioning-steps.ts`,
 `provisioning-queue.ts` — see "Durable provisioning job queue" below) makes
 provisioning resumable and idempotent; storage owns the KV records these
 modules read and write; and the UI will contain browser-facing HTML and
@@ -71,10 +72,28 @@ header.
 The exchange result is handed directly to the request-local onboarding
 continuation as `{ jobId, accessToken, duplicatedTemplateId }`. The access and
 refresh tokens, workspace metadata, OAuth code, and duplicated-root ID are not
-written to KV, queue messages, cookies, logs, or browser responses. Until the
-database resolver is wired in issue #7, the route's default continuation is a
-no-op; tests inject the continuation to prove the handoff. The HTTP response
-contains only the job ID and whether template duplication occurred.
+written to KV, queue messages, cookies, logs, or browser responses. The
+production continuation (`continueNotionOnboarding` in `index.ts`) spends the
+token immediately: `resolveNotionTemplateDatabases`
+(`notion-template.ts`) walks the duplicated root — paginated block children,
+descending into sub-pages within an explicit depth/fetch budget — and matches
+each `child_database` (whose block id is the database id) against the Pages
+and Posts schema fingerprints (required property names and types per the
+pinned `Notion-Version: 2022-06-28`, never titles). Because a fresh duplicate
+can briefly serve empty or partial content, propagation-shaped outcomes are
+retried with bounded backoff inside the request, honoring Notion's
+`Retry-After`; a fetched database whose schema matches no fingerprint (or
+more than one) fails fast and distinct — `notion_template_database_missing`
+vs `notion_template_database_ambiguous`, plus separate codes for a
+non-duplicated authorization, an unreadable or empty root, and exhausted
+transient retries. What the continuation persists is the resolution record
+(`notion:template-resolution:<job id>`, same 24-hour TTL as every other
+record): normalized Pages/Posts database IDs plus each database's non-secret
+schema summary (property types and select/multi-select option names), which
+the later schema-validation and secret-writing steps consume. No token, page
+title, or row content ever reaches it. The HTTP response contains only the
+job ID and whether template duplication occurred; failures return their
+distinct error code with non-secret details (missing roles, scanned count).
 
 ## Durable provisioning job queue
 

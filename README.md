@@ -18,12 +18,24 @@ The initial Cloudflare Workers sealed-box experiment is documented in
 the hosting decision is recorded in
 [`docs/decisions/0001-sealed-box-on-workers.md`](docs/decisions/0001-sealed-box-on-workers.md).
 
-The Worker entrypoint is [`src/index.ts`](src/index.ts). It exposes
+The Worker entrypoint is [`src/index.ts`](src/index.ts). `GET /` serves the
+public landing page ([`src/landing-page.ts`](src/landing-page.ts)): a
+self-contained, server-rendered document with no client JavaScript and no
+external requests (fonts, scripts, or images), so its core content and the
+single `/connect/notion` call to action work with JavaScript disabled. It
+explains what InkDrafts creates, owns, and costs; the real three-stage
+onboarding flow and why each provider's permissions are requested; and
+privacy/security notes and links to the three public repositories. It
+deliberately never links `/connect/github` or the App install page — the
+GitHub App stays unadvertised from inkdrafts.com until the M5 launch issue
+(see [`docs/github-app-runbook.md`](docs/github-app-runbook.md)). It also
+exposes
 `GET /healthz`, starts Notion-first onboarding at `GET /connect/notion?job_id=...`,
 and handles the signed Notion callback at `GET /auth/notion/callback`. The Notion
-callback exchanges the code server-side and hands the access token plus the
-duplicated template root only to a request-local onboarding continuation; it
-returns only a redacted authorization summary. It also starts the GitHub App
+callback exchanges the code server-side and, while the access token is still
+request-local, resolves the duplicated template root into the Pages and Posts
+database IDs (see below); it returns only a redacted authorization summary. It
+also starts the GitHub App
 flow at `GET /connect/github?job_id=...`, whose signed callback
 exchanges the OAuth code server-side, verifies that the authenticated personal
 account owns the installation, selects a collision-safe repository destination,
@@ -64,6 +76,30 @@ already serves the new content. Workflow failure, Pages build failure,
 polling timeout, and unreachable-URL propagation each surface as a distinct
 step error, classified as retryable or terminal by
 [`src/provisioning-queue.ts`](src/provisioning-queue.ts).
+
+Template resolution is implemented in [`src/notion-template.ts`](src/notion-template.ts).
+The duplicated root page is walked breadth-first through its paginated block
+children (descending into sub-pages within a depth budget, since a user may
+move the databases after duplication), and each `child_database` block — whose
+block id *is* the database id — is fetched and matched against the Pages and
+Posts schema fingerprints from
+[`docs/notion-template.md`](docs/notion-template.md): required property names
+*and* Notion property types, never titles, so renaming either database does
+not break resolution. A freshly duplicated page can briefly serve empty or
+partial content, so propagation-shaped outcomes (an empty root, or candidate
+databases that still 404) are retried with bounded backoff — honoring Notion's
+`Retry-After` — inside the callback request. Every other failure is distinct
+and actionable: `notion_template_database_missing` (databases exist but one
+role matches nothing), `notion_template_database_ambiguous` (a fingerprint
+matched more than one database, or a database matched both — never guessed),
+`notion_template_not_duplicated` (the authorization used manual page selection;
+the programmatic-creation fallback of ADR 0002 §2 is future work),
+`notion_template_root_unavailable`, `notion_template_root_empty`, and
+`notion_template_unavailable`. The resolution — normalized database IDs plus a
+non-secret schema summary (property types and select options) for the later
+schema-validation step — is persisted under
+`notion:template-resolution:<job id>` in `JOBS`; the access token is never
+persisted, and page content (titles, rows, text) is never read.
 
 `/connect/notion` and `/connect/github` accept an optional `job_id` (or `jobId`)
 and generate one when omitted. Both signed states expire after ten minutes and
@@ -114,6 +150,22 @@ GITHUB_PAGES_INTEGRATION_TOKEN=... bun run test:pages-integration
 
 It verifies that the repository reports `main:/` and legacy Pages without
 changing it.
+
+The read-only template-resolution acceptance check against a disposable
+development workspace is opt-in the same way:
+
+```sh
+NOTION_TEMPLATE_INTEGRATION_TOKEN=secret_... \
+NOTION_TEMPLATE_INTEGRATION_ROOT=<duplicated root page id> \
+bun run test:notion-template-integration
+```
+
+It resolves the duplicated template root through the live Notion API and
+asserts the Pages and Posts database IDs and schema fingerprints — it only
+reads, and prints no IDs or token. Prepare the workspace by authorizing the
+development connection and choosing "Duplicate template" (the duplicated root
+id is the token response's `duplicated_template_id`), or by duplicating the
+public template manually and sharing the copy with the integration.
 
 The Notion OAuth template-duplication spike is documented in
 [`spikes/notion-oauth-template/README.md`](spikes/notion-oauth-template/README.md), and

@@ -7,6 +7,8 @@
  * returned to the browser.
  */
 
+import type { NotionTemplateErrorCode } from './notion-template';
+
 export const NOTION_AUTHORIZATION_URL = 'https://api.notion.com/v1/oauth/authorize';
 export const NOTION_TOKEN_URL = 'https://api.notion.com/v1/oauth/token';
 export const NOTION_API_VERSION = '2022-06-28';
@@ -63,7 +65,8 @@ export type NotionOAuthContinuationHandler =
 export interface NotionOAuthRouteOptions {
   /**
    * Consumes the short-lived token and duplicated root immediately. The
-   * default is a no-op until the database resolver is connected in issue #7.
+   * production handler (`continueNotionOnboarding` in `index.ts`) resolves
+   * the duplicated template into database IDs; tests inject their own.
    */
   continueOnboarding?: NotionOAuthContinuationHandler;
   /** Injectable provider transport for tests and local development. */
@@ -88,17 +91,23 @@ export type NotionOAuthErrorCode =
   | 'notion_authorization_failed'
   | 'notion_rate_limited'
   | 'notion_unavailable'
-  | 'notion_token_invalid';
+  | 'notion_token_invalid'
+  // The onboarding continuation (the database resolver wired in issue #7)
+  // reports through the same error channel; `details` may add non-secret
+  // schema metadata to the response body.
+  | NotionTemplateErrorCode;
 
 export class NotionOAuthError extends Error {
   readonly code: NotionOAuthErrorCode;
   readonly status: number;
+  readonly details: Record<string, unknown> | null;
 
-  constructor(code: NotionOAuthErrorCode, status: number) {
+  constructor(code: NotionOAuthErrorCode, status: number, details: Record<string, unknown> | null = null) {
     super(code);
     this.name = 'NotionOAuthError';
     this.code = code;
     this.status = status;
+    this.details = details;
   }
 }
 
@@ -401,7 +410,10 @@ export async function finishNotionCallback(
     return response(summary, 202, clearCookieHeaders);
   } catch (error) {
     if (error instanceof NotionOAuthError) {
-      return response({ error: error.code }, error.status, clearCookieHeaders);
+      const body: Record<string, unknown> = { error: error.code };
+      // Only non-secret schema metadata the continuation attached on purpose.
+      if (error.details) Object.assign(body, error.details);
+      return response(body, error.status, clearCookieHeaders);
     }
     return response({ error: 'notion_unavailable' }, 502, clearCookieHeaders);
   }
