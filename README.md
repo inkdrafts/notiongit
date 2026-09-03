@@ -18,9 +18,18 @@ The initial Cloudflare Workers sealed-box experiment is documented in
 the hosting decision is recorded in
 [`docs/decisions/0001-sealed-box-on-workers.md`](docs/decisions/0001-sealed-box-on-workers.md).
 
-The Worker entrypoint is [`src/index.ts`](src/index.ts). It currently exposes
-`GET /healthz` and wires the `JOBS` KV namespace and `PROVISIONING_QUEUE` Queue
-bindings. OAuth and provisioning routes will be added in subsequent issues.
+The Worker entrypoint is [`src/index.ts`](src/index.ts). It exposes
+`GET /healthz`, starts the GitHub App flow at `GET /connect/github?job_id=...`,
+and handles the signed callback at `GET /auth/github/callback`. The callback
+exchanges the OAuth code server-side, verifies that the authenticated personal
+account owns the installation, and stores only GitHub identity and installation
+metadata in `JOBS`; OAuth and installation tokens are never persisted or
+returned to browser code. It also wires the `PROVISIONING_QUEUE` Queue binding.
+
+`/connect/github` accepts an optional `job_id` (or `jobId`) and generates one
+when omitted. The signed state expires after ten minutes and is marked consumed
+after a successful callback, so a callback URL cannot be reused for a second
+authorization.
 
 Before a real deployment, replace the KV placeholder in `wrangler.toml` with
 the namespace ID returned by Wrangler and create the provisioning queues. The
