@@ -136,8 +136,15 @@ failure, a lock another attempt still holds, a record not yet visible
 through KV's eventual consistency — a message can be delivered before the
 write that preceded its enqueue has propagated — or a step that succeeded
 and was durably saved but whose continuation then failed to enqueue, in
-which case the saved success is left untouched), or acks (the job just
-reached a terminal status). Because progress lives in the record rather than the
+which case the saved success is left untouched and a retryable
+`provisioning_enqueue_failed` breadcrumb is written onto the step now
+waiting, so a record whose message has stalled never reads as healthy; the
+breadcrumb clears as soon as that step is next booked, and a stalled record
+can be re-driven by re-sending its `{ jobId }`), or acks (the job just
+reached a terminal status). A KV write failure while persisting a step's
+result is the one outcome that *does* count as a step failure: the success
+was never durable, so the standard failure path releases the lock and the
+step re-runs. Because progress lives in the record rather than the
 message, a redelivered, duplicated, or out-of-order message is always safe:
 a step already marked `succeeded` is skipped, and a job already `succeeded`,
 `failed`, or `dead_letter` is acked without touching a provider. Six of the
@@ -172,10 +179,11 @@ Workers KV has no compare-and-swap, so the per-job lock cannot give perfect
 mutual exclusion: two consumer invocations that read the job at the same
 instant can both observe no lock and both proceed. Closing that race
 completely would need a Durable Object, which this queue's expected
-throughput does not justify; the accepted fallback is that every step stays
-idempotent, so the rare double acquisition wastes a redundant step execution
-rather than corrupting job state or double-mutating GitHub. The sync
-dispatch's marker is a narrower guarantee than that: it makes a *sequential*
+throughput does not justify; the accepted fallback is that six of the seven
+steps are idempotent (see above), so the rare double acquisition wastes a
+redundant step execution rather than corrupting job state or double-mutating
+GitHub. The sync dispatch's marker is a narrower guarantee than that: it
+makes a *sequential*
 crash-then-retry safe (see above), but does not by itself prevent two
 invocations that are genuinely in flight at the same instant from both
 reading the marker unset and both dispatching — closing that specific case

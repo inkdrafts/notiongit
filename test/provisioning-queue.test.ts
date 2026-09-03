@@ -523,12 +523,24 @@ describe('processProvisioningMessage', () => {
     await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
     const { fetcher } = pipelineFetch();
     const runtime = { fetcher, sleep: async () => {}, now: () => 7_000 };
+    // MemoryKV keeps only the latest value per key, so inspect every write:
+    // an intermediate save that leaked the token before being overwritten
+    // would otherwise pass this tripwire.
+    const writes: string[] = [];
+    const spyingKv = {
+      get: kv.get.bind(kv),
+      put: async (key: string, value: string, options?: unknown) => {
+        writes.push(value);
+        return kv.put(key, value, options as never);
+      },
+    } as unknown as KVNamespace;
 
-    for (let i = 0; i < 5; i += 1) await processProvisioningMessage('job-1', env, runtime);
+    for (let i = 0; i < 5; i += 1) await processProvisioningMessage('job-1', { ...env, JOBS: spyingKv }, runtime);
 
     const job = await loadProvisioningJob(env.JOBS, 'job-1');
     expect(job?.status).toBe('succeeded');
-    expect(JSON.stringify(job)).not.toContain('installation-token');
+    expect(writes.length).toBeGreaterThan(0);
+    expect(writes.join('\n')).not.toContain('installation-token');
   });
 
   test('a retryable correlate timeout after a confirmed dispatch preserves the marker, not the stale pre-handler snapshot', async () => {
@@ -547,7 +559,10 @@ describe('processProvisioningMessage', () => {
       if (url.includes('/actions/workflows/sync-notion.yml/runs?')) {
         return Response.json({
           workflow_runs: correlatable
-            ? [{ id: 555, html_url: 'https://github.com/alice/alice.github.io/actions/runs/555', status: 'completed', conclusion: null, event: 'workflow_dispatch', created_at: new Date().toISOString() }]
+            // A fake-epoch `created_at` consistent with this test's `now()`
+            // (8_000/9_000), so the correlation window filter is actually
+            // exercised instead of vacuously passing a real-epoch timestamp.
+            ? [{ id: 555, html_url: 'https://github.com/alice/alice.github.io/actions/runs/555', status: 'completed', conclusion: null, event: 'workflow_dispatch', created_at: new Date(8_500).toISOString() }]
             : [],
         });
       }
@@ -601,6 +616,10 @@ describe('processProvisioningMessage', () => {
     expect(afterFailedSend?.steps.configure_pages.status).toBe('succeeded');
     expect(afterFailedSend?.steps.configure_pages.attempts).toBe(1);
     expect(afterFailedSend?.data.pages?.htmlUrl).toBe('https://alice.github.io');
+    // The stall is visible on the record: the step now waiting carries the
+    // breadcrumb, so this job never reads as healthy while its handoff is
+    // missing.
+    expect(afterFailedSend?.steps.dispatch_sync.lastError).toEqual({ code: 'provisioning_enqueue_failed', retryable: true });
 
     // Redelivery of the same message (the queue's own retry, not a fresh
     // continuation) must not re-run configure_pages.
@@ -608,6 +627,52 @@ describe('processProvisioningMessage', () => {
     expect(redelivered).toEqual({ outcome: 'acked' });
     expect(calls.configure_pages).toBe(1);
     expect(calls.dispatch_sync).toBe(1);
+
+    // Running the breadcrumb's step clears it — the record no longer shows
+    // a stall that has already been handed off.
+    const afterResume = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(afterResume?.steps.configure_pages.status).toBe('succeeded');
+    expect(afterResume?.steps.dispatch_sync.lastError).toBeNull();
+  });
+
+  test('a KV write failure while persisting a successful step counts as a step failure and re-runs it on redelivery', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const { fetcher, calls } = pipelineFetch();
+
+    // Fail exactly the third KV put: the saves per delivery are the locked
+    // record, the in-progress record, then the completed result.
+    let puts = 0;
+    const flakyKv = {
+      get: kv.get.bind(kv),
+      put: async (key: string, value: string, options?: unknown) => {
+        puts += 1;
+        if (puts === 3) throw new Error('kv write blip');
+        return kv.put(key, value, options as never);
+      },
+    } as unknown as KVNamespace;
+
+    const outcome = await processProvisioningMessage('job-1', { ...env, JOBS: flakyKv }, { fetcher, sleep: async () => {}, now: () => 15_000 });
+    expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 30 });
+
+    // The success was never durable, so the standard failure path applies:
+    // lock released, step back to pending with its attempt counted, no
+    // phantom result data, and the record is resumable rather than wedged
+    // behind a live lock.
+    const afterSaveFailure = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(afterSaveFailure?.status).toBe('queued');
+    expect(afterSaveFailure?.lock).toBeNull();
+    expect(afterSaveFailure?.steps.configure_pages).toMatchObject({ status: 'pending', attempts: 1 });
+    expect(afterSaveFailure?.data.pages).toBeNull();
+
+    // A healthy redelivery re-runs exactly configure_pages (the first POST's
+    // result was lost with the failed write) and advances the pipeline.
+    const redelivered = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 15_001 });
+    expect(redelivered).toEqual({ outcome: 'acked' });
+    expect(calls.configure_pages).toBe(2);
+    const afterResume = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(afterResume?.steps.configure_pages).toMatchObject({ status: 'succeeded', attempts: 2 });
   });
 
   test('patch_config advances through the queue without redoing verify_repository', async () => {
@@ -639,6 +704,34 @@ describe('processProvisioningMessage', () => {
     expect(stored?.steps.patch_config.status).toBe('succeeded');
     expect(stored?.steps.verify_repository.status).toBe('succeeded');
     expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
+  });
+
+  test('patch_config dead-letters on an unparseable config instead of retrying', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    const job = makeJob();
+    job.steps.verify_repository.status = 'succeeded';
+    await saveProvisioningJob(env.JOBS, job);
+
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url.startsWith('https://api.github.com/repos/alice/alice.github.io/contents/_config.yml')) {
+        if (init?.method === 'PUT') throw new Error('an invalid config must never be patched');
+        // Duplicate `url` keys make the config parser throw
+        // `github_config_invalid` (terminal) before any PUT is attempted.
+        return Response.json({ type: 'file', encoding: 'base64', content: base64('url: ""\nurl: ""\nbaseurl: ""\n'), sha: 'config-sha' });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 17_000 });
+    expect(outcome).toEqual({ outcome: 'acked' });
+    const stored = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(stored?.status).toBe('dead_letter');
+    expect(stored?.steps.patch_config.lastError).toEqual({ code: 'github_config_invalid', retryable: false });
+    expect(queue.sent).toEqual([]);
   });
 
   test('verify_repository dead-letters on a branch mismatch instead of retrying', async () => {

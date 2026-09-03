@@ -9,9 +9,10 @@
  * remain), asks the queue to redeliver the same message later (a retryable
  * step failure, a lock held by another in-flight attempt, a record not yet
  * visible through KV's eventual consistency, or a step that succeeded but
- * whose continuation failed to enqueue — the already-persisted success is
- * left untouched either way), or acks (the job just reached a terminal
- * status).
+ * whose continuation failed to enqueue — the saved success is kept and a
+ * retryable `provisioning_enqueue_failed` breadcrumb is left on the step now
+ * waiting, so the record never reads as healthy while nothing can advance
+ * it), or acks (the job just reached a terminal status).
  */
 
 import {
@@ -158,6 +159,40 @@ async function recordStepFailure(
 }
 
 /**
+ * Persist the fact that a succeeded step's continuation could not be
+ * enqueued. Mirrors `finishGithubCallback`'s `provisioning_enqueue_failed`
+ * handling one level up, but stays retryable and non-terminal on purpose:
+ * the step's success is already durable, so the only thing lost is the
+ * handoff, and redelivery — or a manually re-sent `{ jobId }` — resumes from
+ * the record exactly where it stopped. The breadcrumb is written onto the
+ * next pending step and disappears when that step is next booked (either it
+ * runs, or `recordStepFailure` rebuilds its bookkeeping), so it can never
+ * outlive the stall it describes. A sustained producer outage still ends at
+ * the platform's `max_retries`/dead-letter queue, which this breadcrumb
+ * turns from an invisible stall into a visible one.
+ */
+async function recordEnqueueFailure(
+  env: Pick<ProvisioningQueueEnv, 'JOBS'>,
+  finalJob: ProvisioningJob,
+  pendingStep: ProvisioningStepName,
+  now: number,
+): Promise<ProvisioningMessageOutcome> {
+  const updated: ProvisioningJob = {
+    ...finalJob,
+    steps: {
+      ...finalJob.steps,
+      [pendingStep]: {
+        ...finalJob.steps[pendingStep],
+        lastError: { code: 'provisioning_enqueue_failed', retryable: true },
+        updatedAt: now,
+      },
+    },
+  };
+  await saveProvisioningJob(env.JOBS, updated);
+  return { outcome: 'retry', delaySeconds: PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS };
+}
+
+/**
  * Advance one job by exactly one step. Safe to call for a duplicate,
  * out-of-order, or post-completion delivery of the same `jobId`: a job that
  * is already terminal or currently locked by a live attempt is left
@@ -234,20 +269,34 @@ export async function processProvisioningMessage(
   const finalJob: ProvisioningJob = remainingStep
     ? { ...stepSucceeded, status: 'queued' }
     : { ...stepSucceeded, status: 'succeeded', completedAt: stepSucceeded.updatedAt };
-  await saveProvisioningJob(env.JOBS, finalJob);
+  try {
+    await saveProvisioningJob(env.JOBS, finalJob);
+  } catch (error) {
+    // Unlike the enqueue failure below, a KV write failure here means the
+    // success was never persisted, so the step genuinely has to re-run:
+    // route it through the standard failure path, which releases the lock
+    // and resets the step to `pending`. That re-run is safe — six steps are
+    // idempotent and `dispatch_sync`'s marker was persisted by the handler
+    // itself, before its external call.
+    return recordStepFailure(env, inProgress, step, error, now());
+  }
 
   if (remainingStep) {
     try {
       await env.PROVISIONING_QUEUE.send({ jobId });
+      return { outcome: 'acked' };
     } catch {
       // The step itself succeeded and that is already durable (saved just
       // above); only handing off the continuation failed. Ask the queue to
       // redeliver this same message rather than recording a step failure —
       // on redelivery the just-completed step is found already 'succeeded'
-      // and is not re-run, so a transient enqueue failure never doubles the
-      // step's external effect, discards its result, or inflates its
-      // attempt count.
-      return { outcome: 'retry', delaySeconds: PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS };
+      // and is not re-run, so a transient enqueue failure does not double
+      // the step's external effect, discard its result, or inflate its
+      // attempt count. (If the redelivery's KV read is stale enough to
+      // predate the saved success, the step re-runs — the handlers'
+      // idempotency and the dispatch marker contain that case, exactly as
+      // for the eventual-consistency redelivery at the top of this file.)
+      return recordEnqueueFailure(env, finalJob, remainingStep, now());
     }
   }
   return { outcome: 'acked' };
