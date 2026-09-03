@@ -104,11 +104,16 @@ async function runDispatchSync(job: ProvisioningJob, ctx: StepRunnerContext): Pr
   const dispatchedAtMs = ctx.now();
   // Persist the marker before dispatching. A crash after the POST succeeds
   // but before this function returns still resumes by correlating the same
-  // window on the next attempt — never by dispatching a second run. (A
-  // crash between this write and the POST itself is the one gap this
-  // cannot close without a transactional outbox: the next attempt will see
-  // the marker, find no matching run, and time out. That is a bounded,
-  // visible failure — not a silent duplicate.)
+  // window on the *next sequential attempt* — never by dispatching a
+  // second run. (A crash between this write and the POST itself is the one
+  // gap this cannot close without a transactional outbox: the next attempt
+  // will see the marker, find no matching run, and time out. That is a
+  // bounded, visible failure — not a silent duplicate.) This does not
+  // protect against two invocations that are genuinely in flight at the
+  // same time: each reads the job's marker as `null` from its own
+  // in-memory snapshot before either has written, so both can reach this
+  // branch. See the compare-and-swap limitation documented on
+  // `tryAcquireProvisioningLock` in `provisioning-job.ts`.
   await saveProvisioningJob(ctx.jobs, {
     ...job,
     data: { ...job.data, syncDispatchMarker: { excludedRunIds: [...excludedRunIds], dispatchedAtMs } },

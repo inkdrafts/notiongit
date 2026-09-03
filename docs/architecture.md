@@ -137,11 +137,20 @@ A queue message carries only `{ jobId }`; the `ProvisioningJob` record in KV
 is the sole source of truth for progress. Each consumer invocation acquires
 a short-lived per-job lock, advances exactly one pending step, persists the
 result, and either enqueues a continuation message (steps remain), asks the
-queue to redeliver the same message after a backoff (a retryable failure, a
-lock another attempt still holds, or a record not yet visible through KV's
-eventual consistency — a message can be delivered before the write that
-preceded its enqueue has propagated), or acks (the job just reached a
-terminal status). Because progress lives in the record rather than the
+queue to redeliver the same message after a backoff (a retryable step
+failure, a lock another attempt still holds, a record not yet visible
+through KV's eventual consistency — a message can be delivered before the
+write that preceded its enqueue has propagated — or a step that succeeded
+and was durably saved but whose continuation then failed to enqueue, in
+which case the saved success is left untouched and a retryable
+`provisioning_enqueue_failed` breadcrumb is written onto the step now
+waiting, so a record whose message has stalled never reads as healthy; the
+breadcrumb clears as soon as that step is next booked, and a stalled record
+can be re-driven by re-sending its `{ jobId }`), or acks (the job just
+reached a terminal status). A KV write failure while persisting a step's
+result is the one outcome that *does* count as a step failure: the success
+was never durable, so the standard failure path releases the lock and the
+step re-runs. Because progress lives in the record rather than the
 message, a redelivered, duplicated, or out-of-order message is always safe:
 a step already marked `succeeded` is skipped, and a job already `succeeded`,
 `failed`, or `dead_letter` is acked without touching a provider. Six of the
@@ -176,10 +185,18 @@ Workers KV has no compare-and-swap, so the per-job lock cannot give perfect
 mutual exclusion: two consumer invocations that read the job at the same
 instant can both observe no lock and both proceed. Closing that race
 completely would need a Durable Object, which this queue's expected
-throughput does not justify; the accepted fallback is that every step stays
-idempotent (or, for the sync dispatch, resumable via its marker), so the
-rare double acquisition wastes a redundant step execution rather than
-corrupting job state or double-mutating GitHub. Every `ProvisioningJob`
+throughput does not justify; the accepted fallback is that six of the seven
+steps are idempotent (see above), so the rare double acquisition wastes a
+redundant step execution rather than corrupting job state or double-mutating
+GitHub. The sync dispatch's marker is a narrower guarantee than that: it
+makes a *sequential*
+crash-then-retry safe (see above), but does not by itself prevent two
+invocations that are genuinely in flight at the same instant from both
+reading the marker unset and both dispatching — closing that specific case
+needs the same compare-and-swap the lock lacks. This is called out as a
+known, accepted limitation rather than a silent one; a Durable-Object-backed
+lock is the natural follow-up if genuine concurrent redelivery of the same
+job is ever observed in practice. Every `ProvisioningJob`
 record — including the sync dispatch marker, the only durable state
 adjacent to an in-flight operation — is written with the same
 `expirationTtl` used everywhere else in this project (24 hours), so expired

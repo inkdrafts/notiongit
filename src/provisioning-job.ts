@@ -20,6 +20,10 @@ export const PROVISIONING_JOB_PREFIX = 'github:onboarding-job:';
 export const PROVISIONING_STEP_MAX_ATTEMPTS = 5;
 export const PROVISIONING_LOCK_TTL_MS = 5 * 60 * 1000;
 export const PROVISIONING_LOCK_RETRY_DELAY_SECONDS = 30;
+/** Short backoff for redelivery after a step succeeded but handing the
+ * continuation to the queue itself failed — expected to be rare and
+ * transient, unlike a provider-classified step failure. */
+export const PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS = 10;
 
 /**
  * One entry per synchronous chain this project's `finishGithubCallback` used
@@ -200,11 +204,20 @@ export async function saveProvisioningJob(
  * Workers KV has no compare-and-swap, so two invocations that read the job
  * at the same instant can both observe no lock and both write one — closing
  * that race completely would need a Durable Object, which this queue's
- * throughput does not justify. The accepted fallback is that every step
- * handler stays idempotent (or, for the one call that is not, resumable —
- * see `runDispatchSync` in `provisioning-steps.ts`), so the rare double
+ * throughput does not justify. For six of the seven steps that is a
+ * contained accepted trade-off: each is idempotent, so the rare double
  * acquisition wastes a redundant step execution rather than corrupting job
- * state or double-mutating an external system.
+ * state or double-mutating an external system. `dispatch_sync` is the
+ * documented exception: its before-dispatch marker (see `runDispatchSync`
+ * in `provisioning-steps.ts`) makes a *sequential* crash-then-retry safe,
+ * but does not by itself prevent two invocations that are both genuinely
+ * in flight at once — each reading `syncDispatchMarker` as `null` from its
+ * own in-memory snapshot before either has written — from both taking the
+ * fresh-dispatch branch and starting two real workflow runs. Closing that
+ * specific gap needs the same compare-and-swap this function lacks; it is
+ * an accepted, documented limitation rather than a silent one, and a
+ * candidate for a Durable-Object-backed lock if genuine concurrent
+ * redelivery of the same job is ever observed in practice.
  */
 export function tryAcquireProvisioningLock(
   job: ProvisioningJob,
