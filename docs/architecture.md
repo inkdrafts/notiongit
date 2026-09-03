@@ -86,14 +86,20 @@ retried with bounded backoff inside the request, honoring Notion's
 more than one) fails fast and distinct — `notion_template_database_missing`
 vs `notion_template_database_ambiguous`, plus separate codes for a
 non-duplicated authorization, an unreadable or empty root, and exhausted
-transient retries. What the continuation persists is the resolution record
-(`notion:template-resolution:<job id>`, same 24-hour TTL as every other
-record): normalized Pages/Posts database IDs plus each database's non-secret
-schema summary (property types and select/multi-select option names), which
-the later schema-validation and secret-writing steps consume. No token, page
-title, or row content ever reaches it. The HTTP response contains only the
-job ID and whether template duplication occurred; failures return their
-distinct error code with non-secret details (missing roles, scanned count).
+ transient retries. The continuation then validates the complete sync-engine
+ contract: required properties and types, required select values, and the
+ types of optional fields when present. Missing properties, wrong types, and
+ unsupported options are returned per database with remediation that names the
+ correct Notion database. Only a successful validation is persisted in the
+ resolution record (`notion:template-resolution:<job id>`, same 24-hour TTL as
+ every other record): normalized Pages/Posts database IDs plus each database's
+ non-secret schema summary (property types and select/multi-select option
+ names). `/connect/github` requires that record and revalidates it before
+ issuing any GitHub authorization or provisioning call. No token, page title,
+ or row content ever reaches it. The HTTP response contains only the job ID
+ and whether template duplication occurred; failures return their distinct
+ error code with non-secret details (missing roles, scanned count, or schema
+ validation issues).
 
 ## Durable provisioning job queue
 

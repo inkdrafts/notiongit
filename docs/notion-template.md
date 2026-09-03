@@ -113,3 +113,19 @@ The full field lists above are the engine contract source for future template
 updates. If a required property is renamed or its type changes, increment the
 template schema version and update the sync engine contract and resolver in a
 separate change before changing the public template.
+
+## Onboarding validation
+
+The Notion callback validates the database schema before the GitHub connection
+can begin. The runtime-required fields are the fingerprint fields listed
+above. `Title`, `Description`, and the Pages home-profile fields are optional;
+the sync engine has documented name aliases and defaults for them. Optional
+fields are still rejected when present with the wrong Notion type.
+
+The Pages `Type` select must contain `home`, `blog-list`, `blog`, and
+`markdown`. Both `Status` selects must contain `Published` (the template also
+ships `Draft`). Additional select values are rejected when the engine cannot
+interpret them. Validation failures identify the affected database and list
+missing properties, wrong types, or unsupported options with instructions to
+fix that database in Notion. No rows, page body content, tokens, or private
+workspace metadata are read for this check.
