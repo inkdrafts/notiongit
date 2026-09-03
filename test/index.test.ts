@@ -36,6 +36,7 @@ function mockResponse(entry: MockSequenceEntry): Response {
     headers: { 'content-type': 'application/json', ...(entry.headers ?? {}) },
   });
 }
+
 function base64(content: string): string {
   let binary = '';
   for (const byte of new TextEncoder().encode(content)) binary += String.fromCharCode(byte);
@@ -50,7 +51,6 @@ baseurl: ""
 author:
   name: ""
 `;
-
 
 function generatedRepositoryBody(name: string): Record<string, unknown> {
   return {
@@ -110,6 +110,20 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
       if (request.url === 'https://api.github.com/app/installations/123/access_tokens') {
         return Response.json({ token: 'installation-token' });
       }
+      const pagesMatch = request.url.match(/^https:\/\/api\.github\.com\/repos\/alice\/([^/]+)\/pages$/u);
+      if (pagesMatch) {
+        const name = pagesMatch[1];
+        return mockResponse({
+          status: 201,
+          body: {
+            status: 'built',
+            url: `https://api.github.com/repos/alice/${name}/pages`,
+            html_url: name === 'alice.github.io' ? 'https://alice.github.io' : `https://alice.github.io/${name}`,
+            build_type: 'legacy',
+            source: { branch: 'main', path: '/' },
+          },
+        });
+      }
       const repositoryMatch = request.url.match(/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+$/u);
       if (repositoryMatch && authorization === 'Bearer user-token') {
         return mockResponse(next(options.colliding, () => ({ status: 404 })));
@@ -127,7 +141,9 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
         })));
       }
       if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/contents\/_config\.yml(?:\?ref=main)?$/u.test(request.url)) {
-        if (request.method === 'PUT') return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
+        if (request.method === 'PUT') {
+          return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
+        }
         return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
       }
       throw new Error(`unexpected URL: ${request.url}`);
@@ -297,6 +313,18 @@ describe('GitHub App install and authorize flow', () => {
       if (request.url === 'https://api.github.com/app/installations/123/access_tokens') {
         return Response.json({ token: 'installation-token' });
       }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
+        expect(request.method).toBe('POST');
+        expect(await request.json()).toEqual({ build_type: 'legacy', source: { branch: 'main', path: '/' } });
+        return Response.json({
+          status: 'built',
+          url: 'https://api.github.com/repos/alice/alice.github.io/pages',
+          html_url: 'https://alice.github.io',
+          build_type: 'legacy',
+          source: { branch: 'main', path: '/' },
+        }, { status: 201 });
+      }
       if (request.url === 'https://api.github.com/repos/alice/alice.github.io') {
         expect(request.headers.get('authorization')).toBe('Bearer installation-token');
         return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
@@ -335,6 +363,13 @@ describe('GitHub App install and authorize flow', () => {
           html_url: 'https://github.com/alice/alice.github.io',
           default_branch: 'main',
         },
+        pages: {
+          status: 'built',
+          url: 'https://api.github.com/repos/alice/alice.github.io/pages',
+          html_url: 'https://alice.github.io',
+          build_type: 'legacy',
+          source: { branch: 'main', path: '/' },
+        },
       });
       expect(generateBodies).toEqual([{
         name: 'alice.github.io',
@@ -344,7 +379,13 @@ describe('GitHub App install and authorize flow', () => {
       }]);
 
       const stored = await kv.get<Record<string, any>>('github:onboarding-job:job-123', 'json');
-      expect(stored?.status).toBe('repository_generated');
+      expect(stored?.status).toBe('pages_enabled');
+      expect(stored?.pages).toMatchObject({
+        status: 'built',
+        htmlUrl: 'https://alice.github.io',
+        buildType: 'legacy',
+        source: { branch: 'main', path: '/' },
+      });
       expect(stored?.generatedRepository).toMatchObject({
         id: 1001,
         fullName: 'alice/alice.github.io',
@@ -365,7 +406,7 @@ describe('GitHub App install and authorize flow', () => {
       );
       expect(replay.status).toBe(400);
       expect(await replay.json()).toEqual({ error: 'github_state_replayed' });
-      expect(requests).toHaveLength(11);
+      expect(requests).toHaveLength(12);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -410,6 +451,15 @@ describe('GitHub App install and authorize flow', () => {
       if (request.url === 'https://api.github.com/app/installations/123/access_tokens') {
         return Response.json({ token: 'installation-token' });
       }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        return Response.json({
+          status: 'built',
+          url: 'https://api.github.com/repos/alice/alice.github.io/pages',
+          html_url: 'https://alice.github.io',
+          build_type: 'legacy',
+          source: { branch: 'main', path: '/' },
+        }, { status: 201 });
+      }
       if (request.url === 'https://api.github.com/repos/alice/alice.github.io') {
         return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
       }
@@ -436,7 +486,7 @@ describe('GitHub App install and authorize flow', () => {
         env,
       );
       expect(callback.status).toBe(200);
-      expect(calls).toBe(12);
+      expect(calls).toBe(13);
     } finally {
       globalThis.fetch = originalFetch;
     }

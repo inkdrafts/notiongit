@@ -19,6 +19,11 @@ import {
   type GeneratedRepositoryIdentity,
 } from './repository-generation';
 import {
+  configureGithubPages,
+  GithubPagesError,
+  type GithubPagesIdentity,
+} from './github-pages';
+import {
   GithubActionsSecretsError,
 } from './actions-secrets';
 import {
@@ -61,6 +66,22 @@ export type {
 } from './repository-generation';
 
 export {
+  configureGithubPages,
+  getGithubPagesSite,
+  GITHUB_PAGES_BUILD_TYPE,
+  GITHUB_PAGES_SOURCE,
+  GithubPagesError,
+  PAGES_INITIAL_DELAY_MS,
+  PAGES_MAX_ATTEMPTS,
+  PAGES_MAX_DELAY_MS,
+} from './github-pages';
+export type {
+  GithubPagesConfigureOptions,
+  GithubPagesErrorCode,
+  GithubPagesIdentity,
+} from './github-pages';
+
+export {
   ACTIONS_SECRET_NAMES,
   GithubActionsSecretsError,
   getActionsPublicKey,
@@ -79,6 +100,7 @@ export type {
   GithubActionsSecretsPayload,
   GithubActionsPublicKey,
 } from './actions-secrets';
+
 export {
   CONFIG_PATCH_COMMIT_MESSAGE,
   CONFIG_PATCH_MAX_ATTEMPTS,
@@ -123,6 +145,7 @@ export interface GithubOnboardingResult {
   identity: GithubIdentity;
   repository: RepositoryDestination;
   generatedRepository: GeneratedRepositoryIdentity;
+  pages: GithubPagesIdentity;
 }
 
 const GITHUB_API = 'https://api.github.com';
@@ -183,11 +206,12 @@ interface GithubStateRecord {
 interface GithubJobRecord {
   version: 1;
   jobId: string;
-  status: 'repository_generated';
+  status: 'pages_enabled';
   installationId: number;
   identity: GithubIdentity;
   repository: RepositoryDestination;
   generatedRepository: GeneratedRepositoryIdentity;
+  pages: GithubPagesIdentity;
   completedAt: number;
 }
 
@@ -567,6 +591,11 @@ function authError(error: unknown): Response {
     if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
     return json(body, error.status);
   }
+  if (error instanceof GithubPagesError) {
+    const body: Record<string, unknown> = { error: error.code };
+    if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
+    return json(body, error.status);
+  }
   if (error instanceof GithubActionsSecretsError) {
     return json({ error: error.code }, error.status);
   }
@@ -708,14 +737,21 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       headTreeSha: usable.headTreeSha,
     };
 
+    // Pages configuration uses the installation token, whose Pages and
+    // Administration permissions are the least privilege needed for this
+    // operation. A 409 is reconciled by configureGithubPages, so retries after
+    // a partial callback never create or mutate a second repository.
+    const pages = await configureGithubPages(installationToken, generatedRepository.fullName);
+
     const completed: GithubJobRecord = {
       version: 1,
       jobId: record.jobId,
-      status: 'repository_generated',
+      status: 'pages_enabled',
       installationId: selectedInstallationId,
       identity,
       repository,
       generatedRepository,
+      pages,
       completedAt: Date.now(),
     };
     await env.JOBS.put(jobKey(record.jobId), JSON.stringify(completed), { expirationTtl: JOB_TTL_SECONDS });
@@ -736,6 +772,13 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
         id: generatedRepository.id,
         html_url: generatedRepository.htmlUrl,
         default_branch: generatedRepository.defaultBranch,
+      },
+      pages: {
+        status: pages.status,
+        url: pages.url,
+        html_url: pages.htmlUrl,
+        build_type: pages.buildType,
+        source: pages.source,
       },
     });
   } catch (error) {
