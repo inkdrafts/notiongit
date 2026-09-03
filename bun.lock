@@ -4,6 +4,10 @@
   "workspaces": {
     "": {
       "name": "notiongit",
+      "dependencies": {
+        "libsodium": "0.8.4",
+        "libsodium-wrappers": "0.8.4",
+      },
     },
     "spikes/libsodium-workers": {
       "name": "libsodium-workers-spike",

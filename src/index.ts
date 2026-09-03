@@ -19,6 +19,9 @@ import {
   type GeneratedRepositoryIdentity,
 } from './repository-generation';
 import {
+  GithubActionsSecretsError,
+} from './actions-secrets';
+import {
   patchRepositoryConfig,
   GithubConfigError,
 } from './repository-config';
@@ -56,6 +59,26 @@ export type {
   GeneratedRepositoryPollOptions,
   GithubGenerateErrorCode,
 } from './repository-generation';
+
+export {
+  ACTIONS_SECRET_NAMES,
+  GithubActionsSecretsError,
+  getActionsPublicKey,
+  getGithubActionsPublicKey,
+  sealActionsSecret,
+  sealSecret,
+  sealGithubActionsSecret,
+  writeActionsSecrets,
+  writeGithubActionsSecrets,
+} from './actions-secrets';
+export type {
+  ActionsSecretName,
+  ActionsSecretsProvisioningPayload,
+  ActionsSecretsWriteResult,
+  GithubActionsSecretsErrorCode,
+  GithubActionsSecretsPayload,
+  GithubActionsPublicKey,
+} from './actions-secrets';
 export {
   CONFIG_PATCH_COMMIT_MESSAGE,
   CONFIG_PATCH_MAX_ATTEMPTS,
@@ -543,6 +566,9 @@ function authError(error: unknown): Response {
     const body: Record<string, unknown> = { error: error.code };
     if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
     return json(body, error.status);
+  }
+  if (error instanceof GithubActionsSecretsError) {
+    return json({ error: error.code }, error.status);
   }
   if (error instanceof GithubConfigError) {
     if (error.status === 400 || error.status === 401) {

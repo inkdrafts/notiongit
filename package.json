@@ -12,6 +12,10 @@
     "deploy:dry-run": "bun run build",
     "dev": "spikes/libsodium-workers/node_modules/.bin/wrangler dev"
   },
+  "dependencies": {
+    "libsodium": "0.8.4",
+    "libsodium-wrappers": "0.8.4"
+  },
   "trustedDependencies": [
     "esbuild",
     "workerd"
