@@ -29,6 +29,7 @@ import {
   provisioningRetryDelaySeconds,
   saveProvisioningJob,
   tryAcquireProvisioningLock,
+  PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS,
   PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
   PROVISIONING_STEP_MAX_ATTEMPTS,
   type ProvisioningJob,
@@ -194,10 +195,11 @@ export async function processProvisioningMessage(
   await saveProvisioningJob(env.JOBS, inProgress);
 
   const ctx: StepRunnerContext = { jobs: env.JOBS, installationToken, fetcher, sleep, now };
+  let stepSucceeded: ProvisioningJob;
   try {
     const patch = await PROVISIONING_STEP_HANDLERS[step](inProgress, ctx);
     const completionMs = now();
-    const stepSucceeded: ProvisioningJob = {
+    stepSucceeded = {
       ...inProgress,
       data: { ...inProgress.data, ...patch },
       steps: {
@@ -207,15 +209,36 @@ export async function processProvisioningMessage(
       lock: null,
       updatedAt: completionMs,
     };
-
-    const remainingStep = nextPendingStep(stepSucceeded);
-    const finalJob: ProvisioningJob = remainingStep
-      ? { ...stepSucceeded, status: 'queued' }
-      : { ...stepSucceeded, status: 'succeeded', completedAt: completionMs };
-    await saveProvisioningJob(env.JOBS, finalJob);
-    if (remainingStep) await env.PROVISIONING_QUEUE.send({ jobId });
-    return { outcome: 'acked' };
   } catch (error) {
-    return recordStepFailure(env, inProgress, step, error, now());
+    // Reload rather than reusing `inProgress`: the handler itself may have
+    // already durably written partial progress before throwing (only
+    // runDispatchSync does this today, persisting its pre-dispatch marker —
+    // see provisioning-steps.ts). Recording the failure against the stale
+    // pre-handler snapshot would silently erase that write, and for
+    // dispatch_sync specifically that erased marker is exactly what would
+    // let the next attempt dispatch a second Notion sync run.
+    const current = await loadProvisioningJob(env.JOBS, jobId);
+    return recordStepFailure(env, current ?? inProgress, step, error, now());
   }
+
+  const remainingStep = nextPendingStep(stepSucceeded);
+  const finalJob: ProvisioningJob = remainingStep
+    ? { ...stepSucceeded, status: 'queued' }
+    : { ...stepSucceeded, status: 'succeeded', completedAt: stepSucceeded.updatedAt };
+  await saveProvisioningJob(env.JOBS, finalJob);
+
+  if (remainingStep) {
+    try {
+      await env.PROVISIONING_QUEUE.send({ jobId });
+    } catch {
+      // The step itself succeeded and that is already durable (saved just
+      // above); only handing off the continuation failed. Ask the queue to
+      // redeliver this same message rather than recording a step failure —
+      // on redelivery the just-completed step is found already 'succeeded'
+      // and is not re-run, so a transient enqueue failure never doubles the
+      // step's external effect or discards its result.
+      return { outcome: 'retry', delaySeconds: PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS };
+    }
+  }
+  return { outcome: 'acked' };
 }

@@ -185,6 +185,45 @@ describe('runDispatchSync', () => {
     const patch = await PROVISIONING_STEP_HANDLERS.dispatch_sync(job, makeContext(unreachableFetch()));
     expect(patch).toEqual({});
   });
+
+  test('persists the dispatch marker to KV before issuing the dispatch POST', async () => {
+    const events: string[] = [];
+    const jobs = new MemoryKV();
+    const instrumentedJobs = {
+      get: jobs.get.bind(jobs),
+      put: async (key: string, value: string, options?: unknown) => {
+        events.push('kv-write');
+        return jobs.put(key, value, options as never);
+      },
+    } as unknown as KVNamespace;
+
+    let dispatched = false;
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/actions/workflows/sync-notion.yml/runs?')) {
+        return Response.json({
+          workflow_runs: dispatched
+            ? [{ id: 555, html_url: 'https://github.com/alice/alice.github.io/actions/runs/555', status: 'queued', conclusion: null, event: 'workflow_dispatch', created_at: new Date(20_000).toISOString() }]
+            : [],
+        });
+      }
+      if (url.endsWith('/dispatches') && init?.method === 'POST') {
+        events.push('dispatch-post');
+        dispatched = true;
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    await PROVISIONING_STEP_HANDLERS.dispatch_sync(
+      makeJob(),
+      makeContext(fetcher, { jobs: instrumentedJobs, now: () => 20_000, sleep: async () => {} }),
+    );
+
+    expect(events).toEqual(['kv-write', 'dispatch-post']);
+    const stored = await jobs.get<ProvisioningJob>('github:onboarding-job:job-1', 'json');
+    expect(stored?.data.syncDispatchMarker).toEqual({ excludedRunIds: [], dispatchedAtMs: 20_000 });
+  });
 });
 
 describe('runAwaitSync', () => {

@@ -28,6 +28,7 @@ import {
 import {
   createProvisioningJob,
   saveProvisioningJob,
+  PROVISIONING_STEP_ORDER,
 } from './provisioning-job';
 import { processProvisioningMessage } from './provisioning-queue';
 
@@ -162,6 +163,7 @@ export {
   PROVISIONING_JOB_PREFIX,
   PROVISIONING_JOB_TTL_SECONDS,
   PROVISIONING_JOB_VERSION,
+  PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS,
   PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
   PROVISIONING_LOCK_TTL_MS,
   PROVISIONING_STEP_MAX_ATTEMPTS,
@@ -695,7 +697,33 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       JSON.stringify({ ...record, phase: 'consumed', installationId: selectedInstallationId, identity }),
       { expirationTtl: STATE_REPLAY_TTL_SECONDS },
     );
-    await env.PROVISIONING_QUEUE.send({ jobId: job.jobId });
+
+    try {
+      await env.PROVISIONING_QUEUE.send({ jobId: job.jobId });
+    } catch {
+      // The job record exists but no message will ever advance it — mark it
+      // dead_letter immediately rather than leaving a 'queued' record that
+      // silently never processes until its TTL expires. The OAuth state is
+      // already consumed, so recovery is a fresh /connect/github attempt
+      // (a new job), not a replay of this callback.
+      const failedAt = Date.now();
+      const firstStep = PROVISIONING_STEP_ORDER[0];
+      await saveProvisioningJob(env.JOBS, {
+        ...job,
+        status: 'dead_letter',
+        steps: {
+          ...job.steps,
+          [firstStep]: {
+            status: 'failed',
+            attempts: 0,
+            updatedAt: failedAt,
+            lastError: { code: 'provisioning_enqueue_failed', retryable: false },
+          },
+        },
+        completedAt: failedAt,
+      });
+      return json({ error: 'github_provisioning_enqueue_failed', job_id: job.jobId }, 502);
+    }
 
     return json({
       ok: true,

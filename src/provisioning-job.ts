@@ -20,6 +20,10 @@ export const PROVISIONING_JOB_PREFIX = 'github:onboarding-job:';
 export const PROVISIONING_STEP_MAX_ATTEMPTS = 5;
 export const PROVISIONING_LOCK_TTL_MS = 5 * 60 * 1000;
 export const PROVISIONING_LOCK_RETRY_DELAY_SECONDS = 30;
+/** Short backoff for redelivery after a step succeeded but handing the
+ * continuation to the queue itself failed — expected to be rare and
+ * transient, unlike a provider-classified step failure. */
+export const PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS = 10;
 
 /**
  * One entry per synchronous chain this project's `finishGithubCallback` used

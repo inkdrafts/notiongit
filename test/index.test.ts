@@ -485,6 +485,58 @@ describe('GitHub App install and authorize flow', () => {
     expect(queue.sent).toEqual([]);
   });
 
+  test('dead-letters the job instead of orphaning it when handing off to the queue fails', async () => {
+    const kv = new MemoryKV();
+    const brokenQueue = { send: async () => { throw new Error('queue outage'); } };
+    const env = await githubEnv(kv, brokenQueue as unknown as Queue<ProvisioningMessage>);
+    const { state } = await getInstallState(env);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+      if (request.url === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
+      if (request.url === 'https://api.github.com/user/installations/123') {
+        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+      }
+      if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') {
+        return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
+      }
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/generate') {
+        return Response.json(generatedRepositoryBody('alice.github.io'), { status: 201 });
+      }
+      throw new Error(`unexpected URL: ${request.url}`);
+    };
+
+    try {
+      const response = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(response.status).toBe(502);
+      expect(await response.json()).toEqual({ error: 'github_provisioning_enqueue_failed', job_id: 'job-123' });
+
+      const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
+      expect(stored?.status).toBe('dead_letter');
+      expect(stored?.steps.verify_repository).toMatchObject({
+        status: 'failed',
+        lastError: { code: 'provisioning_enqueue_failed', retryable: false },
+      });
+      expect(stored?.data.generatedRepository).toMatchObject({ fullName: 'alice/alice.github.io' });
+
+      // The OAuth state is still consumed (a real repository now exists),
+      // so recovery is a fresh /connect/github attempt, not a replay.
+      const replay = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123`),
+        env,
+      );
+      expect(replay.status).toBe(400);
+      expect(await replay.json()).toEqual({ error: 'github_state_replayed' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test.each([
     ['suspended installation', { suspended_at: '2026-09-02T00:00:00Z' }, 'github_installation_suspended', 403],
     ['organization installation', { suspended_at: null, account: { id: 7, login: 'org', type: 'Organization' } }, 'github_organization_installation_not_supported', 403],

@@ -72,7 +72,12 @@ cannot be deferred. Once generation succeeds, the callback persists a
 `ProvisioningJob` record (`provisioning-job.ts`), enqueues `{ jobId }` to
 `PROVISIONING_QUEUE`, and responds `202` with only the identity and
 repository data known so far — the OAuth token and code are already out of
-scope by the time the response is written and are never queued or stored.
+scope by the time the response is written and are never queued or stored. If
+enqueuing itself fails, the callback marks the job `dead_letter` (with a
+`provisioning_enqueue_failed` step error) before responding `502`, rather
+than leaving a `queued` record that no message will ever advance — the OAuth
+state is already consumed by then, so recovery is a fresh `/connect/github`
+attempt, not a replay of the same callback.
 
 Everything after generation — verifying the generated repository is
 readable, patching `_config.yml`, enabling Pages, dispatching and awaiting
@@ -100,7 +105,16 @@ seven steps are simple idempotent GETs or already-reconciling writes; the
 one exception, dispatching the Notion sync workflow, persists a
 before-dispatch marker (the excluded run-id snapshot and dispatch time) so a
 crash between the dispatch call and recording its correlated run resumes by
-correlating that same window instead of starting a second workflow run.
+correlating that same window instead of starting a second workflow run. When
+a step throws, the consumer reloads the job from KV before recording the
+failure rather than reusing the pre-step snapshot in memory — a step handler
+can itself have durably written partial progress (the sync dispatch marker
+is the one example today) before throwing, and recording the failure against
+a stale snapshot would silently erase that write. Symmetrically, if a step
+succeeds and its result is durably saved but handing the continuation to the
+queue then fails, the consumer never treats that as a step failure: it asks
+for redelivery of the same message, and the already-persisted success is
+what the redelivered attempt finds and skips past.
 
 A step failure is classified (`classifyProvisioningError`) from the same
 error taxonomy each provider module already exposes: retryable failures
