@@ -136,9 +136,16 @@ mutual exclusion: two consumer invocations that read the job at the same
 instant can both observe no lock and both proceed. Closing that race
 completely would need a Durable Object, which this queue's expected
 throughput does not justify; the accepted fallback is that every step stays
-idempotent (or, for the sync dispatch, resumable via its marker), so the
-rare double acquisition wastes a redundant step execution rather than
-corrupting job state or double-mutating GitHub. Every `ProvisioningJob`
+idempotent, so the rare double acquisition wastes a redundant step execution
+rather than corrupting job state or double-mutating GitHub. The sync
+dispatch's marker is a narrower guarantee than that: it makes a *sequential*
+crash-then-retry safe (see above), but does not by itself prevent two
+invocations that are genuinely in flight at the same instant from both
+reading the marker unset and both dispatching — closing that specific case
+needs the same compare-and-swap the lock lacks. This is called out as a
+known, accepted limitation rather than a silent one; a Durable-Object-backed
+lock is the natural follow-up if genuine concurrent redelivery of the same
+job is ever observed in practice. Every `ProvisioningJob`
 record — including the sync dispatch marker, the only durable state
 adjacent to an in-flight operation — is written with the same
 `expirationTtl` used everywhere else in this project (24 hours), so expired
