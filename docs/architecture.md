@@ -58,6 +58,24 @@ credential rotation procedure are maintained in the
 [`Notion integration runbook`](notion-integration-runbook.md) and its
 [`sanitized template build sheet`](notion-template.md).
 
+## Notion authorization continuation
+
+`GET /connect/notion` creates a ten-minute HMAC-signed state containing only a
+job reference and nonce. The nonce is replay-tracked in `JOBS` and copied into
+an HttpOnly, Secure, SameSite cookie so a callback from a different browser
+flow is rejected. `GET /auth/notion/callback` validates and consumes that state
+before exchanging Notion's one-time code at `/v1/oauth/token`, using the
+environment-derived callback URL and the pinned `Notion-Version: 2022-06-28`
+header.
+
+The exchange result is handed directly to the request-local onboarding
+continuation as `{ jobId, accessToken, duplicatedTemplateId }`. The access and
+refresh tokens, workspace metadata, OAuth code, and duplicated-root ID are not
+written to KV, queue messages, cookies, logs, or browser responses. Until the
+database resolver is wired in issue #7, the route's default continuation is a
+no-op; tests inject the continuation to prove the handoff. The HTTP response
+contains only the job ID and whether template duplication occurred.
+
 ## Durable provisioning job queue
 
 Provisioning spans several third-party API calls over 60–120 seconds and can
@@ -72,12 +90,11 @@ cannot be deferred. Once generation succeeds, the callback persists a
 `ProvisioningJob` record (`provisioning-job.ts`), enqueues `{ jobId }` to
 `PROVISIONING_QUEUE`, and responds `202` with only the identity and
 repository data known so far — the OAuth token and code are already out of
-scope by the time the response is written and are never queued or stored. If
-enqueuing itself fails, the callback marks the job `dead_letter` (with a
-`provisioning_enqueue_failed` step error) before responding `502`, rather
-than leaving a `queued` record that no message will ever advance — the OAuth
-state is already consumed by then, so recovery is a fresh `/connect/github`
-attempt, not a replay of the same callback.
+scope by the time the response is written and are never queued or stored.
+If the enqueue itself fails, the job record is marked `dead_letter` with a
+`provisioning_enqueue_failed` step error before the request surfaces a 502,
+so durable state never shows a `queued` job that no message will ever
+process; restarting the flow creates a fresh job.
 
 Everything after generation — verifying the generated repository is
 readable, patching `_config.yml`, enabling Pages, dispatching and awaiting
@@ -95,26 +112,24 @@ A queue message carries only `{ jobId }`; the `ProvisioningJob` record in KV
 is the sole source of truth for progress. Each consumer invocation acquires
 a short-lived per-job lock, advances exactly one pending step, persists the
 result, and either enqueues a continuation message (steps remain), asks the
-queue to redeliver the same message after a backoff (a retryable failure or
-a lock another attempt still holds), or does neither (the job just reached a
-terminal status). Because progress lives in the record rather than the
+queue to redeliver the same message after a backoff (a retryable step
+failure, a lock another attempt still holds, a record not yet visible
+through KV's eventual consistency — a message can be delivered before the
+write that preceded its enqueue has propagated — or a step that succeeded
+and was durably saved but whose continuation then failed to enqueue, in
+which case the saved success is left untouched), or acks (the job just
+reached a terminal status). Because progress lives in the record rather than the
 message, a redelivered, duplicated, or out-of-order message is always safe:
 a step already marked `succeeded` is skipped, and a job already `succeeded`,
 `failed`, or `dead_letter` is acked without touching a provider. Six of the
 seven steps are simple idempotent GETs or already-reconciling writes; the
 one exception, dispatching the Notion sync workflow, persists a
-before-dispatch marker (the excluded run-id snapshot and dispatch time) so a
-crash between the dispatch call and recording its correlated run resumes by
-correlating that same window instead of starting a second workflow run. When
-a step throws, the consumer reloads the job from KV before recording the
-failure rather than reusing the pre-step snapshot in memory — a step handler
-can itself have durably written partial progress (the sync dispatch marker
-is the one example today) before throwing, and recording the failure against
-a stale snapshot would silently erase that write. Symmetrically, if a step
-succeeds and its result is durably saved but handing the continuation to the
-queue then fails, the consumer never treats that as a step failure: it asks
-for redelivery of the same message, and the already-persisted success is
-what the redelivered attempt finds and skips past.
+before-dispatch marker (the excluded run-id snapshot and dispatch time) so
+a crash — or a failed attempt — between the dispatch call and recording its
+correlated run resumes by correlating that same window instead of starting
+a second workflow run. Step failures re-read the record before persisting
+the failure precisely so a marker a step wrote mid-attempt is never wiped
+by the failure bookkeeping.
 
 A step failure is classified (`classifyProvisioningError`) from the same
 error taxonomy each provider module already exposes: retryable failures
@@ -126,10 +141,13 @@ else — or a retryable failure that has recurred
 `dead_letter`, and the message is acked immediately rather than left to
 exhaust Cloudflare's own retry budget. `wrangler.toml`'s
 `max_retries`/`dead_letter_queue` on the queue consumer exist as the
-platform's own backstop for the case the consumer throws unexpectedly (a
-bug, a KV outage) rather than returning a controlled outcome — the
-application's own per-job dead-lettering is the primary mechanism and is
-what a future progress UI or ops tooling should read.
+platform's own backstop for a consumer that throws unexpectedly (a bug, a
+KV outage) or a message whose job record never materializes within the
+retry budget — the application's own per-job dead-lettering is the primary
+mechanism and is what a future progress UI or ops tooling should read. The
+consumer batch stays at one message: steps such as `await_sync` poll
+provider APIs inline for minutes, so a larger sequential batch could exceed
+the consumer's wall-clock limit and force redelivery of every message in it.
 
 Workers KV has no compare-and-swap, so the per-job lock cannot give perfect
 mutual exclusion: two consumer invocations that read the job at the same

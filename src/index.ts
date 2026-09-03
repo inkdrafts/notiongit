@@ -27,10 +27,15 @@ import {
 } from './github-app-auth';
 import {
   createProvisioningJob,
+  nextPendingStep,
   saveProvisioningJob,
-  PROVISIONING_STEP_ORDER,
 } from './provisioning-job';
 import { processProvisioningMessage } from './provisioning-queue';
+import {
+  beginNotionAuthorization,
+  finishNotionCallback,
+  type NotionOAuthRouteOptions,
+} from './notion-oauth';
 
 
 export {
@@ -163,7 +168,6 @@ export {
   PROVISIONING_JOB_PREFIX,
   PROVISIONING_JOB_TTL_SECONDS,
   PROVISIONING_JOB_VERSION,
-  PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS,
   PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
   PROVISIONING_LOCK_TTL_MS,
   PROVISIONING_STEP_MAX_ATTEMPTS,
@@ -195,6 +199,30 @@ export type {
   ProvisioningQueueEnv,
   ProvisioningRuntimeOptions,
 } from './provisioning-queue';
+
+export {
+  beginNotionAuthorization,
+  exchangeNotionAuthorizationCode,
+  finishNotionCallback,
+  NOTION_API_VERSION,
+  NOTION_AUTHORIZATION_URL,
+  NOTION_STATE_COOKIE,
+  NOTION_STATE_PREFIX,
+  NOTION_STATE_REPLAY_TTL_SECONDS,
+  NOTION_STATE_TTL_SECONDS,
+  NOTION_TOKEN_URL,
+  NotionOAuthError,
+  signNotionState,
+} from './notion-oauth';
+export type {
+  NotionOAuthContinuation,
+  NotionOAuthContinuationHandler,
+  NotionOAuthEnv,
+  NotionOAuthErrorCode,
+  NotionOAuthRouteOptions,
+  NotionOAuthSummary,
+  NotionStatePayload,
+} from './notion-oauth';
 
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
@@ -697,32 +725,31 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       JSON.stringify({ ...record, phase: 'consumed', installationId: selectedInstallationId, identity }),
       { expirationTtl: STATE_REPLAY_TTL_SECONDS },
     );
-
     try {
       await env.PROVISIONING_QUEUE.send({ jobId: job.jobId });
-    } catch {
-      // The job record exists but no message will ever advance it — mark it
-      // dead_letter immediately rather than leaving a 'queued' record that
-      // silently never processes until its TTL expires. The OAuth state is
-      // already consumed, so recovery is a fresh /connect/github attempt
-      // (a new job), not a replay of this callback.
-      const failedAt = Date.now();
-      const firstStep = PROVISIONING_STEP_ORDER[0];
-      await saveProvisioningJob(env.JOBS, {
-        ...job,
-        status: 'dead_letter',
-        steps: {
-          ...job.steps,
-          [firstStep]: {
-            status: 'failed',
-            attempts: 0,
-            updatedAt: failedAt,
-            lastError: { code: 'provisioning_enqueue_failed', retryable: false },
+    } catch (enqueueError) {
+      // Without a message nothing will ever process this job, but its record
+      // would otherwise sit `queued` until the TTL with no trace of why. Mark
+      // the enqueue failure on the job so durable state reflects reality,
+      // then let the request surface as a 502.
+      const failedStep = nextPendingStep(job);
+      if (failedStep) {
+        await saveProvisioningJob(env.JOBS, {
+          ...job,
+          status: 'dead_letter',
+          steps: {
+            ...job.steps,
+            [failedStep]: {
+              ...job.steps[failedStep],
+              status: 'failed',
+              lastError: { code: 'provisioning_enqueue_failed', retryable: false },
+            },
           },
-        },
-        completedAt: failedAt,
-      });
-      return json({ error: 'github_provisioning_enqueue_failed', job_id: job.jobId }, 502);
+          completedAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+      throw enqueueError;
     }
 
     return json({
@@ -745,7 +772,11 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   }
 }
 
-export function route(request: Request, env: Partial<Env> = {}): Response | Promise<Response> {
+export function route(
+  request: Request,
+  env: Partial<Env> = {},
+  options: NotionOAuthRouteOptions = {},
+): Response | Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === 'GET' && url.pathname === '/') {
@@ -760,12 +791,16 @@ export function route(request: Request, env: Partial<Env> = {}): Response | Prom
     return beginGithubInstall(request, env);
   }
 
+  if (request.method === 'GET' && url.pathname === '/connect/notion') {
+    return beginNotionAuthorization(request, env);
+  }
+
   if (request.method === 'GET' && url.pathname === '/auth/github/callback') {
     return finishGithubCallback(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/notion/callback') {
-    return json({ error: 'not_implemented' }, 501);
+    return finishNotionCallback(request, env, options);
   }
 
   return json(

@@ -19,8 +19,12 @@ the hosting decision is recorded in
 [`docs/decisions/0001-sealed-box-on-workers.md`](docs/decisions/0001-sealed-box-on-workers.md).
 
 The Worker entrypoint is [`src/index.ts`](src/index.ts). It exposes
-`GET /healthz`, starts the GitHub App flow at `GET /connect/github?job_id=...`,
-and handles the signed callback at `GET /auth/github/callback`. The callback
+`GET /healthz`, starts Notion-first onboarding at `GET /connect/notion?job_id=...`,
+and handles the signed Notion callback at `GET /auth/notion/callback`. The Notion
+callback exchanges the code server-side and hands the access token plus the
+duplicated template root only to a request-local onboarding continuation; it
+returns only a redacted authorization summary. It also starts the GitHub App
+flow at `GET /connect/github?job_id=...`, whose signed callback
 exchanges the OAuth code server-side, verifies that the authenticated personal
 account owns the installation, selects a collision-safe repository destination,
 and generates that repository from `inkdrafts/notiongit-template` — the only
@@ -61,10 +65,10 @@ polling timeout, and unreachable-URL propagation each surface as a distinct
 step error, classified as retryable or terminal by
 [`src/provisioning-queue.ts`](src/provisioning-queue.ts).
 
-`/connect/github` accepts an optional `job_id` (or `jobId`) and generates one
-when omitted. The signed state expires after ten minutes and is marked consumed
-after a successful callback, so a callback URL cannot be reused for a second
-authorization.
+`/connect/notion` and `/connect/github` accept an optional `job_id` (or `jobId`)
+and generate one when omitted. Both signed states expire after ten minutes and
+are replay-tracked in KV. Notion additionally binds the state to an HttpOnly,
+Secure, SameSite cookie. Neither flow stores OAuth codes or user tokens.
 
 Repository naming is deterministic. InkDrafts first tries the exact lowercase
 `<login>.github.io` repository, which maps to `https://<login>.github.io` with
