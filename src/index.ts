@@ -3,8 +3,27 @@
  *
  * GitHub's OAuth code and all access tokens are deliberately kept inside the
  * request that uses them. KV contains only the signed-state replay marker and
- * the resulting GitHub identity/installation metadata.
+ * the resulting GitHub identity/installation and destination metadata.
  */
+
+import {
+  GithubRepositoryApiError,
+  selectGithubRepositoryDestination,
+  type RepositoryDestination,
+} from './repository-naming';
+
+export {
+  createRepositoryWithRetry,
+  GithubRepositoryApiError,
+  GithubRepositoryNameCollisionError,
+  isGithubRepositoryNameCollision,
+  isValidGithubRepositoryName,
+  listOwnedGithubRepositories,
+  repositoryDestination,
+  selectGithubRepositoryDestination,
+  selectRepositoryDestination,
+} from './repository-naming';
+export type { RepositoryDestination } from './repository-naming';
 
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
@@ -37,6 +56,7 @@ export interface GithubOnboardingResult {
   jobId: string;
   installationId: number;
   identity: GithubIdentity;
+  repository: RepositoryDestination;
 }
 
 const GITHUB_API = 'https://api.github.com';
@@ -100,6 +120,7 @@ interface GithubJobRecord {
   status: 'github_authorized';
   installationId: number;
   identity: GithubIdentity;
+  repository: RepositoryDestination;
   completedAt: number;
 }
 
@@ -468,6 +489,9 @@ function authError(error: unknown): Response {
     if (error.status === 404) return json({ error: 'github_installation_missing' }, 400);
     if (error.status === 400 || error.status === 401) return json({ error: 'github_authorization_failed' }, 400);
   }
+  if (error instanceof GithubRepositoryApiError) {
+    if (error.status === 400 || error.status === 401) return json({ error: 'github_authorization_failed' }, 400);
+  }
   // Deliberately do not expose provider response bodies, OAuth codes, tokens,
   // private keys, or exception messages to the browser.
   return json({ error: 'github_authorization_unavailable' }, 502);
@@ -536,6 +560,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
 
   try {
     let identity: GithubIdentity | undefined;
+    let repository: RepositoryDestination | undefined;
     let selectedInstallationId = installationId || record.installationId;
 
     if (code) {
@@ -554,6 +579,9 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       const userInstallation = await getUserInstallation(accessToken, selectedInstallationId);
       const installationIdentityForUser = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
       identity = installationIdentityForUser;
+      // Selection happens while the short-lived OAuth token is in memory.
+      // Only non-secret destination metadata is retained in the job record.
+      repository = await selectGithubRepositoryDestination(accessToken, identity.login);
     } else {
       // This supports a setup callback arriving before the OAuth callback. The
       // App JWT proves that the installation belongs to this App; the later
@@ -570,7 +598,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       return json({ status: 'awaiting_authorization', job_id: record.jobId }, 202);
     }
 
-    if (!identity) return json({ error: 'github_identity_missing' }, 400);
+    if (!identity || !repository) return json({ error: 'github_identity_missing' }, 400);
 
     const completed: GithubJobRecord = {
       version: 1,
@@ -578,6 +606,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       status: 'github_authorized',
       installationId: selectedInstallationId,
       identity,
+      repository,
       completedAt: Date.now(),
     };
     await env.JOBS.put(jobKey(record.jobId), JSON.stringify(completed), { expirationTtl: JOB_TTL_SECONDS });
@@ -591,6 +620,11 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       job_id: completed.jobId,
       installation_id: completed.installationId,
       github: { id: identity.id, login: identity.login },
+      repository: {
+        name: repository.name,
+        url: repository.url,
+        baseurl: repository.baseurl,
+      },
     });
   } catch (error) {
     return authError(error);

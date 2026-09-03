@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 
-import { route, type Env } from '../src/index';
+import {
+  createRepositoryWithRetry,
+  GithubRepositoryNameCollisionError,
+  isValidGithubRepositoryName,
+  route,
+  selectGithubRepositoryDestination,
+  selectRepositoryDestination,
+  type Env,
+} from '../src/index';
 
 class MemoryKV {
   private values = new Map<string, string>();
@@ -108,6 +116,10 @@ describe('GitHub App install and authorize flow', () => {
         expect(request.headers.get('authorization')).toBe('Bearer user-token');
         return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
       }
+      if (request.url.startsWith('https://api.github.com/user/repos?')) {
+        expect(request.headers.get('authorization')).toBe('Bearer user-token');
+        return Response.json([]);
+      }
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -122,6 +134,11 @@ describe('GitHub App install and authorize flow', () => {
         job_id: 'job-123',
         installation_id: 123,
         github: { id: 42, login: 'alice' },
+        repository: {
+          name: 'alice.github.io',
+          url: 'https://alice.github.io',
+          baseurl: '',
+        },
       });
       expect(kv.entries().join('\n')).not.toContain('user-token');
       expect(kv.entries().join('\n')).not.toContain('one-time-code');
@@ -132,7 +149,7 @@ describe('GitHub App install and authorize flow', () => {
       );
       expect(replay.status).toBe(400);
       expect(await replay.json()).toEqual({ error: 'github_state_replayed' });
-      expect(requests).toHaveLength(3);
+      expect(requests).toHaveLength(4);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -169,6 +186,7 @@ describe('GitHub App install and authorize flow', () => {
       if (request.url === 'https://api.github.com/user/installations/123') {
         return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
       }
+      if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -185,7 +203,7 @@ describe('GitHub App install and authorize flow', () => {
         env,
       );
       expect(callback.status).toBe(200);
-      expect(calls).toBe(4);
+      expect(calls).toBe(5);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -205,6 +223,7 @@ describe('GitHub App install and authorize flow', () => {
       if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
       if (request.url === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
       if (request.url === 'https://api.github.com/user/installations/123') return Response.json(installation);
+      if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -238,5 +257,65 @@ describe('GitHub App install and authorize flow', () => {
     );
     expect(missing.status).toBe(400);
     expect(await missing.json()).toEqual({ error: 'github_installation_missing' });
+  });
+});
+
+describe('Repository naming and GitHub Pages destinations', () => {
+  test.each([
+    ['Alice', [], 'alice.github.io', 'https://alice.github.io', ''],
+    ['Alice', ['ALICE.GITHUB.IO'], 'alice-inkdrafts', 'https://alice.github.io/alice-inkdrafts', '/alice-inkdrafts'],
+    ['alice', ['alice.github.io', 'alice-inkdrafts', 'alice-inkdrafts-2'], 'alice-inkdrafts-3', 'https://alice.github.io/alice-inkdrafts-3', '/alice-inkdrafts-3'],
+  ])('%s selects a stable destination', (login, existing, name, url, baseurl) => {
+    expect(selectRepositoryDestination(login, existing)).toMatchObject({ name, url, baseurl });
+  });
+
+  test('treats invalid GitHub repository names as invalid candidates', () => {
+    expect(isValidGithubRepositoryName('valid_name-1.0')).toBe(true);
+    expect(isValidGithubRepositoryName('')).toBe(false);
+    expect(isValidGithubRepositoryName('contains spaces')).toBe(false);
+    expect(isValidGithubRepositoryName('x'.repeat(101))).toBe(false);
+  });
+
+  test('retries the next deterministic name when creation loses a race', async () => {
+    const attempted: string[] = [];
+    const result = await createRepositoryWithRetry(
+      'Alice',
+      ['alice.github.io'],
+      async (destination) => {
+        attempted.push(destination.name);
+        if (attempted.length < 3) throw new GithubRepositoryNameCollisionError();
+        return { created: true };
+      },
+    );
+
+    expect(attempted).toEqual(['alice-inkdrafts', 'alice-inkdrafts-2', 'alice-inkdrafts-3']);
+    expect(result.destination.url).toBe('https://alice.github.io/alice-inkdrafts-3');
+    expect(result.result).toEqual({ created: true });
+  });
+
+  test('paginates the owned-repository check before selecting a name', async () => {
+    const requests: string[] = [];
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({ name: `existing-${index}` }));
+    firstPage[0] = { name: 'ALICE.GITHUB.IO' };
+    firstPage[1] = { name: 'alice-inkdrafts' };
+    const destination = await selectGithubRepositoryDestination(
+      'user-token',
+      'Alice',
+      async (input, init) => {
+        const request = new Request(input, init);
+        requests.push(request.url);
+        expect(request.headers.get('authorization')).toBe('Bearer user-token');
+        return request.url.endsWith('page=1')
+          ? Response.json(firstPage)
+          : Response.json([{ name: 'alice-inkdrafts-2' }]);
+      },
+    );
+
+    expect(requests).toHaveLength(2);
+    expect(destination).toMatchObject({
+      name: 'alice-inkdrafts-3',
+      url: 'https://alice.github.io/alice-inkdrafts-3',
+      baseurl: '/alice-inkdrafts-3',
+    });
   });
 });
