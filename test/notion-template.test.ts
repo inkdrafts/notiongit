@@ -1,0 +1,627 @@
+import { describe, expect, test } from 'bun:test';
+
+import worker, {
+  continueNotionOnboarding,
+  NOTION_TEMPLATE_RESOLUTION_PREFIX,
+  NOTION_TEMPLATE_RESOLUTION_TTL_SECONDS,
+  route,
+  type Env,
+} from '../src/index';
+import { NotionOAuthError } from '../src/notion-oauth';
+import {
+  loadNotionTemplateResolution,
+  normalizeNotionId,
+  notionTemplateResolutionKey,
+  NotionTemplateError,
+  resolveNotionTemplateDatabases,
+  saveNotionTemplateResolution,
+} from '../src/notion-template';
+
+// Synthetic identifiers only — no real workspace IDs, tokens, or content.
+const ROOT_DASHED = '55555555-5555-4555-8555-555555555555';
+const ROOT_UNDASHED = '55555555555545558555555555555555';
+const PAGES_DB = '11111111-1111-4111-8111-111111111111';
+const POSTS_DB = '22222222-2222-4222-8222-222222222222';
+const UNRELATED_DB = '33333333-3333-4333-8333-333333333333';
+const SUB_PAGE = '44444444-4444-4444-8444-444444444444';
+const TOKEN = 'synthetic-notion-access-token';
+
+const TOKEN_RESPONSE = {
+  access_token: TOKEN,
+  token_type: 'bearer',
+  bot_id: 'synthetic-bot-id',
+  workspace_id: 'synthetic-workspace-id',
+  duplicated_template_id: ROOT_DASHED,
+};
+
+function pagesProperties(): Record<string, unknown> {
+  return {
+    Title: { type: 'title' },
+    Slug: { type: 'rich_text' },
+    Type: { type: 'select', select: { options: [{ name: 'home' }, { name: 'blog' }] } },
+    'Nav Order': { type: 'number' },
+    'Show in Nav': { type: 'checkbox' },
+    Status: { type: 'select', select: { options: [{ name: 'Draft' }, { name: 'Published' }] } },
+    Description: { type: 'rich_text' },
+  };
+}
+
+function postsProperties(): Record<string, unknown> {
+  return {
+    Title: { type: 'title' },
+    Slug: { type: 'rich_text' },
+    Status: { type: 'select', select: { options: [{ name: 'Draft' }, { name: 'Published' }] } },
+    'Publish Date': { type: 'date' },
+    Tags: { type: 'multi_select', multi_select: { options: [{ name: 'guide' }] } },
+    'Cover Image': { type: 'files' },
+  };
+}
+
+function databaseResponse(id: string, properties: Record<string, unknown>): Response {
+  return Response.json({
+    object: 'database',
+    id,
+    title: [{ type: 'text', text: { content: 'A title the user may have renamed' } }],
+    properties,
+  });
+}
+
+function block(id: string, type: string): unknown {
+  return { object: 'block', id, type, [type]: {} };
+}
+
+function childrenList(results: unknown[], hasMore = false, nextCursor: string | null = null): Response {
+  return Response.json({ object: 'list', results, has_more: hasMore, next_cursor: nextCursor });
+}
+
+interface RecordedCall {
+  request: Request;
+  url: URL;
+}
+
+/**
+ * Minimal provider fake: routes by path against a queue of responses per
+ * resource, so tests can stage eventual-consistency and rate-limit behavior
+ * without any network access. The last response in a queue repeats, and an
+ * unexpected request fails loudly.
+ */
+class NotionFake {
+  readonly calls: RecordedCall[] = [];
+  private readonly childrenQueues = new Map<string, Array<Response | Error>>();
+  private readonly databaseQueues = new Map<string, Array<Response | Error>>();
+
+  children(blockId: string, responses: Array<Response | Error>): this {
+    this.childrenQueues.set(blockId, [...responses]);
+    return this;
+  }
+
+  database(databaseId: string, responses: Array<Response | Error>): this {
+    this.databaseQueues.set(databaseId, [...responses]);
+    return this;
+  }
+
+  fetcher: typeof fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    this.calls.push({ request, url });
+    // /v1/blocks/{id}/children and /v1/databases/{id} both carry the id at
+    // the third path segment.
+    const segments = url.pathname.split('/');
+    const queue =
+      segments[2] === 'blocks' ? this.childrenQueues.get(segments[3]) : this.databaseQueues.get(segments[3]);
+    if (!queue || queue.length === 0) {
+      throw new Error(`unexpected provider request: ${request.method} ${url.pathname}`);
+    }
+    const next = queue.shift()!;
+    // The last staged response repeats, so multi-attempt retries see a
+    // stable workspace instead of an unexpected request.
+    if (queue.length === 0) queue.push(next);
+    if (next instanceof Error) throw next;
+    // A Response body can only be read once; every serving hands out a
+    // fresh clone so repeats and retries read a live body.
+    return next.clone();
+  };
+
+  childrenCallCount(blockId: string): number {
+    return this.calls.filter(({ url }) => url.pathname === `/v1/blocks/${blockId}/children`).length;
+  }
+
+  databaseCallCount(databaseId: string): number {
+    return this.calls.filter(({ url }) => url.pathname === `/v1/databases/${databaseId}`).length;
+  }
+}
+
+function noSleep(): (milliseconds: number) => Promise<void> {
+  return () => Promise.resolve();
+}
+
+function recordingSleep(sleeps: number[]): (milliseconds: number) => Promise<void> {
+  return (milliseconds) => {
+    sleeps.push(milliseconds);
+    return Promise.resolve();
+  };
+}
+
+class MemoryKV {
+  private values = new Map<string, string>();
+  readonly puts: Array<{ key: string; value: string; ttl?: number }> = [];
+
+  async get<T>(key: string, type?: string): Promise<T | string | null> {
+    const value = this.values.get(key);
+    if (value === undefined) return null;
+    return type === 'json' ? JSON.parse(value) as T : value;
+  }
+
+  async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+    this.values.set(key, value);
+    this.puts.push({ key, value, ttl: options?.expirationTtl });
+  }
+}
+
+function fakeEnv(kv = new MemoryKV()): Partial<Env> {
+  return {
+    JOBS: kv as unknown as KVNamespace,
+    NOTION_CLIENT_ID: 'notion-client-id',
+    NOTION_CLIENT_SECRET: 'notion-client-secret',
+  };
+}
+
+async function caught(promise: Promise<unknown>): Promise<unknown> {
+  return promise.catch((error: unknown) => error);
+}
+
+function templateErrorCode(error: unknown): string {
+  expect(error).toBeInstanceOf(NotionTemplateError);
+  return (error as NotionTemplateError).code;
+}
+
+describe('Notion template ID normalization', () => {
+  test('accepts dashed and compact UUIDs and rejects anything else', () => {
+    expect(normalizeNotionId(ROOT_DASHED)).toBe(ROOT_DASHED);
+    expect(normalizeNotionId(ROOT_UNDASHED)).toBe(ROOT_DASHED);
+    expect(normalizeNotionId(` ${ROOT_DASHED.toUpperCase()} `)).toBe(ROOT_DASHED);
+    expect(normalizeNotionId('not-a-uuid')).toBeNull();
+    expect(normalizeNotionId('55555555-5555-4555-8555-5555555555')).toBeNull();
+    expect(normalizeNotionId('')).toBeNull();
+  });
+});
+
+describe('Notion template resolution', () => {
+  test('resolves renamed, paginated, nested databases by schema and pins the API version', async () => {
+    const fake = new NotionFake();
+    // Page one of the root: an extra unrelated database and a nested page.
+    fake.children(ROOT_DASHED, [
+      childrenList(
+        [
+          block('66666666-6666-4666-8666-666666666666', 'paragraph'),
+          block(PAGES_DB, 'child_database'),
+          block(UNRELATED_DB, 'child_database'),
+          block(SUB_PAGE, 'child_page'),
+        ],
+        true,
+        'cursor-1',
+      ),
+      // Page two finishes the root's children.
+      childrenList([block('77777777-7777-4777-8777-777777777777', 'paragraph')]),
+    ]);
+    // The Posts database lives one level down, inside the sub-page.
+    fake.children(SUB_PAGE, [childrenList([block(POSTS_DB, 'child_database')])]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
+    // An unrelated database the workspace already had: a candidate that
+    // matches nothing and is ignored.
+    fake.database(UNRELATED_DB, [databaseResponse(UNRELATED_DB, { Name: { type: 'rich_text' } })]);
+
+    const resolution = await resolveNotionTemplateDatabases(TOKEN, ROOT_UNDASHED, {
+      fetcher: fake.fetcher,
+      sleep: noSleep(),
+    });
+
+    expect(resolution.pagesDatabaseId).toBe(PAGES_DB);
+    expect(resolution.postsDatabaseId).toBe(POSTS_DB);
+    expect(resolution.templateSchemaVersion).toBe(1);
+    expect(resolution.scannedDatabaseCount).toBe(3);
+    expect(resolution.pagesSchema.propertyTypes['Nav Order']).toBe('number');
+    expect(resolution.pagesSchema.optionNames.Status).toEqual(['Draft', 'Published']);
+    expect(resolution.postsSchema.optionNames.Tags).toEqual(['guide']);
+    expect(resolution.postsSchema.propertyTypes['Publish Date']).toBe('date');
+
+    // Every request carries the ADR-pinned version and the token only in its
+    // Authorization header; pagination followed the provided cursor.
+    for (const { request } of fake.calls) {
+      expect(request.headers.get('notion-version')).toBe('2022-06-28');
+      expect(request.headers.get('authorization')).toBe(`Bearer ${TOKEN}`);
+    }
+    expect(fake.childrenCallCount(ROOT_DASHED)).toBe(2);
+    const rootChildrenCalls = fake.calls.filter(({ url }) => url.pathname === `/v1/blocks/${ROOT_DASHED}/children`);
+    expect(rootChildrenCalls[1].url.searchParams.get('start_cursor')).toBe('cursor-1');
+    expect(rootChildrenCalls[1].url.searchParams.get('page_size')).toBe('100');
+    // The token never leaks into the result.
+    expect(JSON.stringify(resolution)).not.toContain(TOKEN);
+  });
+
+  test('retries an eventually-consistent empty root and then resolves', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [
+      childrenList([]),
+      childrenList([]),
+      childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')]),
+    ]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
+
+    const sleeps: number[] = [];
+    const resolution = await resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, {
+      fetcher: fake.fetcher,
+      sleep: recordingSleep(sleeps),
+    });
+
+    expect(resolution.pagesDatabaseId).toBe(PAGES_DB);
+    expect(resolution.postsDatabaseId).toBe(POSTS_DB);
+    expect(fake.childrenCallCount(ROOT_DASHED)).toBe(3);
+    expect(sleeps).toEqual([500, 1_000]);
+  });
+
+  test('retries a database that 404s right after duplication', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [
+      childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')]),
+      childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')]),
+    ]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [
+      new Response('not propagated yet', { status: 404 }),
+      databaseResponse(POSTS_DB, postsProperties()),
+    ]);
+
+    const resolution = await resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, {
+      fetcher: fake.fetcher,
+      sleep: noSleep(),
+    });
+
+    expect(resolution.postsDatabaseId).toBe(POSTS_DB);
+    expect(fake.databaseCallCount(POSTS_DB)).toBe(2);
+  });
+
+  test('honors Retry-After on a rate-limited walk before succeeding', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [
+      new Response('rate limited', { status: 429, headers: { 'Retry-After': '7' } }),
+      childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')]),
+    ]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
+
+    const sleeps: number[] = [];
+    const resolution = await resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, {
+      fetcher: fake.fetcher,
+      sleep: recordingSleep(sleeps),
+    });
+
+    expect(resolution.pagesDatabaseId).toBe(PAGES_DB);
+    // Retry-After wins over the backoff but is capped at maxDelayMs to bound
+    // the request.
+    expect(sleeps).toEqual([4_000]);
+  });
+
+  test('reports an empty root distinctly after exhausting the eventual-consistency retries', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([])]);
+
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_root_empty');
+    expect((error as NotionTemplateError).status).toBe(502);
+    expect(fake.childrenCallCount(ROOT_DASHED)).toBe(4);
+  });
+
+  test('reports a still-invisible root distinctly after retries', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [new Response('not found', { status: 404 })]);
+
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_root_unavailable');
+    expect((error as NotionTemplateError).status).toBe(502);
+    expect(fake.childrenCallCount(ROOT_DASHED)).toBe(4);
+  });
+
+  test('rejects a token that cannot read the root immediately, without retrying', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [new Response('unauthorized', { status: 401 })]);
+
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_root_unavailable');
+    expect((error as NotionTemplateError).status).toBe(403);
+    expect(fake.childrenCallCount(ROOT_DASHED)).toBe(1);
+  });
+
+  test('rejects a duplicated-template value that cannot be a Notion ID without any request', async () => {
+    const fake = new NotionFake();
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, 'not-a-page-id', { fetcher: fake.fetcher, sleep: noSleep() }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_root_invalid');
+    expect((error as NotionTemplateError).status).toBe(400);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  test('never guesses between two databases matching the same fingerprint', async () => {
+    const duplicatePosts = '88888888-8888-4888-8888-888888888888';
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [
+      childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database'), block(duplicatePosts, 'child_database')]),
+    ]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
+    fake.database(duplicatePosts, [databaseResponse(duplicatePosts, postsProperties())]);
+
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_database_ambiguous');
+    expect((error as NotionTemplateError).status).toBe(422);
+    expect((error as NotionTemplateError).details).toEqual({
+      scanned: 3,
+      duplicated_roles: ['posts'],
+      ambiguous_databases: 0,
+    });
+  });
+
+  test('reports a database that matches both fingerprints as ambiguous', async () => {
+    const both = '99999999-9999-4999-8999-999999999999';
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(both, 'child_database')])]);
+    fake.database(both, [
+      databaseResponse(both, {
+        ...pagesProperties(),
+        ...postsProperties(),
+        Slug: { type: 'rich_text' },
+        Status: { type: 'select' },
+      }),
+    ]);
+
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_database_ambiguous');
+    expect((error as NotionTemplateError).details).toEqual({
+      scanned: 1,
+      duplicated_roles: [],
+      ambiguous_databases: 1,
+    });
+  });
+
+  test('reports no match with the missing roles named, without retrying a fetched mismatch', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(UNRELATED_DB, 'child_database')])]);
+    fake.database(UNRELATED_DB, [databaseResponse(UNRELATED_DB, { Name: { type: 'rich_text' } })]);
+
+    const sleeps: number[] = [];
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, {
+        fetcher: fake.fetcher,
+        sleep: recordingSleep(sleeps),
+      }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_database_missing');
+    expect((error as NotionTemplateError).status).toBe(422);
+    expect((error as NotionTemplateError).details).toEqual({ missing: ['pages', 'posts'], scanned: 1 });
+    expect(fake.childrenCallCount(ROOT_DASHED)).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  test('reports a single missing role when only the other database matches', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database')])]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_database_missing');
+    expect((error as NotionTemplateError).details).toEqual({ missing: ['posts'], scanned: 1 });
+  });
+
+  test('retries while a missing role might still be propagating, then reports unavailability', async () => {
+    const fake = new NotionFake();
+    const rootContent = [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])];
+    fake.children(ROOT_DASHED, [...rootContent, ...rootContent, ...rootContent, ...rootContent]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [
+      new Response('not propagated yet', { status: 404 }),
+      new Response('still not', { status: 404 }),
+      new Response('nope', { status: 404 }),
+      new Response('no', { status: 404 }),
+    ]);
+
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }),
+    );
+
+    expect(templateErrorCode(error)).toBe('notion_template_unavailable');
+    expect((error as NotionTemplateError).status).toBe(502);
+    expect(fake.childrenCallCount(ROOT_DASHED)).toBe(4);
+  });
+
+  test('bounds the walk by depth so far-nested content cannot be traversed unbounded', async () => {
+    const l1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const l2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const l3 = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const deepDb = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(l1, 'child_page')])]);
+    fake.children(l1, [childrenList([block(l2, 'child_page')])]);
+    fake.children(l2, [childrenList([block(l3, 'child_page')])]);
+    fake.children(l3, [childrenList([block(deepDb, 'child_database')])]);
+
+    const error = await caught(
+      resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, {
+        fetcher: fake.fetcher,
+        sleep: noSleep(),
+        maxAttempts: 1,
+      }),
+    );
+
+    // The root plus two child-page levels (depth budget 3) are walked; the
+    // third level is out of budget, so nothing resolves and the failure is
+    // the bounded empty-root outcome rather than an unbounded traversal.
+    expect(templateErrorCode(error)).toBe('notion_template_root_empty');
+    expect(fake.calls.filter(({ url }) => url.pathname.endsWith('/children'))).toHaveLength(3);
+  });
+});
+
+describe('Notion template resolution record', () => {
+  test('round-trips through KV under the job-scoped key with the rolling TTL', async () => {
+    const kv = new MemoryKV();
+    const record = {
+      version: 1 as const,
+      jobId: 'job-record',
+      resolution: {
+        pagesDatabaseId: PAGES_DB,
+        postsDatabaseId: POSTS_DB,
+        templateSchemaVersion: 1,
+        scannedDatabaseCount: 2,
+        pagesSchema: { databaseId: PAGES_DB, propertyTypes: { Slug: 'rich_text' }, optionNames: {} },
+        postsSchema: { databaseId: POSTS_DB, propertyTypes: { Slug: 'rich_text' }, optionNames: {} },
+        resolvedAt: 1_000,
+      },
+    };
+
+    await saveNotionTemplateResolution(kv as unknown as KVNamespace, record);
+    expect(kv.puts[0].key).toBe(notionTemplateResolutionKey('job-record'));
+    expect(kv.puts[0].key.startsWith(NOTION_TEMPLATE_RESOLUTION_PREFIX)).toBe(true);
+    expect(kv.puts[0].ttl).toBe(NOTION_TEMPLATE_RESOLUTION_TTL_SECONDS);
+    expect(await loadNotionTemplateResolution(kv as unknown as KVNamespace, 'job-record')).toEqual(record);
+    expect(await loadNotionTemplateResolution(kv as unknown as KVNamespace, 'other-job')).toBeNull();
+  });
+});
+
+describe('Wired Notion onboarding continuation', () => {
+  test('resolves and persists the duplicate while the token stays request-local', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
+    const kv = new MemoryKV();
+
+    await continueNotionOnboarding(fakeEnv(kv), { fetcher: fake.fetcher })({
+      jobId: 'job-continuation',
+      accessToken: TOKEN,
+      duplicatedTemplateId: ROOT_DASHED,
+    });
+
+    const stored = await loadNotionTemplateResolution(kv as unknown as KVNamespace, 'job-continuation');
+    expect(stored?.resolution.pagesDatabaseId).toBe(PAGES_DB);
+    expect(stored?.resolution.postsDatabaseId).toBe(POSTS_DB);
+    // The token is never persisted anywhere.
+    expect(kv.puts.map((put) => put.value).join('\n')).not.toContain(TOKEN);
+  });
+
+  test('fails a manual-page authorization with a distinct, actionable error', async () => {
+    const fake = new NotionFake();
+    const error = await caught(
+      continueNotionOnboarding(fakeEnv(), { fetcher: fake.fetcher })({
+        jobId: 'job-manual',
+        accessToken: TOKEN,
+        duplicatedTemplateId: null,
+      }),
+    );
+
+    expect(error).toBeInstanceOf(NotionOAuthError);
+    expect((error as NotionOAuthError).code).toBe('notion_template_not_duplicated');
+    expect((error as NotionOAuthError).status).toBe(400);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  test('surfaces resolution failures through the callback response with non-secret details', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([])]);
+    const kv = new MemoryKV();
+    const env = fakeEnv(kv);
+
+    const begin = await route(new Request('https://staging.example/connect/notion?job_id=job-route'), env);
+    expect(begin.status).toBe(302);
+    const location = new URL(begin.headers.get('location')!);
+    const cookie = begin.headers.get('set-cookie')!.split(';', 1)[0];
+
+    const response = await route(
+      new Request(
+        `https://staging.example/auth/notion/callback?state=${encodeURIComponent(location.searchParams.get('state')!)}&code=synthetic-code`,
+        { headers: { Cookie: cookie } },
+      ),
+      env,
+      {
+        // Route-level fetcher answers the token exchange; the continuation's
+        // transport answers the resolution calls, whose root never shows
+        // content. Sleep is stubbed so the retry budget costs nothing.
+        fetcher: async () => Response.json(TOKEN_RESPONSE),
+        continueOnboarding: continueNotionOnboarding(env, { fetcher: fake.fetcher, sleep: noSleep() }),
+      },
+    );
+
+    expect(response.status).toBe(502);
+    const bodyText = await response.text();
+    expect(JSON.parse(bodyText)).toEqual({ error: 'notion_template_root_empty' });
+    // The response never carries the access token.
+    expect(bodyText).not.toContain(TOKEN);
+  });
+
+  test('worker.fetch wires the production continuation end-to-end', async () => {
+    const fake = new NotionFake();
+    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])]);
+    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
+    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
+    const kv = new MemoryKV();
+    const env = fakeEnv(kv);
+    const workerFetch = worker.fetch as unknown as (request: Request, env: unknown) => Promise<Response>;
+
+    const begin = await workerFetch(new Request('https://staging.example/connect/notion?job_id=job-wired'), env);
+    expect(begin.status).toBe(302);
+    const location = new URL(begin.headers.get('location')!);
+    const cookie = begin.headers.get('set-cookie')!.split(';', 1)[0];
+
+    // The wired continuation resolves through the global fetch transport, so
+    // the production wiring is proven by stubbing exactly that boundary.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.href === 'https://api.notion.com/v1/oauth/token') return Response.json(TOKEN_RESPONSE);
+      return fake.fetcher(input, init);
+    }) as typeof fetch;
+    try {
+      const callback = await workerFetch(
+        new Request(
+          `https://staging.example/auth/notion/callback?state=${encodeURIComponent(location.searchParams.get('state')!)}&code=synthetic-code`,
+          { headers: { Cookie: cookie } },
+        ),
+        env,
+      );
+      expect(callback.status).toBe(202);
+      expect(await callback.json()).toMatchObject({
+        ok: true,
+        status: 'notion_authorized',
+        job_id: 'job-wired',
+        template: { duplicated: true },
+      });
+      const stored = await loadNotionTemplateResolution(kv as unknown as KVNamespace, 'job-wired');
+      expect(stored?.resolution.pagesDatabaseId).toBe(PAGES_DB);
+      expect(stored?.resolution.postsDatabaseId).toBe(POSTS_DB);
+      expect(kv.puts.map((put) => put.value).join('\n')).not.toContain(TOKEN);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

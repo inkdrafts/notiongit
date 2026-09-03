@@ -8,6 +8,7 @@
   "scripts": {
     "test": "bun test test/ && bun run --filter libsodium-workers-spike test && bun run --filter notion-oauth-template-spike test",
     "test:pages-integration": "bun test test/github-pages.integration.test.ts",
+    "test:notion-template-integration": "bun test test/notion-template.integration.test.ts",
     "typecheck": "spikes/libsodium-workers/node_modules/.bin/tsc -p tsconfig.json && bun run --filter libsodium-workers-spike typecheck",
     "build": "spikes/libsodium-workers/node_modules/.bin/wrangler deploy --dry-run --env=\"\"",
     "deploy:dry-run": "bun run build",
