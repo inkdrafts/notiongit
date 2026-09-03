@@ -34,8 +34,15 @@ import { processProvisioningMessage } from './provisioning-queue';
 import {
   beginNotionAuthorization,
   finishNotionCallback,
+  NotionOAuthError,
+  type NotionOAuthContinuationHandler,
   type NotionOAuthRouteOptions,
 } from './notion-oauth';
+import {
+  NotionTemplateError,
+  resolveNotionTemplateDatabases,
+  saveNotionTemplateResolution,
+} from './notion-template';
 
 
 export {
@@ -223,6 +230,34 @@ export type {
   NotionOAuthSummary,
   NotionStatePayload,
 } from './notion-oauth';
+
+export {
+  loadNotionTemplateResolution,
+  normalizeNotionId,
+  notionTemplateResolutionKey,
+  NotionTemplateError,
+  NOTION_TEMPLATE_RESOLUTION_PREFIX,
+  NOTION_TEMPLATE_RESOLUTION_TTL_SECONDS,
+  NOTION_TEMPLATE_SCHEMA_VERSION,
+  PAGES_FINGERPRINT,
+  POSTS_FINGERPRINT,
+  resolveNotionTemplateDatabases,
+  RESOLUTION_INITIAL_DELAY_MS,
+  RESOLUTION_MAX_ATTEMPTS,
+  RESOLUTION_MAX_DELAY_MS,
+  saveNotionTemplateResolution,
+  TEMPLATE_MAX_BLOCK_PAGE_FETCHES,
+  TEMPLATE_MAX_CANDIDATE_DATABASES,
+  TEMPLATE_MAX_WALK_DEPTH,
+} from './notion-template';
+export type {
+  NotionDatabaseSchemaSummary,
+  NotionTemplateErrorCode,
+  NotionTemplateResolution,
+  NotionTemplateResolutionRecord,
+  NotionTemplateResolveOptions,
+  TemplateDatabaseRole,
+} from './notion-template';
 
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
@@ -772,6 +807,38 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   }
 }
 
+/**
+ * The production Notion onboarding continuation: while the short-lived access
+ * token is still in this request's scope, resolve the duplicated template
+ * root into the Pages and Posts database IDs and persist that non-secret
+ * resolution for the later provisioning steps. The token itself is never
+ * written anywhere. Template-resolution failures surface as distinct,
+ * actionable Notion OAuth errors; the programmatic database-creation fallback
+ * for a non-duplicated authorization (ADR 0002 §2) is deliberately not
+ * implemented yet, so that case fails with `notion_template_not_duplicated`.
+ */
+export function continueNotionOnboarding(
+  env: Partial<Env>,
+  runtime: { fetcher?: typeof fetch; sleep?: (milliseconds: number) => Promise<void> } = {},
+): NotionOAuthContinuationHandler {
+  return async ({ jobId, accessToken, duplicatedTemplateId }) => {
+    if (!env.JOBS) throw new NotionOAuthError('notion_configuration_missing', 500);
+    try {
+      if (!duplicatedTemplateId) throw new NotionTemplateError('notion_template_not_duplicated', 400);
+      const resolution = await resolveNotionTemplateDatabases(accessToken, duplicatedTemplateId, {
+        fetcher: runtime.fetcher,
+        sleep: runtime.sleep,
+      });
+      await saveNotionTemplateResolution(env.JOBS, { version: 1, jobId, resolution });
+    } catch (error) {
+      if (error instanceof NotionTemplateError) {
+        throw new NotionOAuthError(error.code, error.status, error.details);
+      }
+      throw error;
+    }
+  };
+}
+
 export function route(
   request: Request,
   env: Partial<Env> = {},
@@ -814,7 +881,9 @@ export function route(
 
 const worker: ExportedHandler<Env, ProvisioningMessage> = {
   fetch(request, env) {
-    return route(request, env);
+    // The deployed worker resolves the duplicated template inside the Notion
+    // callback; `route` keeps the continuation injectable for tests.
+    return route(request, env, { continueOnboarding: continueNotionOnboarding(env) });
   },
 
   async queue(batch, env) {
