@@ -4,6 +4,10 @@ compatibility_date = "2026-08-31"
 workers_dev = true
 preview_urls = true
 
+[alias]
+libsodium = "./src/libsodium-worker.ts"
+libsodium-raw = "./spikes/libsodium-workers/node_modules/libsodium/dist/modules-esm/libsodium.mjs"
+
 [vars]
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
