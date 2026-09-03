@@ -234,10 +234,10 @@ describe('classifyProvisioningError', () => {
 });
 
 describe('processProvisioningMessage', () => {
-  test('acks a message for a job that was never persisted', async () => {
+  test('retries a message whose job record is not yet visible in KV', async () => {
     const env = await testEnv();
     const outcome = await processProvisioningMessage('missing-job', env, { fetcher: unreachableFetch() });
-    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(outcome).toEqual({ outcome: 'retry', delaySeconds: PROVISIONING_LOCK_RETRY_DELAY_SECONDS });
   });
 
   test('advances one step per call and completes the remaining pipeline', async () => {
@@ -385,6 +385,63 @@ describe('processProvisioningMessage', () => {
     expect(job?.lock).toBeNull();
     expect(job?.steps.configure_pages).toMatchObject({ status: 'pending', attempts: 1 });
     expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_pages_unavailable', retryable: true });
+  });
+
+  test('an ambiguous dispatch failure keeps the persisted marker, so the retry correlates instead of dispatching again', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    const readyToDispatch = jobAtConfigurePages();
+    readyToDispatch.steps.configure_pages.status = 'succeeded';
+    await saveProvisioningJob(env.JOBS, readyToDispatch);
+
+    let dispatchAttempts = 0;
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') {
+        return Response.json({ token: 'installation-token' });
+      }
+      if (url.endsWith('/actions/workflows/sync-notion.yml/runs?event=workflow_dispatch&per_page=20')) {
+        return Response.json({
+          workflow_runs: dispatchAttempts > 0
+            ? [{
+                id: 555,
+                html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
+                status: 'in_progress',
+                conclusion: null,
+                event: 'workflow_dispatch',
+                created_at: new Date(2_000).toISOString(),
+                head_sha: 'generated-head-sha',
+              }]
+            : [],
+        });
+      }
+      if (url.endsWith('/actions/workflows/sync-notion.yml/dispatches')) {
+        dispatchAttempts += 1;
+        // The handler has already persisted the dispatch marker when this
+        // fires; a network reset here leaves whether GitHub accepted the
+        // dispatch unknown.
+        throw new TypeError('network reset after dispatch was sent');
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 2_000, lockOwner: () => 'attempt-1' });
+    expect(first).toEqual({ outcome: 'retry', delaySeconds: 30 });
+
+    const afterFailure = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(afterFailure?.data.syncDispatchMarker).not.toBeNull();
+
+    // The retry must resume by correlating the recorded window — never by
+    // issuing a second workflow_dispatch.
+    const second = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 3_000, lockOwner: () => 'attempt-2' });
+    expect(second).toEqual({ outcome: 'acked' });
+    expect(dispatchAttempts).toBe(1);
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.data.sync).toMatchObject({ runId: 555, conclusion: null });
+    expect(job?.data.syncDispatchMarker).toBeNull();
+    expect(job?.steps.dispatch_sync.status).toBe('succeeded');
+    expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
   });
 
   test('a non-retryable step failure dead-letters the job on its first attempt', async () => {

@@ -27,6 +27,7 @@ import {
 } from './github-app-auth';
 import {
   createProvisioningJob,
+  nextPendingStep,
   saveProvisioningJob,
 } from './provisioning-job';
 import { processProvisioningMessage } from './provisioning-queue';
@@ -724,7 +725,32 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       JSON.stringify({ ...record, phase: 'consumed', installationId: selectedInstallationId, identity }),
       { expirationTtl: STATE_REPLAY_TTL_SECONDS },
     );
-    await env.PROVISIONING_QUEUE.send({ jobId: job.jobId });
+    try {
+      await env.PROVISIONING_QUEUE.send({ jobId: job.jobId });
+    } catch (enqueueError) {
+      // Without a message nothing will ever process this job, but its record
+      // would otherwise sit `queued` until the TTL with no trace of why. Mark
+      // the enqueue failure on the job so durable state reflects reality,
+      // then let the request surface as a 502.
+      const failedStep = nextPendingStep(job);
+      if (failedStep) {
+        await saveProvisioningJob(env.JOBS, {
+          ...job,
+          status: 'dead_letter',
+          steps: {
+            ...job.steps,
+            [failedStep]: {
+              ...job.steps[failedStep],
+              status: 'failed',
+              lastError: { code: 'provisioning_enqueue_failed', retryable: false },
+            },
+          },
+          completedAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+      throw enqueueError;
+    }
 
     return json({
       ok: true,

@@ -7,8 +7,9 @@
  * reflects rather than repeating a completed step. Each invocation advances
  * at most one step, then either enqueues a continuation message (more steps
  * remain), asks the queue to redeliver the same message later (a retryable
- * failure or a lock held by another in-flight attempt), or does neither
- * (the job just reached a terminal status).
+ * failure, a lock held by another in-flight attempt, or a record not yet
+ * visible through KV's eventual consistency), or acks (the job just reached
+ * a terminal status).
  */
 
 import {
@@ -120,14 +121,21 @@ async function recordStepFailure(
   now: number,
 ): Promise<ProvisioningMessageOutcome> {
   const classification = classifyProvisioningError(error);
-  const attempts = job.steps[step].attempts + 1;
+  // The step handler may have persisted data directly to KV after this
+  // attempt's snapshot was taken — the sync dispatch marker is written this
+  // way exactly so it survives an ambiguous dispatch failure. Re-read the
+  // record and move only the step bookkeeping onto it; wiping `data` here
+  // would make the retry dispatch a second Notion sync run.
+  const persisted = await loadProvisioningJob(env.JOBS, job.jobId);
+  const base = persisted ?? job;
+  const attempts = base.steps[step].attempts + 1;
   const terminal = !classification.retryable || attempts >= PROVISIONING_STEP_MAX_ATTEMPTS;
 
   const updated: ProvisioningJob = {
-    ...job,
+    ...base,
     status: terminal ? 'dead_letter' : 'queued',
     steps: {
-      ...job.steps,
+      ...base.steps,
       [step]: {
         status: terminal ? 'failed' : 'pending',
         attempts,
@@ -165,7 +173,14 @@ export async function processProvisioningMessage(
   } = runtime;
 
   const job = await loadProvisioningJob(env.JOBS, jobId);
-  if (!job) return { outcome: 'acked' };
+  if (!job) {
+    // KV is eventually consistent across locations, and a message may be
+    // delivered before the record written just before it was enqueued is
+    // visible. Redeliver rather than ack: a job that never materializes is
+    // dead-lettered by the platform's retry ceiling instead of silently
+    // dropped after its onboarding response already said "provisioning".
+    return { outcome: 'retry', delaySeconds: PROVISIONING_LOCK_RETRY_DELAY_SECONDS };
+  }
   if (isTerminalProvisioningStatus(job.status)) return { outcome: 'acked' };
 
   const locked = tryAcquireProvisioningLock(job, lockOwner(), now());

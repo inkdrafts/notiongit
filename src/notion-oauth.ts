@@ -145,11 +145,6 @@ async function verifyNotionState(encodedState: string, secret: string): Promise<
   if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
 
   try {
-    const expectedSignature = await hmacSign(parts[0], secret);
-    const expected = textEncoder.encode(expectedSignature);
-    const actual = textEncoder.encode(parts[1]);
-    if (expected.length !== actual.length) return null;
-
     const key = await crypto.subtle.importKey(
       'raw',
       textEncoder.encode(secret),

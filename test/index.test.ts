@@ -357,6 +357,68 @@ describe('GitHub App install and authorize flow', () => {
     }
   });
 
+  test('records an enqueue failure on the job instead of leaving it queued forever', async () => {
+    class FailingQueue {
+      readonly sent: unknown[] = [];
+      async send(): Promise<void> {
+        throw new Error('queue unavailable');
+      }
+      async sendBatch(): Promise<void> {
+        throw new Error('MemoryQueue.sendBatch is not used by this project');
+      }
+    }
+    const kv = new MemoryKV();
+    const queue = new FailingQueue();
+    const env = await githubEnv(kv, queue as unknown as MemoryQueue<ProvisioningMessage>);
+    const { state } = await getInstallState(env);
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url === 'https://github.com/login/oauth/access_token') {
+        return Response.json({ access_token: 'user-token', token_type: 'bearer' });
+      }
+      if (request.url === 'https://api.github.com/user') {
+        return Response.json({ id: 42, login: 'alice', type: 'User' });
+      }
+      if (request.url === 'https://api.github.com/user/installations/123') {
+        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+      }
+      if (request.url.startsWith('https://api.github.com/user/repos?')) {
+        return Response.json([]);
+      }
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') {
+        return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
+      }
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/generate') {
+        return Response.json(generatedRepositoryBody('alice.github.io'), { status: 201 });
+      }
+      throw new Error(`unexpected URL: ${request.url}`);
+    }) as typeof fetch;
+
+    try {
+      const callback = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(callback.status).toBe(502);
+      expect(await callback.json()).toEqual({ error: 'github_authorization_unavailable' });
+
+      // The durable record must not sit `queued` with no message and no
+      // trace of why: the enqueue failure is marked on the job itself.
+      const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
+      expect(stored?.status).toBe('dead_letter');
+      expect(stored?.completedAt).not.toBeNull();
+      expect(stored?.steps.verify_repository.status).toBe('failed');
+      expect(stored?.steps.verify_repository.lastError).toEqual({
+        code: 'provisioning_enqueue_failed',
+        retryable: false,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test('accepts a setup callback before the OAuth callback', async () => {
     const kv = new MemoryKV();
     const queue = new MemoryQueue<ProvisioningMessage>();
