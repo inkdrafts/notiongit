@@ -30,6 +30,19 @@ import {
   patchRepositoryConfig,
   GithubConfigError,
 } from './repository-config';
+import {
+  awaitNotionSyncRun,
+  dispatchAndCorrelateNotionSync,
+  GithubSyncError,
+  type NotionSyncRunIdentity,
+} from './notion-sync';
+import {
+  awaitPagesBuildForCommit,
+  getRepositoryMainHeadSha,
+  verifyPublicSiteReachable,
+  GithubDeployError,
+  type GithubPagesBuildIdentity,
+} from './site-deployment';
 
 
 export {
@@ -112,6 +125,37 @@ export {
 } from './repository-config';
 export type { ConfigPatchOptions, ConfigPatchResult, GithubConfigErrorCode } from './repository-config';
 
+export {
+  awaitNotionSyncRun,
+  correlateDispatchedSyncRun,
+  dispatchAndCorrelateNotionSync,
+  dispatchNotionSyncWorkflow,
+  GithubSyncError,
+  listWorkflowRunIds,
+  SYNC_WORKFLOW_FILE,
+} from './notion-sync';
+export type {
+  GithubSyncErrorCode,
+  NotionSyncPollOptions,
+  NotionSyncRunIdentity,
+} from './notion-sync';
+
+export {
+  awaitPagesBuildForCommit,
+  getRepositoryMainHeadSha,
+  verifyPublicSiteReachable,
+  GithubDeployError,
+  PAGES_BUILD_MAX_POLL_ATTEMPTS,
+  SITE_VERIFY_MAX_ATTEMPTS,
+} from './site-deployment';
+export type {
+  GithubDeployErrorCode,
+  GithubDeployStatus,
+  GithubPagesBuildIdentity,
+  PagesBuildPollOptions,
+  SiteVerifyOptions,
+} from './site-deployment';
+
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
   JOBS: KVNamespace;
@@ -146,6 +190,23 @@ export interface GithubOnboardingResult {
   repository: RepositoryDestination;
   generatedRepository: GeneratedRepositoryIdentity;
   pages: GithubPagesIdentity;
+  sync: NotionSyncStatus;
+  deployment: SiteDeploymentStatus;
+}
+
+/** Non-secret sync progress, correlated once and reused across retries. */
+export interface NotionSyncStatus {
+  runId: number;
+  htmlUrl: string;
+  conclusion: string | null;
+}
+
+/** Non-secret deployment progress, recorded only once the site answers. */
+export interface SiteDeploymentStatus {
+  commitSha: string;
+  buildId: number | null;
+  status: GithubPagesBuildIdentity['status'];
+  verifiedAt: number;
 }
 
 const GITHUB_API = 'https://api.github.com';
@@ -156,6 +217,7 @@ const STATE_REPLAY_TTL_SECONDS = 60 * 60;
 const JOB_TTL_SECONDS = 24 * 60 * 60;
 const STATE_PREFIX = 'github:oauth-state:';
 const JOB_PREFIX = 'github:onboarding-job:';
+const SYNC_RUN_PREFIX = 'github:onboarding-sync-run:';
 
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
@@ -206,12 +268,14 @@ interface GithubStateRecord {
 interface GithubJobRecord {
   version: 1;
   jobId: string;
-  status: 'pages_enabled';
+  status: 'site_live';
   installationId: number;
   identity: GithubIdentity;
   repository: RepositoryDestination;
   generatedRepository: GeneratedRepositoryIdentity;
   pages: GithubPagesIdentity;
+  sync: NotionSyncStatus;
+  deployment: SiteDeploymentStatus;
   completedAt: number;
 }
 
@@ -348,6 +412,22 @@ function stateKey(nonce: string): string {
 
 function jobKey(jobId: string): string {
   return `${JOB_PREFIX}${jobId}`;
+}
+
+function syncRunKey(jobId: string): string {
+  return `${SYNC_RUN_PREFIX}${jobId}`;
+}
+
+/**
+ * The dispatched run is correlated once and persisted immediately, before
+ * this Worker waits on it. A retry that reaches this step again resumes by
+ * polling the same run instead of dispatching a second one — this is what
+ * keeps a partially completed job from creating unbounded workflow runs.
+ */
+interface SyncRunRecord {
+  version: 1;
+  runId: number;
+  htmlUrl: string;
 }
 
 function validJobId(value: string): boolean {
@@ -599,6 +679,14 @@ function authError(error: unknown): Response {
   if (error instanceof GithubActionsSecretsError) {
     return json({ error: error.code }, error.status);
   }
+  if (error instanceof GithubSyncError) {
+    const body: Record<string, unknown> = { error: error.code };
+    if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
+    return json(body, error.status);
+  }
+  if (error instanceof GithubDeployError) {
+    return json({ error: error.code }, error.status);
+  }
   if (error instanceof GithubConfigError) {
     if (error.status === 400 || error.status === 401) {
       return json({ error: 'github_authorization_failed' }, 400);
@@ -743,15 +831,42 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
     // a partial callback never create or mutate a second repository.
     const pages = await configureGithubPages(installationToken, generatedRepository.fullName);
 
+    // The dispatched run is correlated and persisted before this Worker waits
+    // on it, so a retry that reaches this step again resumes the same run
+    // instead of dispatching a duplicate — a partially completed job can
+    // never create an unbounded number of workflow runs.
+    let syncRunRecord = await env.JOBS.get<SyncRunRecord>(syncRunKey(record.jobId), 'json');
+    if (!syncRunRecord || syncRunRecord.version !== 1) {
+      const correlated = await dispatchAndCorrelateNotionSync(installationToken, generatedRepository.fullName);
+      syncRunRecord = { version: 1, runId: correlated.runId, htmlUrl: correlated.htmlUrl };
+      await env.JOBS.put(syncRunKey(record.jobId), JSON.stringify(syncRunRecord), { expirationTtl: JOB_TTL_SECONDS });
+    }
+    const syncRun: NotionSyncRunIdentity = await awaitNotionSyncRun(
+      installationToken,
+      generatedRepository.fullName,
+      syncRunRecord.runId,
+    );
+
+    // Pages rebuilds automatically on every push to `main`, so the build to
+    // wait for is identified by matching the commit the sync run left behind
+    // (or the repository's existing HEAD, when the run changed nothing)
+    // rather than by an id this Worker mints.
+    const headSha = await getRepositoryMainHeadSha(installationToken, generatedRepository.fullName);
+    if (!pages.htmlUrl) throw new GithubDeployError('github_deploy_unavailable', 502);
+    const build = await awaitPagesBuildForCommit(installationToken, generatedRepository.fullName, headSha);
+    await verifyPublicSiteReachable(pages.htmlUrl);
+
     const completed: GithubJobRecord = {
       version: 1,
       jobId: record.jobId,
-      status: 'pages_enabled',
+      status: 'site_live',
       installationId: selectedInstallationId,
       identity,
       repository,
       generatedRepository,
       pages,
+      sync: { runId: syncRun.runId, htmlUrl: syncRun.htmlUrl, conclusion: syncRun.conclusion },
+      deployment: { commitSha: headSha, buildId: build.buildId, status: build.status, verifiedAt: Date.now() },
       completedAt: Date.now(),
     };
     await env.JOBS.put(jobKey(record.jobId), JSON.stringify(completed), { expirationTtl: JOB_TTL_SECONDS });
@@ -779,6 +894,16 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
         html_url: pages.htmlUrl,
         build_type: pages.buildType,
         source: pages.source,
+      },
+      sync: {
+        run_id: syncRun.runId,
+        html_url: syncRun.htmlUrl,
+        conclusion: syncRun.conclusion,
+      },
+      deployment: {
+        commit_sha: headSha,
+        build_id: build.buildId,
+        status: build.status,
       },
     });
   } catch (error) {

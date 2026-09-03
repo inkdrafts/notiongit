@@ -24,10 +24,29 @@ and handles the signed callback at `GET /auth/github/callback`. The callback
 exchanges the OAuth code server-side, verifies that the authenticated personal
 account owns the installation, selects a collision-safe repository destination,
 generates that repository from `inkdrafts/notiongit-template`, enables legacy
-GitHub Pages from `main:/`, and stores only GitHub identity, installation,
-destination, generated-repository metadata, and non-secret Pages status/URL
-metadata in `JOBS`; OAuth and installation tokens are never persisted or
-returned to browser code. It also wires the `PROVISIONING_QUEUE` Queue binding.
+GitHub Pages from `main:/`, dispatches the generated repository's own Notion
+sync workflow and waits for it to complete, then waits for the matching Pages
+build and confirms the public site actually answers before declaring success.
+It stores only GitHub identity, installation, destination, generated-repository
+metadata, non-secret Pages status/URL metadata, and non-secret sync/deployment
+progress (run id and URL, conclusion, commit sha, build id and status) in
+`JOBS`; OAuth and installation tokens are never persisted or returned to
+browser code. It also wires the `PROVISIONING_QUEUE` Queue binding.
+
+The sync dispatch and deploy-verification steps are implemented in
+[`src/notion-sync.ts`](src/notion-sync.ts) and
+[`src/site-deployment.ts`](src/site-deployment.ts). `workflow_dispatch` never
+returns a run id, so the dispatched run is correlated by snapshotting the
+workflow's run ids immediately before dispatch and adopting the first new
+`workflow_dispatch` run created afterward; that correlation is persisted
+before the Worker waits on it, so a retry resumes polling the same run
+instead of dispatching a duplicate. Once the run completes, the Worker waits
+for the Pages build matching the resulting commit and then the public URL
+itself, since a build finishing does not guarantee the CDN in front of it
+already serves the new content. Workflow failure, Pages build failure,
+polling timeout, and unreachable-URL propagation each surface as a distinct
+job error. See [`docs/architecture.md`](docs/architecture.md) for the full
+sequence.
 
 `/connect/github` accepts an optional `job_id` (or `jobId`) and generates one
 when omitted. The signed state expires after ten minutes and is marked consumed

@@ -65,6 +65,36 @@ permission, and rate-limit failures are surfaced as distinct job errors;
 network and 5xx failures use a bounded retry. KV stores only Pages status,
 URLs, and the desired source metadata.
 
+## Notion sync dispatch and deploy verification
+
+Once Pages is configured, the Worker dispatches the generated repository's
+own `sync-notion.yml` workflow (`allow_bulk_delete: false`) with the
+installation token. `workflow_dispatch` never returns a run id, so the run is
+correlated the standard way: the workflow's run ids are snapshotted
+immediately before dispatch, and the first `workflow_dispatch` run created
+afterward with an id outside that snapshot is adopted. That correlated run is
+persisted to KV before the Worker waits on it, so a retry that reaches this
+step again resumes polling the same run instead of dispatching a duplicate —
+a partially completed job cannot create an unbounded number of workflow
+runs. A completed run whose conclusion is not `success` is a distinct job
+error (`github_sync_run_failed`); the run's own machine-readable summary
+output is never read, since step outputs are not retrievable outside the
+run itself and could carry Notion content.
+
+After the run completes, the Worker reads the repository's `main` HEAD
+(unchanged if the sync was a no-op) and polls `GET .../pages/builds/latest`
+until it reports a terminal status for that exact commit — never a stale
+build in flight for an older one. A matching `errored` build is
+`github_deploy_build_failed`; a build that never reaches a terminal, matching
+state within the bounded backoff is `github_deploy_timeout`. Only once the
+build is `built` does the Worker fetch the public Pages URL directly; a build
+finishing does not guarantee the CDN in front of it already serves the new
+content, so a URL that keeps failing after bounded retries is reported as
+its own outcome, `github_deploy_url_unreachable`, distinct from a build
+failure. The completed job record (`status: "site_live"`) is written only
+after the public URL answers, and carries the non-secret run id, run URL,
+conclusion, commit sha, build id, and build status for a future progress UI.
+
 ## Deployment
 
 Run `bun run build` for the dry-run check. The manual Deploy workflow accepts a

@@ -1,0 +1,272 @@
+/**
+ * Dispatch and correlate the template's Notion sync workflow.
+ *
+ * `workflow_dispatch` never returns a run id, so a dispatched run is
+ * correlated the standard way: snapshot the workflow's run ids immediately
+ * before dispatching, then poll the run list for the first `workflow_dispatch`
+ * run whose id was not in that snapshot and whose `created_at` is not earlier
+ * than the dispatch. All calls use the installation token, matching Pages
+ * configuration; no Notion credential ever passes through this module.
+ */
+
+export const SYNC_WORKFLOW_FILE = 'sync-notion.yml';
+
+export const SYNC_CORRELATE_MAX_ATTEMPTS = 6;
+export const SYNC_CORRELATE_INITIAL_DELAY_MS = 500;
+export const SYNC_CORRELATE_MAX_DELAY_MS = 4_000;
+
+export const SYNC_RUN_MAX_POLL_ATTEMPTS = 12;
+export const SYNC_RUN_POLL_INITIAL_DELAY_MS = 3_000;
+export const SYNC_RUN_POLL_MAX_DELAY_MS = 20_000;
+
+/** Tolerance for clock skew between this Worker and GitHub's run timestamps. */
+const CORRELATE_CLOCK_SKEW_TOLERANCE_MS = 10_000;
+
+export interface NotionSyncRunIdentity {
+  runId: number;
+  htmlUrl: string;
+  status: string;
+  conclusion: string | null;
+  headSha: string | null;
+}
+
+export type GithubSyncErrorCode =
+  | 'github_sync_dispatch_unavailable'
+  | 'github_sync_permission_denied'
+  | 'github_sync_rate_limited'
+  | 'github_sync_correlate_timeout'
+  | 'github_sync_run_timeout'
+  | 'github_sync_run_failed'
+  | 'github_sync_unavailable';
+
+export class GithubSyncError extends Error {
+  readonly code: GithubSyncErrorCode;
+  readonly status: number;
+  readonly retryAfterSeconds: number | null;
+
+  constructor(code: GithubSyncErrorCode, status: number, retryAfterSeconds: number | null = null) {
+    super(code);
+    this.name = 'GithubSyncError';
+    this.code = code;
+    this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+interface WorkflowRunResponse {
+  id?: unknown;
+  html_url?: unknown;
+  status?: unknown;
+  conclusion?: unknown;
+  head_sha?: unknown;
+  created_at?: unknown;
+  event?: unknown;
+}
+
+export interface NotionSyncPollOptions {
+  maxAttempts?: number;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+  fetcher?: typeof fetch;
+  sleep?: (milliseconds: number) => Promise<void>;
+}
+
+const GITHUB_API = 'https://api.github.com';
+const GITHUB_API_VERSION = '2022-11-28';
+
+const defaultSleep = (milliseconds: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
+function githubHeaders(installationToken: string): Headers {
+  return new Headers({
+    Accept: 'application/vnd.github+json',
+    Authorization: `Bearer ${installationToken}`,
+    'X-GitHub-Api-Version': GITHUB_API_VERSION,
+  });
+}
+
+async function readJson<T>(response: Response): Promise<T | null> {
+  try {
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+function retryAfterSeconds(response: Response): number | null {
+  const value = response.headers.get('retry-after');
+  if (value === null) return null;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : null;
+}
+
+function isUsableRunShape(run: WorkflowRunResponse): boolean {
+  return Number.isSafeInteger(run.id) && (run.id as number) > 0 && typeof run.status === 'string';
+}
+
+function runIdentity(run: WorkflowRunResponse): NotionSyncRunIdentity {
+  return {
+    runId: run.id as number,
+    htmlUrl: typeof run.html_url === 'string' ? run.html_url : '',
+    status: run.status as string,
+    conclusion: typeof run.conclusion === 'string' ? run.conclusion : null,
+    headSha: typeof run.head_sha === 'string' ? run.head_sha : null,
+  };
+}
+
+function runsPath(repositoryFullName: string): string {
+  const parts = repositoryFullName.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new GithubSyncError('github_sync_unavailable', 502);
+  }
+  return `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/actions/workflows/${SYNC_WORKFLOW_FILE}`;
+}
+
+/** Non-secret snapshot of a workflow's current run ids, used to detect a new run. */
+export async function listWorkflowRunIds(
+  installationToken: string,
+  repositoryFullName: string,
+  fetcher: typeof fetch = fetch,
+): Promise<Set<number>> {
+  const response = await fetcher(`${GITHUB_API}${runsPath(repositoryFullName)}/runs?event=workflow_dispatch&per_page=20`, {
+    headers: githubHeaders(installationToken),
+  });
+  if (!response.ok) throw new GithubSyncError('github_sync_unavailable', 502);
+  const body = await readJson<{ workflow_runs?: WorkflowRunResponse[] }>(response);
+  const runs = body?.workflow_runs ?? [];
+  return new Set(runs.filter(isUsableRunShape).map((run) => run.id as number));
+}
+
+/** Trigger the template's documented sync workflow with safe default bulk-delete behavior. */
+export async function dispatchNotionSyncWorkflow(
+  installationToken: string,
+  repositoryFullName: string,
+  fetcher: typeof fetch = fetch,
+): Promise<void> {
+  const response = await fetcher(`${GITHUB_API}${runsPath(repositoryFullName)}/dispatches`, {
+    method: 'POST',
+    headers: (() => {
+      const headers = githubHeaders(installationToken);
+      headers.set('Content-Type', 'application/json');
+      return headers;
+    })(),
+    body: JSON.stringify({ ref: 'main', inputs: { allow_bulk_delete: 'false' } }),
+  });
+
+  if (response.status === 204) return;
+  if (response.status === 403 || response.status === 429) {
+    throw new GithubSyncError('github_sync_rate_limited', 429, retryAfterSeconds(response));
+  }
+  if (response.status === 401) throw new GithubSyncError('github_sync_permission_denied', 403);
+  if (response.status === 404 || response.status === 422) {
+    throw new GithubSyncError('github_sync_dispatch_unavailable', 502);
+  }
+  throw new GithubSyncError('github_sync_unavailable', 502);
+}
+
+/** Find the run a just-issued dispatch produced, never an id seen before it. */
+export async function correlateDispatchedSyncRun(
+  installationToken: string,
+  repositoryFullName: string,
+  excludedRunIds: ReadonlySet<number>,
+  dispatchedAtMs: number,
+  options: NotionSyncPollOptions = {},
+): Promise<NotionSyncRunIdentity> {
+  const {
+    maxAttempts = SYNC_CORRELATE_MAX_ATTEMPTS,
+    initialDelayMs = SYNC_CORRELATE_INITIAL_DELAY_MS,
+    maxDelayMs = SYNC_CORRELATE_MAX_DELAY_MS,
+    fetcher = fetch,
+    sleep = defaultSleep,
+  } = options;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+    throw new Error('invalid sync correlation attempt limit');
+  }
+
+  const notBeforeMs = dispatchedAtMs - CORRELATE_CLOCK_SKEW_TOLERANCE_MS;
+  let delay = initialDelayMs;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await fetcher(`${GITHUB_API}${runsPath(repositoryFullName)}/runs?event=workflow_dispatch&per_page=20`, {
+      headers: githubHeaders(installationToken),
+    });
+    if (response.ok) {
+      const body = await readJson<{ workflow_runs?: WorkflowRunResponse[] }>(response);
+      const runs = (body?.workflow_runs ?? []).filter(isUsableRunShape);
+      const match = runs.find((run) => {
+        if (excludedRunIds.has(run.id as number)) return false;
+        const createdAt = typeof run.created_at === 'string' ? Date.parse(run.created_at) : NaN;
+        return Number.isFinite(createdAt) && createdAt >= notBeforeMs;
+      });
+      if (match) return runIdentity(match);
+    }
+    if (attempt < maxAttempts) {
+      await sleep(delay);
+      delay = Math.min(delay * 2, maxDelayMs);
+    }
+  }
+
+  throw new GithubSyncError('github_sync_correlate_timeout', 504);
+}
+
+/** Dispatch the sync workflow and correlate the run it produced. */
+export async function dispatchAndCorrelateNotionSync(
+  installationToken: string,
+  repositoryFullName: string,
+  options: NotionSyncPollOptions = {},
+): Promise<NotionSyncRunIdentity> {
+  const { fetcher = fetch } = options;
+  const excludedRunIds = await listWorkflowRunIds(installationToken, repositoryFullName, fetcher);
+  const dispatchedAtMs = Date.now();
+  await dispatchNotionSyncWorkflow(installationToken, repositoryFullName, fetcher);
+  return correlateDispatchedSyncRun(installationToken, repositoryFullName, excludedRunIds, dispatchedAtMs, options);
+}
+
+/**
+ * Poll a correlated run until GitHub reports it `completed`. A completed run
+ * whose conclusion is not `success` (the guarded bulk-delete abort, an
+ * unexpected sync error, or any other non-zero exit) is reported as a
+ * distinct failure rather than returned for the caller to re-check.
+ */
+export async function awaitNotionSyncRun(
+  installationToken: string,
+  repositoryFullName: string,
+  runId: number,
+  options: NotionSyncPollOptions = {},
+): Promise<NotionSyncRunIdentity> {
+  const {
+    maxAttempts = SYNC_RUN_MAX_POLL_ATTEMPTS,
+    initialDelayMs = SYNC_RUN_POLL_INITIAL_DELAY_MS,
+    maxDelayMs = SYNC_RUN_POLL_MAX_DELAY_MS,
+    fetcher = fetch,
+    sleep = defaultSleep,
+  } = options;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+    throw new Error('invalid sync run poll attempt limit');
+  }
+
+  const parts = repositoryFullName.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) throw new GithubSyncError('github_sync_unavailable', 502);
+  const path = `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/actions/runs/${runId}`;
+
+  let delay = initialDelayMs;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await fetcher(`${GITHUB_API}${path}`, { headers: githubHeaders(installationToken) });
+    if (response.ok) {
+      const body = await readJson<WorkflowRunResponse>(response);
+      if (body && isUsableRunShape(body) && body.status === 'completed') {
+        const identity = runIdentity(body);
+        if (identity.conclusion !== 'success') throw new GithubSyncError('github_sync_run_failed', 502);
+        return identity;
+      }
+    } else if (response.status !== 404 && !(response.status >= 500)) {
+      throw new GithubSyncError('github_sync_unavailable', 502);
+    }
+    if (attempt < maxAttempts) {
+      await sleep(delay);
+      delay = Math.min(delay * 2, maxDelayMs);
+    }
+  }
+
+  throw new GithubSyncError('github_sync_run_timeout', 504);
+}
