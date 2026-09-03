@@ -36,6 +36,21 @@ function mockResponse(entry: MockSequenceEntry): Response {
     headers: { 'content-type': 'application/json', ...(entry.headers ?? {}) },
   });
 }
+function base64(content: string): string {
+  let binary = '';
+  for (const byte of new TextEncoder().encode(content)) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+const TEMPLATE_CONFIG = `# Neutral template defaults. Provisioning patches url/baseurl.
+title: "NotionGit"
+url: ""
+baseurl: ""
+
+author:
+  name: ""
+`;
+
 
 function generatedRepositoryBody(name: string): Record<string, unknown> {
   return {
@@ -110,6 +125,10 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
           status: 200,
           body: { sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } },
         })));
+      }
+      if (/^https:\/\/api\.github\.com\/repos\/alice\/[^/]+\/contents\/_config\.yml(?:\?ref=main)?$/u.test(request.url)) {
+        if (request.method === 'PUT') return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
+        return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
       }
       throw new Error(`unexpected URL: ${request.url}`);
     };
@@ -286,6 +305,14 @@ describe('GitHub App install and authorize flow', () => {
         expect(request.headers.get('authorization')).toBe('Bearer installation-token');
         return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
       }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml' || request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml?ref=main') {
+        expect(request.headers.get('authorization')).toBe('Bearer installation-token');
+        if (request.method === 'PUT') {
+          expect(await request.json()).toMatchObject({ sha: 'config-sha', branch: 'main' });
+          return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
+        }
+        return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
+      }
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -338,7 +365,7 @@ describe('GitHub App install and authorize flow', () => {
       );
       expect(replay.status).toBe(400);
       expect(await replay.json()).toEqual({ error: 'github_state_replayed' });
-      expect(requests).toHaveLength(9);
+      expect(requests).toHaveLength(11);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -389,6 +416,10 @@ describe('GitHub App install and authorize flow', () => {
       if (request.url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
         return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
       }
+      if (request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml' || request.url === 'https://api.github.com/repos/alice/alice.github.io/contents/_config.yml?ref=main') {
+        if (request.method === 'PUT') return Response.json({ content: { sha: 'patched-config-sha' }, commit: { sha: 'config-commit-sha' } });
+        return Response.json({ type: 'file', encoding: 'base64', content: base64(TEMPLATE_CONFIG), sha: 'config-sha' });
+      }
       throw new Error(`unexpected URL: ${request.url}`);
     };
 
@@ -405,7 +436,7 @@ describe('GitHub App install and authorize flow', () => {
         env,
       );
       expect(callback.status).toBe(200);
-      expect(calls).toBe(10);
+      expect(calls).toBe(12);
     } finally {
       globalThis.fetch = originalFetch;
     }

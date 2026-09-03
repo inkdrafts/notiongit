@@ -18,6 +18,10 @@ import {
   GithubGenerateError,
   type GeneratedRepositoryIdentity,
 } from './repository-generation';
+import {
+  patchRepositoryConfig,
+  GithubConfigError,
+} from './repository-config';
 
 
 export {
@@ -52,6 +56,16 @@ export type {
   GeneratedRepositoryPollOptions,
   GithubGenerateErrorCode,
 } from './repository-generation';
+export {
+  CONFIG_PATCH_COMMIT_MESSAGE,
+  CONFIG_PATCH_MAX_ATTEMPTS,
+  GithubConfigError,
+  JEKYLL_CONFIG_BRANCH,
+  JEKYLL_CONFIG_PATH,
+  patchGeneratedRepositoryConfig,
+  patchRepositoryConfig,
+} from './repository-config';
+export type { ConfigPatchOptions, ConfigPatchResult, GithubConfigErrorCode } from './repository-config';
 
 export interface Env {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
@@ -530,6 +544,12 @@ function authError(error: unknown): Response {
     if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
     return json(body, error.status);
   }
+  if (error instanceof GithubConfigError) {
+    if (error.status === 400 || error.status === 401) {
+      return json({ error: 'github_authorization_failed' }, 400);
+    }
+    return json({ error: error.code }, error.status);
+  }
   // Deliberately do not expose provider response bodies, OAuth codes, tokens,
   // private keys, or exception messages to the browser.
   return json({ error: 'github_authorization_unavailable' }, 502);
@@ -655,6 +675,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       selectedInstallationId,
     );
     const usable = await awaitGeneratedRepositoryCommit(`Bearer ${installationToken}`, generatedRepository.fullName);
+    await patchRepositoryConfig(installationToken, generatedRepository.fullName, repository);
     generatedRepository = {
       ...generatedRepository,
       headSha: usable.headSha,
