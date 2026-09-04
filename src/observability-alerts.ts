@@ -146,11 +146,12 @@ export interface AlertCheckEnv {
 const DEFAULT_ALERT_WINDOW_MINUTES = 60;
 const DATASET_NAME_PATTERN = /^[A-Za-z0-9_]+$/u;
 
+// `datasetName` is interpolated into SQL text; the caller checks it against
+// `DATASET_NAME_PATTERN` before calling this, so it never reaches here
+// unvalidated.
 function alertWindowQuery(windowMinutes: number, datasetName: string): string {
-  // Both are interpolated into SQL text, so each is reduced to a safe shape
-  // rather than trusted as an arbitrary caller-supplied value: the window to
-  // a positive integer, the dataset name to one this project could plausibly
-  // have configured.
+  // Also interpolated, so reduced to a positive integer rather than trusted
+  // as an arbitrary caller-supplied value.
   const minutes = Math.max(1, Math.floor(windowMinutes));
   return [
     `SELECT blob1, blob3, SUM(_sample_interval) AS count`,
@@ -177,8 +178,6 @@ function alertMessage(alert: ObservabilityAlert): string {
 
 export interface AlertCheckOptions {
   fetcher?: typeof fetch;
-  /** Unread while the query uses a relative SQL `INTERVAL`. */
-  now?: () => number;
   windowMinutes?: number;
   thresholds?: AlertThresholds;
 }
