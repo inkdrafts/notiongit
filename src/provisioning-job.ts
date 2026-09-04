@@ -13,6 +13,7 @@
 import type { GeneratedRepositoryIdentity } from './repository-generation';
 import type { GithubPagesIdentity } from './github-pages';
 import type { RepositoryDestination } from './repository-naming';
+import { isProvisioningFailureCode, type ProvisioningFailureCode } from './failures';
 
 export const PROVISIONING_JOB_VERSION = 1;
 export const PROVISIONING_JOB_TTL_SECONDS = 24 * 60 * 60;
@@ -53,7 +54,7 @@ export type ProvisioningStepName = (typeof PROVISIONING_STEP_ORDER)[number];
 export type ProvisioningStepStatus = 'pending' | 'in_progress' | 'succeeded' | 'failed';
 
 export interface ProvisioningStepError {
-  code: string;
+  code: ProvisioningFailureCode;
   retryable: boolean;
 }
 
@@ -222,12 +223,31 @@ export function createProvisioningJob(params: CreateProvisioningJobParams): Prov
   };
 }
 
+/**
+ * `lastError.code` is written only from the closed taxonomy by current code,
+ * but a record persisted by an older or differently-deployed version can
+ * carry any string. Normalize on read so every consumer can trust the union,
+ * keeping the recorded retry decision. Forensics caveat: the stored code is
+ * replaced in the returned record, so inspecting a historical value means
+ * reading the raw JSON out of KV, not this function's result.
+ */
+function sanitizedStepErrors(job: ProvisioningJob): ProvisioningJob['steps'] {
+  const steps = { ...job.steps };
+  for (const step of PROVISIONING_STEP_ORDER) {
+    const lastError = steps[step].lastError;
+    if (lastError && !isProvisioningFailureCode(lastError.code)) {
+      steps[step] = { ...steps[step], lastError: { code: 'provisioning_step_failed', retryable: lastError.retryable } };
+    }
+  }
+  return steps;
+}
+
 export async function loadProvisioningJob(kv: KVNamespace, jobId: string): Promise<ProvisioningJob | null> {
   const job = await kv.get<ProvisioningJob>(provisioningJobKey(jobId), 'json');
   if (!job || job.version !== PROVISIONING_JOB_VERSION) return null;
   // Records written before the throttle existed carry no `wait`; the version
   // stays 1 because the 24h TTL drains them without a migration.
-  return { ...job, wait: job.wait ?? null };
+  return { ...job, steps: sanitizedStepErrors(job), wait: job.wait ?? null };
 }
 
 /** Persist a job with the same rolling TTL used everywhere else in this project — the

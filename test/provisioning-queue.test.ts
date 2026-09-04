@@ -220,7 +220,7 @@ describe('classifyProvisioningError', () => {
 
   test('passes an app-auth 429 retry-after through', () => {
     expect(classifyProvisioningError(new GithubAppAuthError(429, 45)))
-      .toEqual({ code: 'github_app_auth_failed', retryable: true, retryAfterSeconds: 45 });
+      .toEqual({ code: 'github_rate_limited', retryable: true, retryAfterSeconds: 45 });
   });
 
   test('dead-letters a permission-denied Pages call', () => {
@@ -940,7 +940,7 @@ describe('processProvisioningMessage', () => {
     expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
     expect(queue.sendOptions[0]).toEqual({ delaySeconds: 45 });
     const job = await loadProvisioningJob(env.JOBS, 'job-1');
-    expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_app_auth_failed', retryable: true });
+    expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_rate_limited', retryable: true });
   });
 });
 

@@ -700,6 +700,31 @@ describe('GitHub App install and authorize flow', () => {
     }
   });
 
+  test('reports a GitHub identity rate limit as a 429 instead of masking it', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    const { state } = await getInstallState(env);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+      if (request.url === 'https://api.github.com/user') return new Response('rate limited', { status: 429 });
+      throw new Error(`unexpected URL: ${request.url}`);
+    };
+
+    try {
+      const response = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123`),
+        env,
+      );
+      expect(response.status).toBe(429);
+      expect(await response.json()).toEqual({ error: 'github_rate_limited' });
+      expect(kv.entries().join('\n')).not.toContain('user-token');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test('rejects denial, invalid state, and missing installation safely', async () => {
     const env = await githubEnv();
     const denied = await route(new Request('https://example.com/auth/github/callback?error=access_denied'), env);

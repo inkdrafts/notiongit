@@ -15,16 +15,8 @@
  * it), or acks (the job just reached a terminal status).
  */
 
-import {
-  createGithubInstallationToken,
-  GithubAppAuthError,
-  type GithubAppAuthEnv,
-} from './github-app-auth';
-import { GithubConfigError } from './repository-config';
-import { GithubPagesError } from './github-pages';
-import { GithubSyncError } from './notion-sync';
-import { GithubDeployError } from './site-deployment';
-import { GithubGenerateError } from './repository-generation';
+import { createGithubInstallationToken, type GithubAppAuthEnv } from './github-app-auth';
+import { classifyProvisioningError, type ProvisioningErrorClassification } from './failures';
 import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import { PROVISIONING_STEP_HANDLERS, type StepRunnerContext } from './provisioning-steps';
 import {
@@ -49,6 +41,9 @@ import {
   type ProvisioningThrottleVars,
 } from './provisioning-throttle';
 
+export { classifyProvisioningError };
+export type { ProvisioningErrorClassification };
+
 export interface ProvisioningQueueEnv extends GithubAppAuthEnv, ObservabilityEnv, ProvisioningThrottleVars {
   JOBS: KVNamespace;
   PROVISIONING_QUEUE: Queue<{ jobId: string }>;
@@ -69,69 +64,6 @@ export type ProvisioningMessageOutcome =
   | { outcome: 'retry'; delaySeconds: number };
 
 const defaultSleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
-
-export interface ProvisioningErrorClassification {
-  code: string;
-  retryable: boolean;
-  retryAfterSeconds: number | null;
-}
-
-const RETRYABLE_SYNC_CODES = new Set([
-  'github_sync_dispatch_unavailable',
-  'github_sync_rate_limited',
-  'github_sync_correlate_timeout',
-  'github_sync_run_timeout',
-  'github_sync_unavailable',
-]);
-
-const RETRYABLE_PAGES_CODES = new Set(['github_pages_rate_limited', 'github_pages_unavailable']);
-
-const RETRYABLE_CONFIG_CODES = new Set([
-  'github_config_conflict',
-  'github_config_rate_limited',
-  'github_config_unavailable',
-]);
-
-const RETRYABLE_GENERATE_CODES = new Set([
-  'github_generate_rate_limited',
-  'github_generate_timeout',
-  'github_generate_unavailable',
-]);
-
-const RETRYABLE_DEPLOY_CODES = new Set([
-  'github_deploy_url_unreachable',
-  'github_deploy_timeout',
-  'github_deploy_unavailable',
-]);
-
-/** Maps every provisioning error this queue can encounter to a retry decision. */
-export function classifyProvisioningError(error: unknown): ProvisioningErrorClassification {
-  if (error instanceof GithubConfigError) {
-    return { code: error.code, retryable: RETRYABLE_CONFIG_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
-  }
-  if (error instanceof GithubPagesError) {
-    return { code: error.code, retryable: RETRYABLE_PAGES_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
-  }
-  if (error instanceof GithubSyncError) {
-    return { code: error.code, retryable: RETRYABLE_SYNC_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
-  }
-  if (error instanceof GithubDeployError) {
-    // A build GitHub reports as errored for this exact commit will not fix
-    // itself; url-unreachable, the bounded build timeout, and a transient
-    // unavailable are all worth another pass.
-    return { code: error.code, retryable: RETRYABLE_DEPLOY_CODES.has(error.code), retryAfterSeconds: null };
-  }
-  if (error instanceof GithubGenerateError) {
-    return { code: error.code, retryable: RETRYABLE_GENERATE_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
-  }
-  if (error instanceof GithubAppAuthError) {
-    return { code: 'github_app_auth_failed', retryable: error.status >= 500 || error.status === 429, retryAfterSeconds: error.retryAfterSeconds };
-  }
-  // An unrecognized error (a network throw, a bug) is treated as transient.
-  // The per-step attempt ceiling still bounds it to a handful of tries
-  // before the job goes to dead_letter, so this can never retry forever.
-  return { code: 'provisioning_step_failed', retryable: true, retryAfterSeconds: null };
-}
 
 async function recordStepFailure(
   env: Pick<ProvisioningQueueEnv, 'JOBS' | 'PROVISIONING_QUEUE' | 'PROVISIONING_METRICS'>,

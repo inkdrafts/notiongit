@@ -155,6 +155,7 @@ export type NotionTemplateErrorCode =
   | 'notion_template_not_duplicated'
   | 'notion_template_root_invalid'
   | 'notion_template_root_unavailable'
+  | 'notion_template_root_unshared'
   | 'notion_template_root_empty'
   | 'notion_template_database_missing'
   | 'notion_template_database_ambiguous'
@@ -590,10 +591,12 @@ function missingRolesFor(identified: IdentifiedCandidate[]): TemplateDatabaseRol
  *   never guessed between.
  * - `notion_template_database_missing` (422): every child database was
  *   fetched and fingerprinted, and a role has no match.
- * - `notion_template_root_unavailable` (403): Notion rejected the token;
- *   (502): the root was still not visible after all attempts — right after
- *   duplication this is usually eventual consistency, otherwise the page is
- *   not shared with the connection.
+ * - `notion_template_root_unshared` (403): Notion rejected the token's access
+ *   to the root; the page is not shared with the connection, or access was
+ *   revoked.
+ * - `notion_template_root_unavailable` (502): the root was still not visible
+ *   after all attempts — right after duplication this is usually eventual
+ *   consistency.
  * - `notion_template_root_empty` (502): the root was reachable but showed no
  *   child databases after all attempts.
  * - `notion_template_unavailable` (502): transient provider failures kept
@@ -641,7 +644,7 @@ export async function resolveNotionTemplateDatabases(
 
     const walked = await walkTemplateDatabaseIds(accessToken, rootId, fetcher);
     if (walked.kind === 'forbidden') {
-      throw new NotionTemplateError('notion_template_root_unavailable', 403);
+      throw new NotionTemplateError('notion_template_root_unshared', 403);
     }
     if (walked.kind === 'root_missing') {
       pending = 'root_missing';
@@ -666,7 +669,7 @@ export async function resolveNotionTemplateDatabases(
       const fetched = await fetchTemplateDatabase(databaseId, accessToken, fetcher);
       if (fetched.kind === 'ok') identified.push(identifyTemplateDatabase(fetched.databaseId, fetched.database));
       else if (fetched.kind === 'forbidden') {
-        throw new NotionTemplateError('notion_template_root_unavailable', 403);
+        throw new NotionTemplateError('notion_template_root_unshared', 403);
       } else invisible += 1;
     }
 

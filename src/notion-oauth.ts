@@ -10,6 +10,7 @@
 import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import type { GithubActionsSecretsErrorCode } from './actions-secrets';
 import type { NotionTemplateErrorCode } from './notion-template';
+import { callbackFailure } from './failures';
 
 export const NOTION_AUTHORIZATION_URL = 'https://api.notion.com/v1/oauth/authorize';
 export const NOTION_TOKEN_URL = 'https://api.notion.com/v1/oauth/token';
@@ -435,19 +436,17 @@ export async function finishNotionCallback(
     // purpose, mirroring the `details` channel on the error path.
     return response({ ...summary, ...(details ?? {}) }, 202, clearCookieHeaders);
   } catch (error) {
+    const failure = callbackFailure(error, 'notion');
     emitProvisioningEvent(env, {
       type: 'consent_failed',
       jobId: payload.jobId,
       ts: Date.now(),
       provider: 'notion',
-      errorCode: error instanceof NotionOAuthError ? error.code : 'notion_unavailable',
+      errorCode: failure.code,
     });
-    if (error instanceof NotionOAuthError) {
-      const body: Record<string, unknown> = { error: error.code };
-      // Only non-secret schema metadata the continuation attached on purpose.
-      if (error.details) Object.assign(body, error.details);
-      return response(body, error.status, clearCookieHeaders);
-    }
-    return response({ error: 'notion_unavailable' }, 502, clearCookieHeaders);
+    const body: Record<string, unknown> = { error: failure.code };
+    // Only non-secret schema metadata the continuation attached on purpose.
+    if (failure.details) Object.assign(body, failure.details);
+    return response(body, failure.status, clearCookieHeaders);
   }
 }

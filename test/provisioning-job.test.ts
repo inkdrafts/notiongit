@@ -127,7 +127,6 @@ describe('isTerminalProvisioningStatus', () => {
     ['queued', false],
     ['running', false],
     ['succeeded', true],
-    ['failed', true],
     ['dead_letter', true],
   ] as const)('%s is terminal: %s', (status, terminal) => {
     expect(isTerminalProvisioningStatus(status)).toBe(terminal);
@@ -198,5 +197,25 @@ describe('KV persistence', () => {
     const job = createProvisioningJob(baseParams());
     await kv.put(provisioningJobKey(job.jobId), JSON.stringify({ ...job, version: 2 }));
     expect(await loadProvisioningJob(kv as unknown as KVNamespace, job.jobId)).toBeNull();
+  });
+
+  test('normalizes an unrecognized stored failure code to the taxonomy fallback, keeping the recorded retryability', async () => {
+    const kv = new MemoryKV();
+    const job = createProvisioningJob(baseParams());
+    const marked = {
+      ...job,
+      steps: {
+        ...job.steps,
+        configure_pages: {
+          ...job.steps.configure_pages,
+          lastError: { code: 'github_installation_gone', retryable: false },
+        },
+      },
+    };
+    await kv.put(provisioningJobKey(job.jobId), JSON.stringify(marked));
+
+    const loaded = await loadProvisioningJob(kv as unknown as KVNamespace, job.jobId);
+    expect(loaded?.steps.configure_pages.lastError).toEqual({ code: 'provisioning_step_failed', retryable: false });
+    expect(loaded?.steps.verify_repository.lastError).toBeNull();
   });
 });

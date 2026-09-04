@@ -10,6 +10,8 @@
  * returns.
  */
 
+import type { GithubFailureCode } from './failures';
+
 export interface GithubAppAuthEnv {
   GITHUB_APP_ID: string;
   GITHUB_APP_PRIVATE_KEY: string;
@@ -27,6 +29,8 @@ export interface GithubInstallationAccount {
 
 export class GithubAppAuthError extends Error {
   readonly status: number;
+  /** 429s and outages stay retryable in the queue; other 4xx mean the installation is gone for this app. */
+  readonly code: GithubFailureCode;
   /** Seconds GitHub asked the caller to wait, parsed from a 403/429
    * `Retry-After`; null when the failure carries no pacing instruction. */
   readonly retryAfterSeconds: number | null;
@@ -35,6 +39,7 @@ export class GithubAppAuthError extends Error {
     super('GitHub App request failed');
     this.name = 'GithubAppAuthError';
     this.status = status;
+    this.code = status === 429 ? 'github_rate_limited' : status >= 500 ? 'github_app_unavailable' : 'github_app_auth_failed';
     this.retryAfterSeconds = retryAfterSeconds;
   }
 }

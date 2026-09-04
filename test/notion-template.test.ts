@@ -409,7 +409,7 @@ describe('Notion template resolution', () => {
       resolveNotionTemplateDatabases(TOKEN, ROOT_DASHED, { fetcher: fake.fetcher, sleep: noSleep() }),
     );
 
-    expect(templateErrorCode(error)).toBe('notion_template_root_unavailable');
+    expect(templateErrorCode(error)).toBe('notion_template_root_unshared');
     expect((error as NotionTemplateError).status).toBe(403);
     expect(fake.childrenCallCount(ROOT_DASHED)).toBe(1);
   });

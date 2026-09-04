@@ -1,4 +1,4 @@
-import type { NotionOAuthErrorCode } from './notion-oauth';
+import type { ProvisioningFailureCode } from './failures';
 import type { ProvisioningStepError, ProvisioningStepName } from './provisioning-job';
 
 export type ProvisioningEventErrorCode = ProvisioningStepError['code'];
@@ -23,7 +23,8 @@ export interface ConsentCompletedEvent extends ProvisioningEventBase {
 export interface ConsentFailedEvent extends ProvisioningEventBase {
   type: 'consent_failed';
   provider: 'notion';
-  errorCode: NotionOAuthErrorCode;
+  /** Resolved through `callbackFailure`, so any taxonomy code can land here; the fallback is `notion_unavailable`. */
+  errorCode: ProvisioningFailureCode;
 }
 
 export interface JobQueuedEvent extends ProvisioningEventBase {
