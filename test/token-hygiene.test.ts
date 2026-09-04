@@ -23,10 +23,11 @@ import worker, {
   NotionOAuthError,
   provisioningJobKey,
   route,
-  saveNotionTemplateResolution,
   type Env,
+  type ProvisioningJob,
   type ProvisioningMessage,
 } from '../src/index';
+import { createProvisioningJob } from '../src/provisioning-job';
 
 // ---------------------------------------------------------------------------
 // Canaries. Every value is synthetic and unique so a leak anywhere names the
@@ -46,8 +47,12 @@ const INSTALLATION_TOKENS = Array.from(
   { length: 12 },
   (_, index) => `synthetic-installation-token-${index + 1}`,
 );
+// The Notion callback mints its own installation token to write the three
+// Actions secrets, distinct from every queue-phase mint.
+const SECRETS_INSTALLATION_TOKEN = 'synthetic-secrets-installation-token-0a5d92';
 const MALFORMED_JUNK = 'synthetic-queue-junk-6d3a95';
 
+const ACTIONS_PUBLIC_KEY = 'RwHQhIhFH1RaQJ+1iuPlhYHKQKw/fxFGmM1x3qxzygE=';
 const REDACTED_MARKER = '[redacted]';
 const GITHUB_STATE_PREFIX = 'github:oauth-state:';
 
@@ -62,6 +67,7 @@ const canaryValues = (): string[] => [
   NOTION_CLIENT_SECRET,
   WORKSPACE_ID,
   MALFORMED_JUNK,
+  SECRETS_INSTALLATION_TOKEN,
   ...INSTALLATION_TOKENS,
   THROWAWAY_PEM,
 ];
@@ -250,11 +256,16 @@ function scriptedFetch(handle: (request: Request) => Response | Promise<Response
   const calls: RecordedRequest[] = [];
   const fetcher: typeof fetch = async (input, init) => {
     const request = new Request(input, init);
+    // Read the recording off a clone: a handler that parses the body (the
+    // sealed Actions-secret PUTs) still needs an unconsumed Request.
+    const recording = request.clone();
     calls.push({
       method: request.method,
       url: request.url,
       authorization: request.headers.get('authorization'),
-      body: request.method === 'GET' || request.method === 'HEAD' ? null : await request.text(),
+      body: request.method === 'GET' || request.method === 'HEAD'
+        ? null
+        : await recording.text(),
     });
     return handle(request);
   };
@@ -454,49 +465,44 @@ async function canaryEnv(kv: RecordingKV, queue: RecordingQueue): Promise<Partia
   };
 }
 
-/** The validated-resolution fixture the GitHub journeys need in KV. */
-async function seedValidatedResolution(kv: RecordingKV, jobId: string): Promise<void> {
-  await saveNotionTemplateResolution(kv as unknown as KVNamespace, {
-    version: 1,
+/** Seeds the job the GitHub callback would have created, in awaiting_notion. */
+async function seedAwaitingNotionJob(kv: RecordingKV, jobId: string): Promise<ProvisioningJob> {
+  const job = createProvisioningJob({
     jobId,
-    resolution: {
-      pagesDatabaseId: PAGES_DB,
-      postsDatabaseId: POSTS_DB,
-      templateSchemaVersion: 1,
-      scannedDatabaseCount: 2,
-      pagesSchema: {
-        databaseId: PAGES_DB,
-        propertyTypes: {
-          Slug: 'rich_text', Type: 'select', 'Nav Order': 'number', 'Show in Nav': 'checkbox', Status: 'select',
-        },
-        optionNames: { Type: ['home', 'blog-list', 'blog', 'markdown'], Status: ['Draft', 'Published'] },
-      },
-      postsSchema: {
-        databaseId: POSTS_DB,
-        propertyTypes: { Slug: 'rich_text', 'Publish Date': 'date', Tags: 'multi_select', Status: 'select' },
-        optionNames: { Status: ['Draft', 'Published'] },
-      },
-      resolvedAt: Date.now(),
+    installationId: 123,
+    identity: { id: 42, login: 'alice', accountType: 'User' },
+    repository: { name: 'alice.github.io', url: 'https://alice.github.io', baseurl: '', kind: 'apex' },
+    generatedRepository: {
+      id: 1001,
+      fullName: 'alice/alice.github.io',
+      name: 'alice.github.io',
+      htmlUrl: 'https://github.com/alice/alice.github.io',
+      defaultBranch: 'main',
+      templateFullName: 'inkdrafts/notiongit-template',
+      templateHeadSha: 'template-head-sha',
+      templateHeadTreeSha: 'template-tree-sha',
+      headSha: null,
+      headTreeSha: null,
+      reused: false,
     },
+    now: 1_000,
   });
-  kv.reset();
+  await kv.put(provisioningJobKey(jobId), JSON.stringify(job), { expirationTtl: PROVISIONING_JOB_TTL_SECONDS });
+  return job;
 }
-
-// ---------------------------------------------------------------------------
-// J1 — Notion callback end-to-end through worker.fetch with the production
-// continuation: state record 600 -> 3600, resolution record 86400, the canary
-// token spent request-locally against Notion, nothing else leaving.
-// ---------------------------------------------------------------------------
 
 async function driveNotionCallback(options: {
   tokenEndpoint?: () => Response;
   extraPagesClone?: boolean;
   failResolutionSave?: () => Error;
-} = {}): Promise<Journey> {
+} = {}): Promise<Journey & { secretWrites: Array<{ name: string; encryptedValue: string }> }> {
   const kv = new RecordingKV();
   const queue = new RecordingQueue();
   const journey = emptyJourney(kv, queue);
   const env = await canaryEnv(kv, queue);
+  await seedAwaitingNotionJob(kv, NOTION_JOB_ID);
+  kv.reset();
+  const secretWrites: Array<{ name: string; encryptedValue: string }> = [];
   if (options.failResolutionSave) {
     const boom = options.failResolutionSave();
     env.JOBS = {
@@ -522,6 +528,19 @@ async function driveNotionCallback(options: {
     if (url.pathname === `/v1/databases/${PAGES_DB}`) return databaseResponse(PAGES_DB, pagesProperties());
     if (url.pathname === `/v1/databases/${POSTS_DB}`) return databaseResponse(POSTS_DB, postsProperties());
     if (url.pathname === `/v1/databases/${THIRD_DB}`) return databaseResponse(THIRD_DB, pagesProperties());
+    if (url.href === 'https://api.github.com/app/installations/123/access_tokens') {
+      return Response.json({ token: SECRETS_INSTALLATION_TOKEN });
+    }
+    if (url.pathname === '/repos/alice/alice.github.io/actions/secrets/public-key') {
+      return Response.json({ key_id: 'synthetic-actions-key-1', key: ACTIONS_PUBLIC_KEY });
+    }
+    if (request.method === 'PUT' && url.pathname.startsWith('/repos/alice/alice.github.io/actions/secrets/')) {
+      return (async () => {
+        const body = await request.json() as { encrypted_value: string };
+        secretWrites.push({ name: url.pathname.split('/').pop()!, encryptedValue: body.encrypted_value });
+        return new Response(null, { status: 204 });
+      })();
+    }
     throw new Error(`unexpected provider request: ${request.method} ${url.pathname}`);
   });
   journey.calls = calls;
@@ -552,14 +571,16 @@ async function driveNotionCallback(options: {
   } finally {
     globalThis.fetch = originalFetch;
   }
-  return journey;
+  return { ...journey, secretWrites };
 }
 
 describe('J1 Notion callback journey', () => {
-  test('happy path: the canary token authenticates only Notion calls; retention is 600/3600/86400; no other surface sees anything', async () => {
+  test('happy path: the canary token authenticates only Notion calls and is sealed into Actions secrets; retention is 600/3600/86400', async () => {
     const journey = await withCapturedConsole(async (recorder) => {
       const driven = await driveNotionCallback();
       assertJourneyClean(driven, recorder);
+      expect(recorder.funnelEventTypes()).toEqual(['consent_started', 'job_queued', 'consent_completed']);
+      expect(recorder.reportErrorTexts()).toEqual([]);
       return driven;
     });
 
@@ -570,11 +591,14 @@ describe('J1 Notion callback journey', () => {
       status: 'notion_authorized',
       job_id: NOTION_JOB_ID,
       template: { duplicated: true },
+      repository: { name: 'alice.github.io', html_url: 'https://github.com/alice/alice.github.io' },
+      site: { url: 'https://alice.github.io' },
     });
 
     // Positive flow: the canary Notion token genuinely authenticated the
-    // template-resolution calls, and the one-time code genuinely went to the
-    // token endpoint. The refresh token must reach no Authorization header.
+    // template-resolution calls, the one-time code genuinely went to the
+    // token endpoint, and the secrets write spent its own installation-token
+    // mint. The refresh token must reach no Authorization header.
     const exchange = journey.calls.find((call) => call.url === 'https://api.notion.com/v1/oauth/token');
     expect(exchange?.authorization).toMatch(/^Basic /u);
     expect(exchange?.body).toContain(ONE_TIME_CODE);
@@ -584,15 +608,31 @@ describe('J1 Notion callback journey', () => {
       expect(call.authorization).toBe(`Bearer ${NOTION_USER_TOKEN}`);
     }
     expect(journey.calls.some((call) => call.authorization === `Bearer ${NOTION_REFRESH_TOKEN}`)).toBe(false);
+    const secretPuts = journey.calls.filter((call) => call.method === 'PUT' && call.url.includes('/actions/secrets/'));
+    expect(secretPuts).toHaveLength(3);
+    for (const call of secretPuts) {
+      expect(call.authorization).toBe(`Bearer ${SECRETS_INSTALLATION_TOKEN}`);
+    }
+    expect(journey.secretWrites.map((write) => write.name).sort()).toEqual([
+      'NOTION_PAGES_DATABASE_ID',
+      'NOTION_POSTS_DATABASE_ID',
+      'NOTION_TOKEN',
+    ]);
 
-    // Retention: state pending 600s then consumed 3600s; resolution 86400s.
+    // The handoff happens here: the Notion callback is what enqueues the job.
+    expect(journey.queue.sent).toEqual([{ jobId: NOTION_JOB_ID }]);
+
+    // Retention: state pending 600s then consumed 3600s; resolution 86400s;
+    // every job write 86400s.
     const stateKeys = journey.kv.keysWithPrefix(NOTION_STATE_PREFIX);
     expect(stateKeys).toHaveLength(1);
     expect(journey.kv.ttlLog(stateKeys[0])).toEqual([600, 3600]);
     expect(journey.kv.ttlLog(`${NOTION_TEMPLATE_RESOLUTION_PREFIX}${NOTION_JOB_ID}`))
       .toEqual([NOTION_TEMPLATE_RESOLUTION_TTL_SECONDS]);
+    const jobTtls = journey.kv.ttlLog(provisioningJobKey(NOTION_JOB_ID));
+    expect(jobTtls.length).toBeGreaterThanOrEqual(2);
+    expect(jobTtls.every((ttl) => ttl === PROVISIONING_JOB_TTL_SECONDS)).toBe(true);
     expect(journey.kv.deletes).toEqual([]);
-    expect(journey.queue.sent).toEqual([]);
   });
 
   test('a provider 400 is a fixed, exact body and the provider response body is never echoed', async () => {
@@ -666,7 +706,6 @@ async function runGithubOnboarding(options: {
   const kv = new RecordingKV();
   const queue = new RecordingQueue();
   const journey: Journey & { env: Partial<Env> } = { ...emptyJourney(kv, queue), env: await canaryEnv(kv, queue) };
-  await seedValidatedResolution(kv, GITHUB_JOB_ID);
 
   const exchangeToken = options.exchangeToken ?? (() => Response.json({
     access_token: GITHUB_USER_TOKEN,
@@ -727,30 +766,78 @@ async function runGithubOnboarding(options: {
   return journey;
 }
 
+/**
+ * Continues a J2 journey through the Notion phase with the production
+ * continuation: template resolution, the sealed Actions-secret writes, and
+ * the queue handoff.
+ */
+async function runNotionOnboarding(
+  driven: Journey & { env: Partial<Env> },
+): Promise<Journey & { env: Partial<Env> }> {
+  const trackError = captureThrownErrors(driven);
+  const { calls, fetcher } = scriptedFetch((request) => {
+    const url = new URL(request.url);
+    if (url.href === 'https://api.notion.com/v1/oauth/token') return notionTokenResponse();
+    if (url.pathname === `/v1/blocks/${ROOT_DASHED}/children`) {
+      return childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')]);
+    }
+    if (url.pathname === `/v1/databases/${PAGES_DB}`) return databaseResponse(PAGES_DB, pagesProperties());
+    if (url.pathname === `/v1/databases/${POSTS_DB}`) return databaseResponse(POSTS_DB, postsProperties());
+    if (url.href === 'https://api.github.com/app/installations/123/access_tokens') {
+      return Response.json({ token: SECRETS_INSTALLATION_TOKEN });
+    }
+    if (url.pathname === '/repos/alice/alice.github.io/actions/secrets/public-key') {
+      return Response.json({ key_id: 'synthetic-actions-key-1', key: ACTIONS_PUBLIC_KEY });
+    }
+    if (request.method === 'PUT' && url.pathname.startsWith('/repos/alice/alice.github.io/actions/secrets/')) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`unexpected provider request: ${request.method} ${url.pathname}`);
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetcher;
+  try {
+    const begin = await worker.fetch!(
+      new Request(`https://example.com/connect/notion?job_id=${GITHUB_JOB_ID}`),
+      driven.env as Env,
+      FAKE_EXECUTION_CONTEXT as any,
+    );
+    await addResponse(driven, begin);
+    expect(begin.status).toBe(302);
+    const location = new URL(begin.headers.get('location')!);
+    const cookie = begin.headers.get('set-cookie')!.split(';', 1)[0];
+    const callback = await worker.fetch!(
+      new Request(
+        `https://example.com/auth/notion/callback?state=${encodeURIComponent(location.searchParams.get('state')!)}&code=${ONE_TIME_CODE}`,
+        { headers: { Cookie: cookie } },
+      ),
+      driven.env as Env,
+      FAKE_EXECUTION_CONTEXT as any,
+    );
+    await addResponse(driven, callback);
+  } catch (error) {
+    trackError(error);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  driven.calls.push(...calls);
+  return driven;
+}
+
+async function runFullOnboarding(): Promise<Journey & { env: Partial<Env> }> {
+  return runNotionOnboarding(await runGithubOnboarding());
+}
+
 describe('J2 GitHub callback journey', () => {
-  test('happy path: user token spent only on the synchronous calls; queue message is exactly {jobId}; retention 600/3600/86400', async () => {
+  test('happy path: user token spent only on the synchronous calls; the browser is sent on to Notion with nothing queued; retention 600/3600/86400', async () => {
     const journey = await withCapturedConsole(async (recorder) => {
       const driven = await runGithubOnboarding();
       const callback = driven.responses[1];
-      expect(callback.status).toBe(202);
-      expect(await callback.json()).toEqual({
-        ok: true,
-        status: 'provisioning',
-        job_id: GITHUB_JOB_ID,
-        installation_id: 123,
-        github: { id: 42, login: 'alice' },
-        repository: {
-          name: 'alice.github.io',
-          url: 'https://alice.github.io',
-          baseurl: '',
-          id: 1001,
-          html_url: 'https://github.com/alice/alice.github.io',
-          default_branch: 'main',
-        },
-      });
+      expect(callback.status).toBe(302);
+      expect(callback.headers.get('location'))
+        .toBe(`https://example.com/connect/notion?job_id=${GITHUB_JOB_ID}`);
       assertJourneyClean(driven, recorder);
-      expect(recorder.funnelEventTypes()).toEqual(['job_queued']);
-      expect(recorder.reportErrorTexts()).toEqual([]);
+      recorder.assertSilent();
       return driven;
     });
 
@@ -765,7 +852,12 @@ describe('J2 GitHub callback journey', () => {
     const exchange = journey.calls.find((call) => call.url === 'https://github.com/login/oauth/access_token');
     expect(exchange?.body).toContain(ONE_TIME_CODE);
 
-    expect(journey.queue.sent).toEqual([{ jobId: GITHUB_JOB_ID }]);
+    // Nothing is queued yet: the Notion callback writes the repository's
+    // Actions secrets and only then hands the job to the queue.
+    expect(journey.queue.sent).toEqual([]);
+    const job = await journey.kv.get<Record<string, any>>(provisioningJobKey(GITHUB_JOB_ID), 'json');
+    expect(job?.status).toBe('awaiting_notion');
+    expect(job?.data.notionSecretsWrittenAt).toBeNull();
 
     const stateKeys = journey.kv.keysWithPrefix(GITHUB_STATE_PREFIX);
     expect(stateKeys).toHaveLength(1);
@@ -886,8 +978,8 @@ function queuePhaseFetch(): {
 describe('J3 queue pipeline journey', () => {
   test('seven batches: each step spends its own fresh mint, the user token never reappears, every job write keeps the 24h TTL, zero deletes', async () => {
     const { journey, queueCalls, mintCount, analyticsPoints } = await withCapturedConsole(async (recorder) => {
-      const driven = await runGithubOnboarding();
-      expect(driven.responses[1].status).toBe(202);
+      const driven = await runFullOnboarding();
+      expect(driven.responses[3].status).toBe(202);
 
       const analyticsPoints: unknown[] = [];
       (driven.env as Record<string, unknown>).PROVISIONING_METRICS = {
@@ -946,7 +1038,9 @@ describe('J3 queue pipeline journey', () => {
     const ttls = journey.kv.ttlLog(jobKey);
     expect(ttls.length).toBeGreaterThanOrEqual(7);
     expect(ttls.every((ttl) => ttl === PROVISIONING_JOB_TTL_SECONDS)).toBe(true);
-    expect(journey.kv.deletes).toEqual([]);
+    // The one designed deletion: the throttle's account lease is released
+    // when the job succeeds. No token-hygiene record is ever deleted.
+    expect(journey.kv.deletes).toEqual(['github:account-lease:42']);
   });
 });
 
@@ -987,6 +1081,8 @@ describe('J4 error funnels', () => {
     const queue = new RecordingQueue();
     const journey = emptyJourney(kv, queue);
     const env = await canaryEnv(kv, queue);
+    await seedAwaitingNotionJob(kv, NOTION_JOB_ID);
+    kv.reset();
 
     await withCapturedConsole(async (recorder) => {
       const begin = await route(new Request(`https://staging.example/connect/notion?job_id=${NOTION_JOB_ID}`), env);
@@ -1078,6 +1174,8 @@ describe('J4 error funnels', () => {
     const queue = new RecordingQueue();
     const journey = emptyJourney(kv, queue);
     const env = await canaryEnv(kv, queue);
+    await seedAwaitingNotionJob(kv, NOTION_JOB_ID);
+    kv.reset();
 
     await withCapturedConsole(async (recorder) => {
       const begin = await route(new Request(`https://staging.example/connect/notion?job_id=${NOTION_JOB_ID}`), env);
@@ -1123,10 +1221,10 @@ describe('J4 error funnels', () => {
 // ---------------------------------------------------------------------------
 
 describe('J5 disconnect timeline journey', () => {
-  test('mint 404 dead-letters with lastError.code only; the terminal save refreshes the 24h TTL; zero deletes', async () => {
+  test('mint 404 dead-letters with lastError.code only; the terminal save refreshes the 24h TTL; only the lease is released', async () => {
     const journey = await withCapturedConsole(async (recorder) => {
-      const driven = await runGithubOnboarding();
-      expect(driven.responses[1].status).toBe(202);
+      const driven = await runFullOnboarding();
+      expect(driven.responses[3].status).toBe(202);
 
       const { fetcher } = scriptedFetch(() => new Response(null, { status: 404 }));
       const originalFetch = globalThis.fetch;
@@ -1140,7 +1238,9 @@ describe('J5 disconnect timeline journey', () => {
         globalThis.fetch = originalFetch;
       }
       assertJourneyClean(driven, recorder);
-      expect(recorder.funnelEventTypes()).toEqual(['job_queued', 'step_started', 'step_failed', 'job_dead_lettered']);
+      expect(recorder.funnelEventTypes()).toEqual([
+        'consent_started', 'job_queued', 'consent_completed', 'step_started', 'step_failed', 'job_dead_lettered',
+      ]);
       expect(recorder.reportErrorTexts()).toEqual([]);
       return driven;
     });
@@ -1156,7 +1256,7 @@ describe('J5 disconnect timeline journey', () => {
     expect(ttls.every((ttl) => ttl === PROVISIONING_JOB_TTL_SECONDS)).toBe(true);
     const stateKeys = journey.kv.keysWithPrefix(GITHUB_STATE_PREFIX);
     expect(journey.kv.ttlLog(stateKeys[0])).toEqual([600, 3600]);
-    expect(journey.kv.deletes).toEqual([]);
+    expect(journey.kv.deletes).toEqual(['github:account-lease:42']);
   });
 });
 

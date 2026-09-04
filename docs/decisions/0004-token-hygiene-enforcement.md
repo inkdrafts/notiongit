@@ -59,16 +59,18 @@ Three facts anchored the design:
    alert telemetry introduced by the observability work are the other
    sanctioned console producers; their payloads are closed typechecked
    allowlists of non-secret fields, and the canary suite scans them too.
-3. **TTL-only retention; the resolution record is never deleted.** No
-   `kv.delete`, no cron trigger, no delete endpoint, no scan. Every record
-   expires on the TTL documented in `docs/security-data-flow.md` §3.
-   Deleting `notion:template-resolution:{jobId}` at job completion is
-   explicitly prohibited: `hasValidatedNotionTemplate` (`src/index.ts:480`)
-   re-reads and revalidates that record whenever the same job id starts or
-   finishes a GitHub connection (`beginGithubInstall`, `finishGithubCallback`),
-   so it gates same-jobId reconnection and retry. A hygiene delete would
-   break real flows while removing nothing sensitive — the record holds
-   database IDs and property type names only.
+3. **TTL-only retention; token-hygiene records are never deleted.** No cron
+   trigger, no delete endpoint, no scan. Every token-hygiene record expires
+   on the TTL documented in `docs/security-data-flow.md` §3. The one
+   deliberate deletion is the throttle's account-lease record
+   (`github:account-lease:{accountId}`), released when a job reaches a
+   terminal status so a completed onboarding does not lock the account out
+   for a full lease TTL; it holds a job id and an expiry timestamp only.
+   `notion:template-resolution:{jobId}` is also never deleted: after the
+   GitHub-first reorder (ADR 0005) nothing reads it back — the continuation
+   re-resolves fresh on every Notion authorization — so the record is pure
+   non-secret audit trail that expires on its 24-hour TTL. A hygiene delete
+   would add machinery while removing nothing sensitive.
 4. **The invariant is enforced by a journey-driven canary suite plus static
    tripwires.** `test/token-hygiene.test.ts` drives the Notion callback, the
    GitHub callback, the full seven-step pipeline, the three error funnels,

@@ -22,6 +22,7 @@ import {
   type ProvisioningMessage,
 } from '../src/index';
 import worker from '../src/index';
+import { Secret } from '../src/secret';
 
 interface MockSequenceEntry {
   status: number;
@@ -1085,7 +1086,7 @@ function runContinuation(
 ): Promise<Record<string, unknown> | void> {
   return Promise.resolve(continueNotionOnboarding(env, { fetcher, sleep: async () => {} })({
     jobId: JOB_ID,
-    accessToken: NOTION_ACCESS_TOKEN,
+    accessToken: Secret.notionUserAccess(NOTION_ACCESS_TOKEN),
     duplicatedTemplateId,
   }));
 }

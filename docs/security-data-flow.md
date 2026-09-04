@@ -20,33 +20,40 @@ static tripwire that pins each claim.
 | GitHub user access token | GitHub token exchange (`exchangeGithubCode`) | Write-through: dies with the GitHub callback request | Everything except the GitHub API calls of that request |
 | Installation token | Minted per provisioning step (`createGithubInstallationToken`) | One queue message; discarded when the step returns | Everything except that step's GitHub API calls |
 | App JWT | Minted per App-API call from the private key | ~10 minutes; sent only as a Bearer header to GitHub | KV, queue, responses, logs |
-| Actions secret plaintexts | Would enter via `writeGithubActionsSecrets` (not yet wired, §7) | Sealed to the repository's public key inside one request | Everything except the sealed envelope body |
+| Installation token (Notion callback) | Minted once inside the Notion callback (`createGithubInstallationToken`) | One request; writes the three Actions secrets, then dies | Everything except that request's GitHub API calls |
+| Actions secret plaintexts | Enter via `writeGithubActionsSecrets` during the Notion callback (ADR 0005) | Sealed to the repository's public key inside the same request; the plaintexts are never stored | Everything except the sealed envelope body |
 
 Non-secret configuration (`GITHUB_APP_ID`, `GITHUB_APP_SLUG`, client IDs,
 API version pins) is public by design and may appear in responses and URLs.
 
 ## 2. Journey walkthroughs
 
-**Notion callback.** `GET /connect/notion` stores a signed-state record
-(pending, 10-minute TTL) and redirects to Notion's authorize URL with an
-HttpOnly state cookie. `GET /auth/notion/callback` validates state and cookie,
-rewrites the state record to `consumed` (60-minute replay TTL), exchanges the
-one-time code, and hands the resulting token to the production continuation
-**as a `Secret`** while still inside the request. The continuation resolves
-the duplicated template with that token and persists only the resulting
-database IDs and schema summaries. The token, refresh token, workspace ID,
-bot ID, and code are never written anywhere and are garbage when the request
-returns.
+Onboarding is GitHub-first (ADR 0005): the repository must exist before the
+Notion callback can write its Actions secrets.
 
-**GitHub callback.** `GET /connect/github` requires a valid template
-resolution for the job and stores a signed-state record. `GET
-/auth/github/callback` verifies state, exchanges the code, and spends the user
-token immediately on identity, installation, and repository generation —
-GitHub requires user-to-server authentication there, so this is the one step
-that cannot be deferred. It then persists the `ProvisioningJob` record
-(non-secret metadata only), rewrites the state record to `consumed`, enqueues
-`{ jobId }`, and responds 202. The user token and code are out of scope
-before the response is written.
+**GitHub callback.** `GET /connect/github` stores a signed-state record
+(pending, 10-minute TTL). `GET /auth/github/callback` verifies state, exchanges
+the code, and spends the user token immediately on identity, installation,
+and repository generation — GitHub requires user-to-server authentication
+there, so this is the one step that cannot be deferred. It then persists the
+`ProvisioningJob` record (non-secret metadata only, status `awaiting_notion`),
+rewrites the state record to `consumed` (60-minute replay TTL), and redirects
+the browser to `/connect/notion`. Nothing is queued yet. The user token and
+code are out of scope before the redirect is written.
+
+**Notion callback.** `GET /connect/notion` requires a job in `awaiting_notion`,
+stores a signed-state record, and redirects to Notion's authorize URL with an
+HttpOnly state cookie. `GET /auth/notion/callback` validates state and cookie,
+rewrites the state record to `consumed`, exchanges the one-time code, and
+hands the resulting token to the production continuation **as a `Secret`**
+while still inside the request. The continuation resolves the duplicated
+template with that token, persists only the resulting database IDs and schema
+summaries, mints one installation token, and seals `NOTION_TOKEN` plus the
+two database IDs into the repository's Actions secrets with a libsodium
+sealed box (the token is write-through: used and gone within this request).
+Only then does it enqueue `{ jobId }`, which is the job's transition to
+`queued`. The Notion token, refresh token, workspace ID, bot ID, and code are
+never written anywhere and are garbage when the request returns.
 
 **Queue pipeline.** Each queue message names a job; the consumer mints a fresh
 installation token from the job's durable, non-secret `installationId`,
@@ -55,15 +62,18 @@ handler returns. No token of any kind is part of durable state.
 
 ## 3. Retained state
 
-Every KV record the Worker writes, with every field. There is no other key
-shape, no scan, and no delete call in `src/`; removal is TTL-only.
+Every KV record the Worker writes, with every field. The only delete call in
+`src/` is the throttle's designed release of the account lease when a job
+reaches a terminal status (below); everything else is removal by TTL.
 
 | Key pattern | Record and fields | TTL | Written when |
 | --- | --- | --- | --- |
 | `github:oauth-state:{nonce}` | `GithubStateRecord`: `version` (1), `jobId`, `nonce`, `expiresAt`, `phase` (`pending` \| `setup_received` \| `consumed`), optional `installationId`, optional `identity {id, login, accountType}` | 600s as `pending`; 3600s from the `setup_received`/`consumed` write | GitHub connect/callback |
 | `notion:oauth-state:{nonce}` | `NotionStateRecord`: `version` (1), `jobId`, `nonce`, `expiresAt`, `phase` (`pending` \| `consumed`) | 600s as `pending`; 3600s from the `consumed` write | Notion connect/callback |
 | `notion:template-resolution:{jobId}` | `NotionTemplateResolutionRecord`: `version` (1), `jobId`, `resolution {pagesDatabaseId, postsDatabaseId, templateSchemaVersion, scannedDatabaseCount, pagesSchema {databaseId, propertyTypes, optionNames}, postsSchema {…}, resolvedAt}` | 86400s, single write, never rewritten or deleted (ADR 0004) | Successful Notion template resolution |
-| `github:onboarding-job:{jobId}` | `ProvisioningJob`: `version` (1), `jobId`, `installationId`, `identity {id, login, accountType}`, `status`, `steps {status, attempts, updatedAt, lastError {code, retryable} \| null}` per step, `data {repository {name, url, baseurl, kind}, generatedRepository {id, fullName, name, htmlUrl, defaultBranch, templateFullName, templateHeadSha, templateHeadTreeSha, headSha, headTreeSha, reused}, pages {status, url, htmlUrl, buildType, source, reused} \| null, sync {runId, htmlUrl, conclusion} \| null, syncDispatchMarker {excludedRunIds, dispatchedAtMs} \| null, deployment {commitSha, buildId, status, verifiedAt} \| null}`, `lock {owner, acquiredAt, expiresAt} \| null`, `createdAt`, `updatedAt`, `completedAt` | 86400s, rolling: refreshed by every write including the terminal one | GitHub callback and every queue advance |
+| `github:onboarding-job:{jobId}` | `ProvisioningJob`: `version` (1), `jobId`, `installationId`, `identity {id, login, accountType}`, `status`, `steps {status, attempts, updatedAt, lastError {code, retryable} \| null}` per step, `data {repository {name, url, baseurl, kind}, generatedRepository {id, fullName, name, htmlUrl, defaultBranch, templateFullName, templateHeadSha, templateHeadTreeSha, headSha, headTreeSha, reused}, pages {status, url, htmlUrl, buildType, source, reused} \| null, sync {runId, htmlUrl, conclusion} \| null, syncDispatchMarker {excludedRunIds, dispatchedAtMs} \| null, deployment {commitSha, buildId, status, verifiedAt} \| null}`, `lock {owner, acquiredAt, expiresAt} \| null`, `data.notionSecretsWrittenAt`, `createdAt`, `updatedAt`, `completedAt` | 86400s, rolling: refreshed by every write including the terminal one | GitHub callback and every queue advance |
+| `github:account-lease:{accountId}` | Throttle lease: `jobId`, `expiresAt` (epoch ms) | `PROVISIONING_LEASE_TTL_SECONDS` (default 1800s), renewed by each queue gate pass; **deleted** when the job reaches a terminal status | GitHub callback (acquire), queue steps (renew), terminal transition (release) |
+| `github:rate:global` | Global mutation budget counters | 7200s | Content-creating GitHub mutations (generate, and each queue gate pass) |
 
 Queue payloads are exactly `{ jobId }` — the record in KV is the sole source
 of truth, so a message carries nothing else.
@@ -113,7 +123,9 @@ of truth, so a message carries nothing else.
   fake metrics binding — and it fails if a journey passes vacuously,
   because each also asserts the canary genuinely flowed (the recorded
   provider `Authorization` headers). Per-write TTL logs pin the retention
-  table in §3; the journeys additionally assert zero delete operations.
+  table in §3; the journeys additionally assert that the only delete
+  operation is the throttle's designed account-lease release at a terminal
+  status.
   Console records are further pinned to the sanctioned producers: a
   journey fails if any console line is not a `[notiongit] …` reportError
   line or a structured funnel event. Two static tripwires hold the
@@ -127,16 +139,15 @@ Run `bun test test/token-hygiene.test.ts`.
 
 - **OAuth state records** expire by TTL (10 minutes pending, 60 minutes
   consumed) and are the only records that gate anything time-sensitive.
-- **Template resolution** expires 24 hours after the single write. It is
-  *not* deleted at job completion: `hasValidatedNotionTemplate`
-  (`src/index.ts:480`) re-reads and revalidates it when the same job id
-  reconnects GitHub (`beginGithubInstall` and `finishGithubCallback`), so a
-  retry or a setup-callback-before-OAuth-callback works without repeating the
-  Notion flow. Deleting it "for hygiene" would break those flows while
-  removing nothing sensitive — the record holds database IDs and property
-  type names only. To remove one early (e.g. a support request), use
-  `wrangler kv key delete` with the exact key; there is deliberately no
-  endpoint that does this.
+- **Template resolution** expires 24 hours after its write and is rewritten
+  by every Notion authorization. Nothing reads it back: the continuation
+  re-resolves the template fresh on each callback so a re-authorization can
+  never pair a new token with a previous duplicate's databases. It is kept
+  as a non-secret audit record of the schema validation, and it is *not*
+  deleted at job completion — deleting it "for hygiene" would add deletion
+  machinery while removing nothing sensitive. To remove one early (e.g. a
+  support request), use `wrangler kv key delete` with the exact key; there
+  is deliberately no endpoint that does this.
 - **Provisioning jobs** expire 24 hours after their last write, terminal ones
   included (the rolling TTL is refreshed by every save, so an active job
   never expires mid-flight, and a finished record — including its non-secret
@@ -173,13 +184,6 @@ Run `bun test test/token-hygiene.test.ts`.
 
 ## 8. Follow-ups
 
-- **`writeGithubActionsSecrets` wiring.** The Actions-secrets pipeline
-  (`actions-secrets.ts`) is built but not called: writing the sync workflow's
-  Notion token requires the token at queue-consumer time, i.e. a persistence
-  decision that would put a credential back into durable state. Until that
-  decision is made deliberately (encrypted at rest, or re-entering via a
-  fresh request), the sync workflow must be authorized some other way. Named
-  follow-up; do not wire it casually.
 - **Authenticated disconnect endpoint.** If early removal of a job's records
   is ever wanted as a product feature, it must be an authenticated endpoint,
   not a guessable-id delete. Until then, TTL expiry and manual
