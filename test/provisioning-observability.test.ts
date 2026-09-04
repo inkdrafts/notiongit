@@ -84,8 +84,9 @@ function generateThrowawayPrivateKey(): Promise<string> {
   return throwawayPrivateKey;
 }
 
+/** As the queue sees it: the Notion callback already wrote the secrets. */
 function freshJob(): ProvisioningJob {
-  return createProvisioningJob({
+  const job = createProvisioningJob({
     jobId: JOB_ID,
     installationId: 123,
     identity: { id: 42, login: 'alice', accountType: 'User' },
@@ -105,6 +106,7 @@ function freshJob(): ProvisioningJob {
     },
     now: 1_000,
   });
+  return { ...job, status: 'queued', data: { ...job.data, notionSecretsWrittenAt: 900 } };
 }
 
 function base64(content: string): string {

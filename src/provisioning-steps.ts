@@ -79,6 +79,9 @@ async function runConfigurePages(job: ProvisioningJob, ctx: StepRunnerContext): 
 }
 
 async function runDispatchSync(job: ProvisioningJob, ctx: StepRunnerContext): Promise<Partial<ProvisioningJobData>> {
+  // The sync workflow reads the three Actions secrets. Without them GitHub
+  // runs it anyway and reports success, so fail loudly instead.
+  if (!job.data.notionSecretsWrittenAt) throw new Error('dispatch_sync ran before Notion secrets were written');
   const fullName = job.data.generatedRepository.fullName;
   if (job.data.sync) return {};
 

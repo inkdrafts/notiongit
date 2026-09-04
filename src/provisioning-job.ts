@@ -63,7 +63,13 @@ export interface ProvisioningJobLock {
   expiresAt: number;
 }
 
-export type ProvisioningJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'dead_letter';
+export type ProvisioningJobStatus =
+  | 'awaiting_notion'
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'dead_letter';
 
 /**
  * Non-secret marker persisted before dispatching the Notion sync workflow.
@@ -97,6 +103,13 @@ export interface ProvisioningJobData {
   sync: NotionSyncProgress | null;
   syncDispatchMarker: SyncDispatchMarker | null;
   deployment: SiteDeploymentProgress | null;
+  /**
+   * When the repository's three Actions secrets were written by the Notion
+   * OAuth callback — a timestamp, never the values. Until it is set the job
+   * is not enqueued at all, so no step can reach `dispatch_sync` and record
+   * GitHub Actions' missing-credentials no-op as a success.
+   */
+  notionSecretsWrittenAt: number | null;
 }
 
 /** Structurally identical to `Env`'s `GithubIdentity`; duplicated here so this
@@ -152,7 +165,11 @@ export interface CreateProvisioningJobParams {
   now: number;
 }
 
-/** Build a fresh job record with every step `pending`, ready to persist and enqueue. */
+/**
+ * Build a fresh job record with every step `pending`. The job starts
+ * `awaiting_notion`: the Notion OAuth callback writes the Actions secrets and
+ * only then hands the job to the queue.
+ */
 export function createProvisioningJob(params: CreateProvisioningJobParams): ProvisioningJob {
   const steps = Object.fromEntries(
     PROVISIONING_STEP_ORDER.map((step) => [step, initialStepState(params.now)]),
@@ -163,7 +180,7 @@ export function createProvisioningJob(params: CreateProvisioningJobParams): Prov
     jobId: params.jobId,
     installationId: params.installationId,
     identity: params.identity,
-    status: 'queued',
+    status: 'awaiting_notion',
     steps,
     data: {
       repository: params.repository,
@@ -172,6 +189,7 @@ export function createProvisioningJob(params: CreateProvisioningJobParams): Prov
       sync: null,
       syncDispatchMarker: null,
       deployment: null,
+      notionSecretsWrittenAt: null,
     },
     lock: null,
     createdAt: params.now,

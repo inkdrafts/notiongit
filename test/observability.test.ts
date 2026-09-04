@@ -200,7 +200,8 @@ function canaryJob(attempts = 0): ProvisioningJob {
   job.steps.verify_repository.status = 'succeeded';
   job.steps.patch_config.status = 'succeeded';
   job.steps.configure_pages.attempts = attempts;
-  return job;
+  // As the queue sees it: the Notion callback already wrote the secrets.
+  return { ...job, status: 'queued', data: { ...job.data, notionSecretsWrittenAt: 900 } };
 }
 
 function pagesFetch(): typeof fetch {

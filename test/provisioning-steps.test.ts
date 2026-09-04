@@ -44,7 +44,7 @@ function makeJob(overrides: Partial<CreateProvisioningJobParams> = {}, dataOverr
     now: 5_000,
     ...overrides,
   });
-  return { ...job, data: { ...job.data, ...dataOverrides } };
+  return { ...job, data: { ...job.data, notionSecretsWrittenAt: 6_000, ...dataOverrides } };
 }
 
 function makeContext(fetcher: typeof fetch, overrides: Partial<StepRunnerContext> = {}): StepRunnerContext {
@@ -178,6 +178,12 @@ describe('runDispatchSync', () => {
     expect(dispatchCalls).toBe(0);
     expect(patch.sync).toEqual({ runId: 555, htmlUrl: 'https://github.com/alice/alice.github.io/actions/runs/555', conclusion: null });
     expect(patch.syncDispatchMarker).toBeNull();
+  });
+
+  test('refuses to run before the Notion secrets were written', async () => {
+    const job = makeJob({}, { notionSecretsWrittenAt: null });
+    await expect(PROVISIONING_STEP_HANDLERS.dispatch_sync(job, makeContext(unreachableFetch())))
+      .rejects.toThrow('dispatch_sync ran before Notion secrets were written');
   });
 
   test('is a no-op once a run is already recorded — duplicate delivery makes no request', async () => {
