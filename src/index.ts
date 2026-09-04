@@ -66,6 +66,8 @@ import {
   saveNotionTemplateResolution,
 } from './notion-template';
 import { LANDING_PAGE } from './landing-page';
+import { progressPageUrl, projectProvisioning } from './progress';
+import { progressPage } from './progress-page';
 import { Secret } from './secret';
 import { reportError } from './safe-serialize';
 export {
@@ -335,9 +337,31 @@ export type {
   NotionOAuthEnv,
   NotionOAuthErrorCode,
   NotionOAuthRouteOptions,
-  NotionOAuthSummary,
   NotionStatePayload,
 } from './notion-oauth';
+
+export {
+  progressPageUrl,
+  projectProvisioning,
+  PROGRESS_STAGE_ORDER,
+  PROGRESS_STAGE_REGISTRY,
+  STAGE_BY_STEP,
+} from './progress';
+export type {
+  ProgressSnapshot,
+  ProgressStageEntry,
+  ProgressStageId,
+  ProgressStageState,
+  ProgressStageView,
+  PublicProgress,
+} from './progress';
+
+export {
+  progressPage,
+  PROGRESS_POLL_BASE_INTERVAL_FLOOR,
+  PROGRESS_POLL_INTERVAL_MS,
+  PROGRESS_POLL_MAX_INTERVAL_MS,
+} from './progress-page';
 
 export {
   loadNotionTemplateResolution,
@@ -719,7 +743,7 @@ function assertUsablePersonalInstallation(
   return identity;
 }
 
-function authError(error: unknown): Response {
+function authError(error: unknown, request: Request): Response {
   if (error instanceof ProvisioningAdmissionRefusedError) {
     const status = error.code === 'github_account_attempt_limited' ? 429
       : error.code === 'github_identity_temporarily_denied' ? 423
@@ -741,9 +765,16 @@ function authError(error: unknown): Response {
     return json({ error: 'github_authorization_failed' }, 400);
   }
   if (error instanceof ProvisioningGateRefusedError) {
-    // A refused start is not a failure of the flow: the account already has
-    // its one provisioning in flight, or the app-wide mutation budget is
-    // spent. Both answers carry the same Retry-After contract GitHub uses.
+    // A refused start is not a failure of the flow. A double starter just
+    // OAuth'd as the account that holds the slot, so naming that job's
+    // progress page is a sound capability grant; a budget refusal names no
+    // job and keeps the Retry-After contract GitHub uses.
+    if (error.reason === 'account_busy' && error.activeJobId !== null) {
+      return new Response(null, {
+        status: 303,
+        headers: { Location: new URL(progressPageUrl(error.activeJobId), request.url).toString() },
+      });
+    }
     return json({
       error: error.reason === 'account_busy' ? 'github_provisioning_already_active' : 'github_rate_limited',
       retry_after_seconds: error.retryAfterSeconds,
@@ -976,7 +1007,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       return json({ status: 'awaiting_authorization', job_id: record.jobId }, 202);
     }
   } catch (error) {
-    return authError(error);
+    return authError(error, request);
   }
 }
 
@@ -1095,14 +1126,6 @@ export function continueNotionOnboarding(
       await saveProvisioningJob(env.JOBS, { ...handedOff, status: 'queued', updatedAt: queuedAt });
     }
     emitProvisioningEvent(env, { type: 'job_queued', jobId, ts: queuedAt });
-
-    return {
-      repository: {
-        name: ready.data.generatedRepository.name,
-        html_url: ready.data.generatedRepository.htmlUrl,
-      },
-      site: { url: ready.data.repository.url },
-    };
   };
 }
 
@@ -1135,6 +1158,23 @@ async function beginNotionForJob(request: Request, env: Partial<Env>): Promise<R
   return beginNotionAuthorization(request, env);
 }
 
+async function progressPageResponse(request: Request, env: Partial<Env>): Promise<Response> {
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get('job_id') ?? '';
+  const job = validJobId(jobId) && env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  // An absent, malformed, or unknown id renders the same missing page; only
+  // the status differs, so a bookmark of an expired job still reads as gone.
+  return html(progressPage(jobId, projectProvisioning(job, Date.now())), job ? 200 : 404);
+}
+
+async function progressStatusResponse(request: Request, env: Partial<Env>): Promise<Response> {
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get('job_id');
+  if (!jobId || !validJobId(jobId)) return json({ error: 'invalid_job_id' }, 400);
+  const job = env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  return json(projectProvisioning(job, Date.now()));
+}
+
 export function route(
   request: Request,
   env: Partial<Env> = {},
@@ -1156,6 +1196,14 @@ export function route(
 
   if (request.method === 'GET' && url.pathname === '/connect/notion') {
     return beginNotionForJob(request, env);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/progress') {
+    return progressPageResponse(request, env);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/progress/status') {
+    return progressStatusResponse(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/github/callback') {

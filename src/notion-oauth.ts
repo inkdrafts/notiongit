@@ -11,6 +11,7 @@ import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import type { GithubActionsSecretsErrorCode } from './actions-secrets';
 import type { NotionTemplateErrorCode } from './notion-template';
 import { callbackFailure, codedFailureCode } from './failures';
+import { progressPageUrl } from './progress';
 import { Secret } from './secret';
 import { redactValue, reportError } from './safe-serialize';
 import {
@@ -82,19 +83,12 @@ export interface NotionOAuthRouteOptions {
    * production handler (`continueNotionOnboarding` in `index.ts`) resolves
    * the duplicated template into database IDs, writes the repository's
    * Actions secrets, and hands the job to the provisioning queue; tests
-   * inject their own. Anything it returns must be non-secret: it is merged
-   * into the callback's success body.
+   * inject their own. Its return value is deliberately ignored — the browser
+   * continues on the progress page, so nothing is merged into a success body.
    */
   continueOnboarding?: NotionOAuthContinuationHandler;
   /** Injectable provider transport for tests and local development. */
   fetcher?: typeof fetch;
-}
-
-export interface NotionOAuthSummary {
-  readonly ok: true;
-  readonly status: 'notion_authorized';
-  readonly job_id: string;
-  readonly template: { duplicated: boolean };
 }
 
 export type NotionOAuthErrorCode =
@@ -456,7 +450,7 @@ export async function finishNotionCallback(
       accessToken: exchanged.accessToken,
       duplicatedTemplateId: exchanged.duplicatedTemplateId,
     };
-    const details = await options.continueOnboarding?.(continuation);
+    await options.continueOnboarding?.(continuation);
 
     emitProvisioningEvent(env, {
       type: 'consent_completed',
@@ -466,15 +460,16 @@ export async function finishNotionCallback(
       templateDuplicated: continuation.duplicatedTemplateId !== null,
     });
 
-    const summary: NotionOAuthSummary = {
-      ok: true,
-      status: 'notion_authorized',
-      job_id: payload.jobId,
-      template: { duplicated: continuation.duplicatedTemplateId !== null },
-    };
-    // Only the non-secret onboarding details the continuation returned on
-    // purpose, mirroring the `details` channel on the error path.
-    return response({ ...summary, ...(details ?? {}) }, 202, clearCookieHeaders);
+    // The browser must never sit on this single-use callback URL: the 303
+    // makes refresh, back, and forward re-request the progress page instead
+    // of replaying a consumed callback.
+    return new Response(null, {
+      status: 303,
+      headers: {
+        Location: new URL(progressPageUrl(payload.jobId), request.url).toString(),
+        ...clearCookieHeaders,
+      },
+    });
   } catch (error) {
     const failure = callbackFailure(error, 'notion');
     emitProvisioningEvent(env, {
@@ -484,6 +479,18 @@ export async function finishNotionCallback(
       provider: 'notion',
       errorCode: failure.code,
     });
+    // A handoff failure is not a dead end: the secrets are durable and the
+    // job is live, so the awaiting-Notion panel and its Connect-Notion link
+    // are the taxonomy's prescribed recovery.
+    if (failure.code === 'provisioning_handoff_failed') {
+      return new Response(null, {
+        status: 303,
+        headers: {
+          Location: new URL(progressPageUrl(payload.jobId), request.url).toString(),
+          ...clearCookieHeaders,
+        },
+      });
+    }
     const body: Record<string, unknown> = { error: failure.code };
     // Only non-secret schema metadata the continuation attached on purpose,
     // redacted on the way out so a future details field cannot smuggle a

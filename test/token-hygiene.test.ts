@@ -585,15 +585,9 @@ describe('J1 Notion callback journey', () => {
     });
 
     const callback = journey.responses[1];
-    expect(callback.status).toBe(202);
-    expect(await callback.json()).toEqual({
-      ok: true,
-      status: 'notion_authorized',
-      job_id: NOTION_JOB_ID,
-      template: { duplicated: true },
-      repository: { name: 'alice.github.io', html_url: 'https://github.com/alice/alice.github.io' },
-      site: { url: 'https://alice.github.io' },
-    });
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get('location')).toBe(`https://staging.example/progress?job_id=${NOTION_JOB_ID}`);
+    expect(await callback.text()).toBe('');
 
     // Positive flow: the canary Notion token genuinely authenticated the
     // template-resolution calls, the one-time code genuinely went to the
@@ -979,7 +973,7 @@ describe('J3 queue pipeline journey', () => {
   test('seven batches: each step spends its own fresh mint, the user token never reappears, every job write keeps the 24h TTL, zero deletes', async () => {
     const { journey, queueCalls, mintCount, analyticsPoints } = await withCapturedConsole(async (recorder) => {
       const driven = await runFullOnboarding();
-      expect(driven.responses[3].status).toBe(202);
+      expect(driven.responses[3].status).toBe(303);
 
       const analyticsPoints: unknown[] = [];
       (driven.env as Record<string, unknown>).PROVISIONING_METRICS = {
@@ -1224,7 +1218,7 @@ describe('J5 disconnect timeline journey', () => {
   test('mint 404 dead-letters with lastError.code only; the terminal save refreshes the 24h TTL; only the lease is released', async () => {
     const journey = await withCapturedConsole(async (recorder) => {
       const driven = await runFullOnboarding();
-      expect(driven.responses[3].status).toBe(202);
+      expect(driven.responses[3].status).toBe(303);
 
       const { fetcher } = scriptedFetch(() => new Response(null, { status: 404 }));
       const originalFetch = globalThis.fetch;
@@ -1257,6 +1251,53 @@ describe('J5 disconnect timeline journey', () => {
     const stateKeys = journey.kv.keysWithPrefix(GITHUB_STATE_PREFIX);
     expect(journey.kv.ttlLog(stateKeys[0])).toEqual([600, 3600]);
     expect(journey.kv.deletes).toEqual(['github:account-lease:42']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// J6 — the progress routes: canaries planted on record fields the projection
+// must never surface (identity login, sync run URL, lock owner) stay absent
+// from both responses, and a read performs zero writes and zero sends.
+// ---------------------------------------------------------------------------
+
+describe('J6 progress route journey', () => {
+  test('page and status expose only the safe projection and write nothing', async () => {
+    const kv = new RecordingKV();
+    const queue = new RecordingQueue();
+    const journey = emptyJourney(kv, queue);
+    const env = await canaryEnv(kv, queue);
+    const job = await seedAwaitingNotionJob(kv, NOTION_JOB_ID);
+    await kv.put(provisioningJobKey(NOTION_JOB_ID), JSON.stringify({
+      ...job,
+      identity: { ...job.identity, login: NOTION_USER_TOKEN },
+      lock: { owner: MALFORMED_JUNK, acquiredAt: 1, expiresAt: 2 },
+      data: {
+        ...job.data,
+        notionSecretsWrittenAt: 3,
+        sync: { runId: 4, htmlUrl: ONE_TIME_CODE, conclusion: null },
+      },
+    }), { expirationTtl: PROVISIONING_JOB_TTL_SECONDS });
+    kv.reset();
+
+    await withCapturedConsole(async (recorder) => {
+      const page = await route(new Request(`https://staging.example/progress?job_id=${NOTION_JOB_ID}`), env);
+      await addResponse(journey, page);
+      const status = await route(new Request(`https://staging.example/progress/status?job_id=${NOTION_JOB_ID}`), env);
+      await addResponse(journey, status);
+      assertJourneyClean(journey, recorder);
+      recorder.assertSilent();
+      return journey;
+    });
+
+    const page = journey.responses[0];
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain('<h1 id="progress-heading">Connect Notion to finish setup</h1>');
+    const status = journey.responses[1];
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({ progress: { status: 'awaiting_notion' } });
+    expect(kv.writes).toEqual([]);
+    expect(kv.deletes).toEqual([]);
+    expect(queue.sent).toEqual([]);
   });
 });
 
