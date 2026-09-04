@@ -138,4 +138,40 @@ describe('patchRepositoryConfig', () => {
       status: 409,
     } satisfies Partial<GithubConfigError>);
   });
+
+  test.each([
+    ['429 without retry-after', 429, {}, null],
+    ['403 with retry-after', 403, { 'retry-after': '42' }, 42],
+    ['429 with retry-after', 429, { 'retry-after': '7' }, 7],
+  ])('%s is a distinct, resumable config rate limit', async (_name, status, headers, retryAfter) => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = new Request(input, init);
+      return request.method === 'GET'
+        ? fileResponse(ORIGINAL_CONFIG, 'sha')
+        : new Response(null, { status, headers });
+    };
+
+    await expect(patchRepositoryConfig(
+      TOKEN,
+      'alice/alice.github.io',
+      repositoryDestination('alice', 'alice.github.io'),
+      { fetcher },
+    )).rejects.toMatchObject({ code: 'github_config_rate_limited', status: 429, retryAfterSeconds: retryAfter });
+  });
+
+  test('a 403 without retry-after stays an unavailable failure', async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = new Request(input, init);
+      return request.method === 'GET'
+        ? fileResponse(ORIGINAL_CONFIG, 'sha')
+        : new Response(null, { status: 403 });
+    };
+
+    await expect(patchRepositoryConfig(
+      TOKEN,
+      'alice/alice.github.io',
+      repositoryDestination('alice', 'alice.github.io'),
+      { fetcher },
+    )).rejects.toMatchObject({ code: 'github_config_unavailable', status: 403 });
+  });
 });

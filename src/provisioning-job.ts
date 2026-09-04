@@ -19,6 +19,13 @@ export const PROVISIONING_JOB_VERSION = 1;
 export const PROVISIONING_JOB_TTL_SECONDS = 24 * 60 * 60;
 export const PROVISIONING_JOB_PREFIX = 'github:onboarding-job:';
 export const PROVISIONING_STEP_MAX_ATTEMPTS = 5;
+/**
+ * Attempt ceiling for failures that carry GitHub's own Retry-After. Honoring
+ * the provider's pacing must not dead-letter the job through the regular
+ * five-attempt ceiling, so rate-limited attempts get their own, much larger
+ * bound before the job gives up.
+ */
+export const PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS = 24;
 export const PROVISIONING_LOCK_TTL_MS = 5 * 60 * 1000;
 export const PROVISIONING_LOCK_RETRY_DELAY_SECONDS = 30;
 /** Short backoff for redelivery after a step succeeded but handing the
@@ -64,7 +71,25 @@ export interface ProvisioningJobLock {
   expiresAt: number;
 }
 
-export type ProvisioningJobStatus = 'queued' | 'running' | 'succeeded' | 'dead_letter';
+/**
+ * Non-secret breadcrumb that a delivery was throttled rather than failed:
+ * reason and time only — never identity, provider text, or a token. A wait
+ * is not an error, so `lastError` stays reserved for failures.
+ */
+export interface ProvisioningJobWait {
+  reason: 'global_throttled';
+  /** Epoch ms after which the next delivery should re-evaluate; null re-evaluates now. */
+  untilMs: number | null;
+  updatedAt: number;
+}
+
+export type ProvisioningJobStatus =
+  | 'awaiting_notion'
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'dead_letter';
 
 /**
  * Non-secret marker persisted before dispatching the Notion sync workflow.
@@ -98,6 +123,13 @@ export interface ProvisioningJobData {
   sync: NotionSyncProgress | null;
   syncDispatchMarker: SyncDispatchMarker | null;
   deployment: SiteDeploymentProgress | null;
+  /**
+   * When the repository's three Actions secrets were written by the Notion
+   * OAuth callback — a timestamp, never the values. Until it is set the job
+   * is not enqueued at all, so no step can reach `dispatch_sync` and record
+   * GitHub Actions' missing-credentials no-op as a success.
+   */
+  notionSecretsWrittenAt: number | null;
 }
 
 /** Structurally identical to `Env`'s `GithubIdentity`; duplicated here so this
@@ -117,6 +149,10 @@ export interface ProvisioningJob {
   steps: Record<ProvisioningStepName, ProvisioningStepState>;
   data: ProvisioningJobData;
   lock: ProvisioningJobLock | null;
+  /** Set while the job is parked behind the global throttle; cleared when
+   * the step next books and on every terminal save, so a breadcrumb never
+   * outlives the stall it describes. Absent in pre-throttle records. */
+  wait: ProvisioningJobWait | null;
   createdAt: number;
   updatedAt: number;
   completedAt: number | null;
@@ -127,7 +163,7 @@ export function provisioningJobKey(jobId: string): string {
 }
 
 export function isTerminalProvisioningStatus(status: ProvisioningJobStatus): boolean {
-  return status === 'succeeded' || status === 'dead_letter';
+  return status === 'succeeded' || status === 'failed' || status === 'dead_letter';
 }
 
 /** The first step that has not yet succeeded, or `null` once every step has. */
@@ -153,7 +189,11 @@ export interface CreateProvisioningJobParams {
   now: number;
 }
 
-/** Build a fresh job record with every step `pending`, ready to persist and enqueue. */
+/**
+ * Build a fresh job record with every step `pending`. The job starts
+ * `awaiting_notion`: the Notion OAuth callback writes the Actions secrets and
+ * only then hands the job to the queue.
+ */
 export function createProvisioningJob(params: CreateProvisioningJobParams): ProvisioningJob {
   const steps = Object.fromEntries(
     PROVISIONING_STEP_ORDER.map((step) => [step, initialStepState(params.now)]),
@@ -164,7 +204,7 @@ export function createProvisioningJob(params: CreateProvisioningJobParams): Prov
     jobId: params.jobId,
     installationId: params.installationId,
     identity: params.identity,
-    status: 'queued',
+    status: 'awaiting_notion',
     steps,
     data: {
       repository: params.repository,
@@ -173,8 +213,10 @@ export function createProvisioningJob(params: CreateProvisioningJobParams): Prov
       sync: null,
       syncDispatchMarker: null,
       deployment: null,
+      notionSecretsWrittenAt: null,
     },
     lock: null,
+    wait: null,
     createdAt: params.now,
     updatedAt: params.now,
     completedAt: null,
@@ -203,7 +245,9 @@ function sanitizedStepErrors(job: ProvisioningJob): ProvisioningJob['steps'] {
 export async function loadProvisioningJob(kv: KVNamespace, jobId: string): Promise<ProvisioningJob | null> {
   const job = await kv.get<ProvisioningJob>(provisioningJobKey(jobId), 'json');
   if (!job || job.version !== PROVISIONING_JOB_VERSION) return null;
-  return { ...job, steps: sanitizedStepErrors(job) };
+  // Records written before the throttle existed carry no `wait`; the version
+  // stays 1 because the 24h TTL drains them without a migration.
+  return { ...job, steps: sanitizedStepErrors(job), wait: job.wait ?? null };
 }
 
 /** Persist a job with the same rolling TTL used everywhere else in this project — the

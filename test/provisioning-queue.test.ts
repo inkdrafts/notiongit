@@ -10,7 +10,9 @@ import {
   loadProvisioningJob,
   saveProvisioningJob,
   tryAcquireProvisioningLock,
+  PROVISIONING_JOB_PREFIX,
   PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
+  PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS,
   PROVISIONING_STEP_MAX_ATTEMPTS,
   type CreateProvisioningJobParams,
   type ProvisioningJob,
@@ -21,6 +23,7 @@ import { GithubSyncError } from '../src/notion-sync';
 import { GithubDeployError } from '../src/site-deployment';
 import { GithubGenerateError } from '../src/repository-generation';
 import { GithubAppAuthError } from '../src/github-app-auth';
+import { accountLeaseKey, GLOBAL_RATE_KEY, type AccountLease, type GlobalRateState } from '../src/provisioning-throttle';
 
 class MemoryKV {
   private values = new Map<string, string>();
@@ -38,9 +41,11 @@ class MemoryKV {
 
 class MemoryQueue<T> {
   readonly sent: T[] = [];
+  readonly sendOptions: Array<{ delaySeconds?: number } | null> = [];
 
-  async send(message: T): Promise<void> {
+  async send(message: T, options?: { delaySeconds?: number }): Promise<void> {
     this.sent.push(message);
+    this.sendOptions.push(options ?? null);
   }
 
   async sendBatch(): Promise<void> {
@@ -91,7 +96,13 @@ function makeJob(overrides: Partial<CreateProvisioningJobParams> = {}, dataOverr
     now: 1_000,
     ...overrides,
   });
-  return { ...job, data: { ...job.data, ...dataOverrides } };
+  // The queue only ever sees a job the Notion callback already finished with:
+  // secrets written, status flipped off `awaiting_notion`.
+  return {
+    ...job,
+    status: 'queued',
+    data: { ...job.data, notionSecretsWrittenAt: 900, ...dataOverrides },
+  };
 }
 
 /** A job already through `verify_repository` and `patch_config`, ready for `configure_pages`. */
@@ -200,6 +211,16 @@ describe('classifyProvisioningError', () => {
   test('retries a rate-limited Pages call and passes through its retry-after', () => {
     const classification = classifyProvisioningError(new GithubPagesError('github_pages_rate_limited', 429, 42));
     expect(classification).toEqual({ code: 'github_pages_rate_limited', retryable: true, retryAfterSeconds: 42 });
+  });
+
+  test('retries a rate-limited config patch and passes through its retry-after', () => {
+    expect(classifyProvisioningError(new GithubConfigError('github_config_rate_limited', 429, 90)))
+      .toEqual({ code: 'github_config_rate_limited', retryable: true, retryAfterSeconds: 90 });
+  });
+
+  test('passes an app-auth 429 retry-after through', () => {
+    expect(classifyProvisioningError(new GithubAppAuthError(429, 45)))
+      .toEqual({ code: 'github_rate_limited', retryable: true, retryAfterSeconds: 45 });
   });
 
   test('dead-letters a permission-denied Pages call', () => {
@@ -325,6 +346,20 @@ describe('processProvisioningMessage', () => {
     expect(job).toEqual(finished);
   });
 
+  test('waits instead of running a job whose Notion secrets were never written', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    const awaitingNotion: ProvisioningJob = {
+      ...makeJob({}, { notionSecretsWrittenAt: null }),
+      status: 'awaiting_notion',
+    };
+    await saveProvisioningJob(env.JOBS, awaitingNotion);
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher: unreachableFetch() });
+    expect(outcome).toEqual({ outcome: 'retry', delaySeconds: PROVISIONING_LOCK_RETRY_DELAY_SECONDS });
+    expect(await loadProvisioningJob(env.JOBS, 'job-1')).toEqual(awaitingNotion);
+  });
+
   test('a job dead-lettered by a prior attempt is left untouched on redelivery', async () => {
     const kv = new MemoryKV();
     const env = await testEnv(kv);
@@ -378,13 +413,29 @@ describe('processProvisioningMessage', () => {
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
-    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000 });
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 });
     expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 30 });
     const job = await loadProvisioningJob(env.JOBS, 'job-1');
     expect(job?.status).toBe('queued');
     expect(job?.lock).toBeNull();
     expect(job?.steps.configure_pages).toMatchObject({ status: 'pending', attempts: 1 });
     expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_pages_unavailable', retryable: true });
+  });
+
+  test('a retryable failure carries bounded jitter from the injected rng', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/pages') return new Response(null, { status: 503 });
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    // 30s base backoff + floor(0.5 · 30 · 0.25) of jitter.
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0.5 });
+    expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 33 });
   });
 
   test('an ambiguous dispatch failure keeps the persisted marker, so the retry correlates instead of dispatching again', async () => {
@@ -426,7 +477,7 @@ describe('processProvisioningMessage', () => {
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
-    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 2_000, lockOwner: () => 'attempt-1' });
+    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 2_000, lockOwner: () => 'attempt-1', rng: () => 0 });
     expect(first).toEqual({ outcome: 'retry', delaySeconds: 30 });
 
     const afterFailure = await loadProvisioningJob(env.JOBS, 'job-1');
@@ -577,7 +628,7 @@ describe('processProvisioningMessage', () => {
     // finds a matching run in time and times out — a retryable failure that
     // happens strictly after runDispatchSync's own successful pre-dispatch
     // marker write, distinct from the POST itself failing.
-    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 8_000 });
+    const first = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 8_000, rng: () => 0 });
     expect(first).toEqual({ outcome: 'retry', delaySeconds: 30 });
     expect(dispatchCalls).toBe(1);
     const afterFailure = await loadProvisioningJob(env.JOBS, 'job-1');
@@ -641,19 +692,23 @@ describe('processProvisioningMessage', () => {
     await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
     const { fetcher, calls } = pipelineFetch();
 
-    // Fail exactly the third KV put: the saves per delivery are the locked
-    // record, the in-progress record, then the completed result.
-    let puts = 0;
+    // Fail exactly the completed-result save: the job-record writes per
+    // delivery are the locked record, the in-progress record, then the
+    // completed result. The gate's lease and counter writes carry other key
+    // prefixes and don't count.
+    let jobPuts = 0;
     const flakyKv = {
       get: kv.get.bind(kv),
       put: async (key: string, value: string, options?: unknown) => {
-        puts += 1;
-        if (puts === 3) throw new Error('kv write blip');
+        if (key.startsWith(PROVISIONING_JOB_PREFIX)) {
+          jobPuts += 1;
+          if (jobPuts === 3) throw new Error('kv write blip');
+        }
         return kv.put(key, value, options as never);
       },
     } as unknown as KVNamespace;
 
-    const outcome = await processProvisioningMessage('job-1', { ...env, JOBS: flakyKv }, { fetcher, sleep: async () => {}, now: () => 15_000 });
+    const outcome = await processProvisioningMessage('job-1', { ...env, JOBS: flakyKv }, { fetcher, sleep: async () => {}, now: () => 15_000, rng: () => 0 });
     expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 30 });
 
     // The success was never durable, so the standard failure path applies:
@@ -789,5 +844,248 @@ describe('processProvisioningMessage', () => {
     expect(stored?.status).toBe('dead_letter');
     expect(stored?.steps.await_deploy_build.lastError).toEqual({ code: 'github_deploy_build_failed', retryable: false });
     expect(queue.sent).toEqual([]);
+  });
+
+  test('a rate-limited step failure rides a fresh delayed message instead of the platform retry', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        return new Response(null, { status: 429, headers: { 'retry-after': '120' } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 });
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
+    expect(queue.sendOptions[0]).toEqual({ delaySeconds: 120 });
+
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('queued');
+    expect(job?.lock).toBeNull();
+    expect(job?.steps.configure_pages).toMatchObject({ status: 'pending', attempts: 1 });
+    expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_pages_rate_limited', retryable: true });
+  });
+
+  test('repeated rate-limited failures bypass the five-attempt ceiling and dead-letter only at 24', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        return new Response(null, { status: 403, headers: { 'retry-after': '60' } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const runtime = { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 };
+    for (let attempt = 1; attempt < PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS; attempt += 1) {
+      const outcome = await processProvisioningMessage('job-1', env, runtime);
+      expect(outcome).toEqual({ outcome: 'acked' });
+      const job = await loadProvisioningJob(env.JOBS, 'job-1');
+      expect(job?.status).toBe('queued');
+      expect(job?.steps.configure_pages.attempts).toBe(attempt);
+    }
+
+    const final = await processProvisioningMessage('job-1', env, runtime);
+    expect(final).toEqual({ outcome: 'acked' });
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('dead_letter');
+    expect(job?.steps.configure_pages.attempts).toBe(PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS);
+    expect(job?.completedAt).toBe(4_000);
+  });
+
+  test('a rate-limited retry whose fresh send fails falls back to a platform retry with the same delay', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const brokenQueue: Queue<{ jobId: string }> = {
+      send: async () => { throw new Error('queue outage'); },
+    } as unknown as Queue<{ jobId: string }>;
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/pages') {
+        return new Response(null, { status: 429, headers: { 'retry-after': '90' } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const outcome = await processProvisioningMessage(
+      'job-1',
+      { ...env, PROVISIONING_QUEUE: brokenQueue },
+      { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 },
+    );
+    expect(outcome).toEqual({ outcome: 'retry', delaySeconds: 90 });
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('queued');
+  });
+
+  test('a rate-limited installation-token mint rides the fresh-message path too', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    const fetcher = (async () => new Response(null, { status: 403, headers: { 'retry-after': '45' } })) as typeof fetch;
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 4_000, rng: () => 0 });
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
+    expect(queue.sendOptions[0]).toEqual({ delaySeconds: 45 });
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_rate_limited', retryable: true });
+  });
+});
+
+/** Seeds the global rate counter as exhausted for the fixed window that
+ * contains `nowMs`, so every budgeted gate pass is refused. */
+async function exhaustGlobalBudget(kv: MemoryKV, nowMs: number): Promise<void> {
+  const state: GlobalRateState = {
+    version: 1,
+    minuteBucket: Math.floor(nowMs / 60_000),
+    hourBucket: Math.floor(nowMs / 3_600_000),
+    minuteCount: 30,
+    hourCount: 240,
+  };
+  await kv.put(GLOBAL_RATE_KEY, JSON.stringify(state), { expirationTtl: 7200 });
+}
+
+async function putAccountLease(kv: MemoryKV, lease: AccountLease, accountId = 42): Promise<void> {
+  await kv.put(accountLeaseKey(accountId), JSON.stringify(lease), { expirationTtl: 1800 });
+}
+
+describe('provisioning throttle gate', () => {
+  test('a gate wait parks the job queued with a breadcrumb and a fresh delayed message, minting no token', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    await exhaustGlobalBudget(kv, 18_000);
+
+    const outcome = await processProvisioningMessage(
+      'job-1',
+      env,
+      { fetcher: unreachableFetch(), sleep: async () => {}, now: () => 18_000, rng: () => 0 },
+    );
+
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(queue.sent).toEqual([{ jobId: 'job-1' }]);
+    expect(queue.sendOptions[0]?.delaySeconds).toBeGreaterThanOrEqual(1);
+
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('queued');
+    expect(job?.lock).toBeNull();
+    expect(job?.steps.configure_pages.attempts).toBe(0);
+    expect(job?.steps.configure_pages.status).toBe('pending');
+    expect(job?.wait?.reason).toBe('global_throttled');
+    expect(job?.wait?.updatedAt).toBe(18_000);
+    expect(job?.wait?.untilMs).toBe(18_000 + queue.sendOptions[0]!.delaySeconds! * 1000);
+  });
+
+  test('five consecutive gate refusals never consume an attempt nor dead-letter', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    await exhaustGlobalBudget(kv, 18_000);
+    const runtime = { fetcher: unreachableFetch(), sleep: async () => {}, now: () => 18_000, rng: () => 0 };
+
+    for (let pass = 0; pass < 5; pass += 1) {
+      expect(await processProvisioningMessage('job-1', env, runtime)).toEqual({ outcome: 'acked' });
+    }
+
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('queued');
+    expect(job?.steps.configure_pages.attempts).toBe(0);
+    expect(queue.sent).toHaveLength(5);
+  });
+
+  test('the wait breadcrumb clears when the step next books', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    await exhaustGlobalBudget(kv, 18_000);
+    const gatedRuntime = { fetcher: unreachableFetch(), sleep: async () => {}, now: () => 18_000, rng: () => 0 };
+
+    await processProvisioningMessage('job-1', env, gatedRuntime);
+    expect((await loadProvisioningJob(env.JOBS, 'job-1'))?.wait).not.toBeNull();
+
+    // The window rolls: the next delivery re-evaluates and books the step.
+    await kv.put(GLOBAL_RATE_KEY, JSON.stringify({
+      version: 1,
+      minuteBucket: Math.floor(78_000 / 60_000),
+      hourBucket: Math.floor(78_000 / 3_600_000),
+      minuteCount: 0,
+      hourCount: 0,
+    }), { expirationTtl: 7200 });
+    const { fetcher, calls } = pipelineFetch();
+    const outcome = await processProvisioningMessage(
+      'job-1',
+      env,
+      { fetcher, sleep: async () => {}, now: () => 78_000, rng: () => 0 },
+    );
+
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(calls.mint_token).toBe(1);
+    expect(calls.configure_pages).toBe(1);
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.steps.configure_pages.status).toBe('succeeded');
+    expect(job?.wait).toBeNull();
+  });
+
+  test('a foreign live lease supersedes the job terminally without touching a provider', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, jobAtConfigurePages());
+    await putAccountLease(kv, { version: 1, jobId: 'job-0', expiresAt: 30_000 });
+
+    const outcome = await processProvisioningMessage(
+      'job-1',
+      env,
+      { fetcher: unreachableFetch(), sleep: async () => {}, now: () => 18_000, rng: () => 0 },
+    );
+
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(queue.sent).toEqual([]);
+    const job = await loadProvisioningJob(env.JOBS, 'job-1');
+    expect(job?.status).toBe('failed');
+    expect(job?.completedAt).toBe(18_000);
+    expect(job?.steps.configure_pages.lastError).toEqual({ code: 'github_provisioning_superseded', retryable: false });
+    // The live owner keeps the lease; the superseded duplicate never steals it.
+    expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-0' });
+  });
+
+  test('a read step renews the account lease without consuming budget', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<{ jobId: string }>();
+    const env = await testEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS, makeJob());
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === 'https://api.github.com/app/installations/123/access_tokens') return Response.json({ token: 'installation-token' });
+      if (url === 'https://api.github.com/repos/alice/alice.github.io') {
+        return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
+      }
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
+        return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher, sleep: async () => {}, now: () => 18_000, rng: () => 0 });
+
+    expect(outcome).toEqual({ outcome: 'acked' });
+    expect(await kv.get(GLOBAL_RATE_KEY)).toBeNull();
+    const lease = JSON.parse(await kv.get(accountLeaseKey(42)) as string) as AccountLease;
+    expect(lease).toMatchObject({ version: 1, jobId: 'job-1', expiresAt: 18_000 + 1800_000 });
   });
 });

@@ -31,12 +31,16 @@ export class GithubAppAuthError extends Error {
   readonly status: number;
   /** 429s and outages stay retryable in the queue; other 4xx mean the installation is gone for this app. */
   readonly code: GithubFailureCode;
+  /** Seconds GitHub asked the caller to wait, parsed from a 403/429
+   * `Retry-After`; null when the failure carries no pacing instruction. */
+  readonly retryAfterSeconds: number | null;
 
-  constructor(status: number) {
+  constructor(status: number, retryAfterSeconds: number | null = null) {
     super('GitHub App request failed');
     this.name = 'GithubAppAuthError';
     this.status = status;
     this.code = status === 429 ? 'github_rate_limited' : status >= 500 ? 'github_app_unavailable' : 'github_app_auth_failed';
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -64,6 +68,13 @@ async function readJson<T>(response: Response): Promise<T | null> {
   } catch {
     return null;
   }
+}
+
+function retryAfterSeconds(response: Response): number | null {
+  const value = response.headers.get('retry-after');
+  if (value === null) return null;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : null;
 }
 
 function derLength(length: number): Uint8Array {
@@ -139,6 +150,12 @@ export async function createGithubInstallationToken(
     headers: githubHeaders(`Bearer ${jwt}`),
   });
   const body = await readJson<{ token?: string }>(response);
+  if (response.status === 403 || response.status === 429) {
+    const retryAfter = retryAfterSeconds(response);
+    if (retryAfter !== null || response.status === 429) {
+      throw new GithubAppAuthError(429, retryAfter);
+    }
+  }
   if (!response.ok || !body?.token) throw new GithubAppAuthError(response.status || 502);
   return body.token;
 }
@@ -153,6 +170,12 @@ export async function getAppInstallation(
   const response = await fetcher(`${GITHUB_API}/app/installations/${installationId}`, {
     headers: githubHeaders(`Bearer ${jwt}`),
   });
+  if (response.status === 403 || response.status === 429) {
+    const retryAfter = retryAfterSeconds(response);
+    if (retryAfter !== null || response.status === 429) {
+      throw new GithubAppAuthError(429, retryAfter);
+    }
+  }
   if (!response.ok) throw new GithubAppAuthError(response.status);
   const body = await readJson<GithubInstallationAccount>(response);
   if (body === null) throw new GithubAppAuthError(502);

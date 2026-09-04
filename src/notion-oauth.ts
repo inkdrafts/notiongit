@@ -8,6 +8,7 @@
  */
 
 import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
+import type { GithubActionsSecretsErrorCode } from './actions-secrets';
 import type { NotionTemplateErrorCode } from './notion-template';
 import { callbackFailure } from './failures';
 
@@ -61,14 +62,19 @@ export interface NotionOAuthContinuation {
   readonly duplicatedTemplateId: string | null;
 }
 
-export type NotionOAuthContinuationHandler =
-  (continuation: NotionOAuthContinuation) => Promise<void> | void;
+export type NotionOAuthContinuationHandler = (continuation: NotionOAuthContinuation) =>
+  | Promise<Record<string, unknown> | void>
+  | Record<string, unknown>
+  | void;
 
 export interface NotionOAuthRouteOptions {
   /**
    * Consumes the short-lived token and duplicated root immediately. The
    * production handler (`continueNotionOnboarding` in `index.ts`) resolves
-   * the duplicated template into database IDs; tests inject their own.
+   * the duplicated template into database IDs, writes the repository's
+   * Actions secrets, and hands the job to the provisioning queue; tests
+   * inject their own. Anything it returns must be non-secret: it is merged
+   * into the callback's success body.
    */
   continueOnboarding?: NotionOAuthContinuationHandler;
   /** Injectable provider transport for tests and local development. */
@@ -94,10 +100,18 @@ export type NotionOAuthErrorCode =
   | 'notion_rate_limited'
   | 'notion_unavailable'
   | 'notion_token_invalid'
-  // The onboarding continuation (the database resolver wired in issue #7)
-  // reports through the same error channel; `details` may add non-secret
-  // schema metadata to the response body.
-  | NotionTemplateErrorCode;
+  // No provisioning job exists for this `jobId`: the browser reached Notion
+  // authorization without finishing (or long after) GitHub authorization.
+  | 'provisioning_job_missing'
+  // The secrets are written but the queue would not accept the job. Distinct
+  // because the recovery is to re-authorize Notion for the same job, which
+  // then skips straight to the handoff.
+  | 'provisioning_handoff_failed'
+  // The onboarding continuation (the database resolver wired in issue #7 and
+  // the Actions secret write) reports through the same error channel;
+  // `details` may add non-secret schema metadata to the response body.
+  | NotionTemplateErrorCode
+  | GithubActionsSecretsErrorCode;
 
 export class NotionOAuthError extends Error {
   readonly code: NotionOAuthErrorCode;
@@ -402,7 +416,7 @@ export async function finishNotionCallback(
       accessToken: exchanged.accessToken,
       duplicatedTemplateId: exchanged.duplicatedTemplateId,
     };
-    await options.continueOnboarding?.(continuation);
+    const details = await options.continueOnboarding?.(continuation);
 
     emitProvisioningEvent(env, {
       type: 'consent_completed',
@@ -418,7 +432,9 @@ export async function finishNotionCallback(
       job_id: payload.jobId,
       template: { duplicated: continuation.duplicatedTemplateId !== null },
     };
-    return response(summary, 202, clearCookieHeaders);
+    // Only the non-secret onboarding details the continuation returned on
+    // purpose, mirroring the `details` channel on the error path.
+    return response({ ...summary, ...(details ?? {}) }, 202, clearCookieHeaders);
   } catch (error) {
     const failure = callbackFailure(error, 'notion');
     emitProvisioningEvent(env, {

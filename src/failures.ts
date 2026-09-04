@@ -45,6 +45,8 @@ export const NOTION_FAILURE_CODES = [
   'notion_template_schema_invalid',
   'notion_template_unavailable',
   'notion_template_not_validated',
+  'provisioning_job_missing',
+  'provisioning_handoff_failed',
 ] as const;
 
 export const GITHUB_FAILURE_CODES = [
@@ -62,6 +64,7 @@ export const GITHUB_FAILURE_CODES = [
   'github_installation_suspended',
   'github_organization_installation_not_supported',
   'github_account_mismatch',
+  'github_provisioning_already_active',
   'github_rate_limited',
   'github_app_unavailable',
   'github_app_auth_failed',
@@ -79,6 +82,7 @@ export const PROVISION_FAILURE_CODES = [
   // config patch
   'github_config_unavailable',
   'github_config_conflict',
+  'github_config_rate_limited',
   'github_config_invalid',
   // pages
   'github_pages_missing_branch',
@@ -106,6 +110,7 @@ export const PROVISION_FAILURE_CODES = [
   // the provisioning machine itself
   'provisioning_step_failed',
   'provisioning_enqueue_failed',
+  'github_provisioning_superseded',
 ] as const;
 
 export type FlowFailureCode = (typeof FLOW_FAILURE_CODES)[number];
@@ -391,6 +396,26 @@ const NOTION_FAILURES: { [C in NotionFailureCode]: FailureDescriptor } = {
     },
     support: { area: 'notion', note: 'Preflight gate: no stored template resolution, or a schema version mismatch, for this job.' },
   },
+  provisioning_job_missing: {
+    retryable: false,
+    recovery: 'restart_flow',
+    httpStatus: 409,
+    user: {
+      message: 'We could not find a site setup in progress for this link.',
+      action: 'Start again from the beginning: connect GitHub first, then Notion.',
+    },
+    support: { area: 'platform', note: 'Job id unknown, expired, or missing at a route that requires a live job; the response attaches the connect URL.' },
+  },
+  provisioning_handoff_failed: {
+    retryable: false,
+    recovery: { kind: 'user_action', action: 'reconnect_notion_to_retry_handoff' },
+    httpStatus: 502,
+    user: {
+      message: 'Your site\u2019s setup is almost ready, but we could not hand it to the background queue.',
+      action: 'Connect Notion again for the same site. The next pass picks up where this one stopped.',
+    },
+    support: { area: 'platform', note: 'Actions secrets are written durably; the queue send failed after them. The job record carries the provisioning_enqueue_failed breadcrumb, and the response attaches the retry URL. Re-authorizing Notion skips straight to the handoff.' },
+  },
 };
 
 const GITHUB_FAILURES: { [C in GithubFailureCode]: FailureDescriptor } = {
@@ -534,6 +559,16 @@ const GITHUB_FAILURES: { [C in GithubFailureCode]: FailureDescriptor } = {
     },
     support: { area: 'github', note: 'Installation account does not match the authenticated user\u2019s account.' },
   },
+  github_provisioning_already_active: {
+    retryable: false,
+    recovery: { kind: 'user_action', action: 'wait_for_current_setup_then_retry' },
+    httpStatus: 409,
+    user: {
+      message: 'A site setup is already running for your account.',
+      action: 'Wait for it to finish. If you need to start over, wait a few minutes first.',
+    },
+    support: { area: 'platform', note: 'Start gate refused as account_busy: one provisioning per account is already in flight. The response status and Retry-After come from the gate error; the registry status is the canonical mapping.' },
+  },
   github_rate_limited: {
     retryable: true,
     recovery: 'retry_step',
@@ -639,6 +674,16 @@ const PROVISION_FAILURES: { [C in ProvisionFailureCode]: FailureDescriptor } = {
       action: 'We\u2019ll retry automatically with the latest version.',
     },
     support: { area: 'github', note: 'Config write rejected as a conflict; the retry re-reads and re-applies.' },
+  },
+  github_config_rate_limited: {
+    retryable: true,
+    recovery: 'retry_step',
+    httpStatus: 429,
+    user: {
+      message: 'GitHub is temporarily limiting requests while preparing your site\u2019s settings.',
+      action: 'We\u2019ll keep trying automatically. If setup does not finish, contact support.',
+    },
+    support: { area: 'github', note: 'Config read or write rate-limited (including 403 with Retry-After); Retry-After is honored and rides the fresh-message transport.' },
   },
   github_config_invalid: {
     retryable: false,
@@ -862,6 +907,16 @@ const PROVISION_FAILURES: { [C in ProvisionFailureCode]: FailureDescriptor } = {
       area: 'platform',
       note: 'Queue send failed. Mid-pipeline this breadcrumb is retryable by design. At initial enqueue the record is written with retryable false and the job is dead-lettered, because no message stream exists to redeliver it: the registry value is the default policy, the record is the decision snapshot.',
     },
+  },
+  github_provisioning_superseded: {
+    retryable: false,
+    recovery: { kind: 'user_action', action: 'continue_with_latest_setup' },
+    httpStatus: 409,
+    user: {
+      message: 'A newer setup request for your account replaced this one, so the older attempt was stopped.',
+      action: 'Nothing to fix here. Keep going with your latest setup.',
+    },
+    support: { area: 'platform', note: 'Gate detected a newer provisioning run for the same account; this job is terminated as status failed (distinct from provider dead_letter) so the newer run owns the account.' },
   },
 };
 

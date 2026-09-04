@@ -200,7 +200,8 @@ function canaryJob(attempts = 0): ProvisioningJob {
   job.steps.verify_repository.status = 'succeeded';
   job.steps.patch_config.status = 'succeeded';
   job.steps.configure_pages.attempts = attempts;
-  return job;
+  // As the queue sees it: the Notion callback already wrote the secrets.
+  return { ...job, status: 'queued', data: { ...job.data, notionSecretsWrittenAt: 900 } };
 }
 
 function pagesFetch(): typeof fetch {
@@ -229,7 +230,11 @@ async function funnelEventsForCaughtError(
   const kv = new MemoryKV();
   const metrics = new FakeMetrics();
   await kv.put(provisioningJobKey('job-canary'), JSON.stringify(canaryJob(attempts)));
-  kv.failPutNumber(4, error);
+  // Ordinal 6 is the success save the consumer catches: 1 setup, 2 locked,
+  // 3 lease renewal, 4 budget admission, 5 in-progress, 6 success save. A
+  // failure there routes through `recordStepFailure`, which is the funnel
+  // under test; a later ordinal would escape the consumer uncaught.
+  kv.failPutNumber(6, error);
 
   const env: ProvisioningQueueEnv = {
     JOBS: kv as unknown as KVNamespace,

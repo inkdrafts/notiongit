@@ -15,18 +15,32 @@ import {
 import {
   generateOrReuseRepository,
   type GeneratedRepositoryIdentity,
+  type GenerateOrReuseOptions,
 } from './repository-generation';
 import {
+  GithubActionsSecretsError,
+  writeGithubActionsSecrets,
+} from './actions-secrets';
+import {
+  createGithubInstallationToken,
   getAppInstallation,
   GithubAppAuthError,
   type GithubInstallationAccount,
 } from './github-app-auth';
 import {
   createProvisioningJob,
-  nextPendingStep,
+  loadProvisioningJob,
   saveProvisioningJob,
 } from './provisioning-job';
 import { callbackFailure, FlowFailure } from './failures';
+import {
+  acquireProvisioningStart,
+  consumeGlobalMutationBudget,
+  ProvisioningGateRefusedError,
+  provisioningThrottleConfig,
+  releaseProvisioningLeaseIfOwned,
+  type ProvisioningThrottleVars,
+} from './provisioning-throttle';
 import { processProvisioningMessage } from './provisioning-queue';
 import { emitProvisioningEvent } from './observability';
 import { runObservabilityAlertCheck } from './observability-alerts';
@@ -38,12 +52,9 @@ import {
   type NotionOAuthRouteOptions,
 } from './notion-oauth';
 import {
-  loadNotionTemplateResolution,
   NotionTemplateError,
-  NOTION_TEMPLATE_SCHEMA_VERSION,
   resolveNotionTemplateDatabases,
   saveNotionTemplateResolution,
-  validateNotionTemplateSchemas,
 } from './notion-template';
 import { LANDING_PAGE } from './landing-page';
 
@@ -78,6 +89,7 @@ export {
 export type {
   GeneratedRepositoryIdentity,
   GeneratedRepositoryPollOptions,
+  GenerateOrReuseOptions,
   GithubGenerateErrorCode,
 } from './repository-generation';
 
@@ -235,6 +247,38 @@ export type {
 } from './provisioning-queue';
 
 export {
+  ACCOUNT_LEASE_PREFIX,
+  accountLeaseKey,
+  acquireProvisioningStart,
+  consumeGlobalMutationBudget,
+  gateProvisioningStep,
+  GLOBAL_RATE_KEY,
+  isBudgetedMutationStep,
+  jitteredDelaySeconds,
+  MAX_RACING_ISOLATES,
+  PROVISIONING_LEASE_TTL_DEFAULT_SECONDS,
+  PROVISIONING_LEASE_TTL_MAX_SECONDS,
+  PROVISIONING_LEASE_TTL_MIN_SECONDS,
+  PROVISIONING_MUTATIONS_PER_HOUR_CEILING,
+  PROVISIONING_MUTATIONS_PER_HOUR_DEFAULT,
+  PROVISIONING_MUTATIONS_PER_MINUTE_CEILING,
+  PROVISIONING_MUTATIONS_PER_MINUTE_DEFAULT,
+  provisioningThrottleConfig,
+  ProvisioningGateRefusedError,
+  releaseProvisioningLeaseIfOwned,
+  saveTerminalProvisioningJob,
+} from './provisioning-throttle';
+export type {
+  AccountLease,
+  BudgetDecision,
+  GlobalRateState,
+  ProvisioningThrottleConfig,
+  ProvisioningThrottleVars,
+  StartGateDecision,
+  StepGateDecision,
+} from './provisioning-throttle';
+
+export {
   beginNotionAuthorization,
   exchangeNotionAuthorizationCode,
   finishNotionCallback,
@@ -295,7 +339,7 @@ export type {
 
 export { LANDING_PAGE } from './landing-page';
 
-export interface Env {
+export interface Env extends ProvisioningThrottleVars {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
   JOBS: KVNamespace;
   /** Work queue for resumable provisioning jobs. */
@@ -343,10 +387,10 @@ const HTML_HEADERS = {
   'cache-control': 'no-store',
 };
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: JSON_HEADERS,
+    headers: { ...JSON_HEADERS, ...headers },
   });
 }
 
@@ -498,26 +542,6 @@ function validJobId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 }
 
-const NOTION_TEMPLATE_NOT_VALIDATED_MESSAGE =
-  'Connect Notion and complete the Pages and Posts database check before connecting GitHub.';
-
-async function hasValidatedNotionTemplate(env: Pick<Env, 'JOBS'>, jobId: string): Promise<boolean> {
-  const record = await loadNotionTemplateResolution(env.JOBS, jobId);
-  if (!record || !record.resolution || record.resolution.templateSchemaVersion !== NOTION_TEMPLATE_SCHEMA_VERSION) return false;
-  try {
-    return validateNotionTemplateSchemas(record.resolution).valid;
-  } catch {
-    return false;
-  }
-}
-
-function notionTemplateNotValidatedResponse(): Response {
-  return json({
-    error: 'notion_template_not_validated',
-    message: NOTION_TEMPLATE_NOT_VALIDATED_MESSAGE,
-  }, 400);
-}
-
 function validInstallationId(value: string | null): number | null {
   if (!value || !/^\d{1,20}$/u.test(value)) return null;
   const parsed = Number(value);
@@ -659,6 +683,18 @@ function authError(error: unknown): Response {
   if (error instanceof GithubRepositoryApiError && (error.status === 400 || error.status === 401)) {
     return json({ error: 'github_authorization_failed' }, 400);
   }
+  if (error instanceof ProvisioningGateRefusedError) {
+    // A refused start is not a failure of the flow: the account already has
+    // its one provisioning in flight, or the app-wide mutation budget is
+    // spent. Both answers carry the same Retry-After contract GitHub uses.
+    return json({
+      error: error.reason === 'account_busy' ? 'github_provisioning_already_active' : 'github_rate_limited',
+      retry_after_seconds: error.retryAfterSeconds,
+    }, error.status, { 'retry-after': String(error.retryAfterSeconds) });
+  }
+  if (error instanceof GithubActionsSecretsError) {
+    return json({ error: error.code }, error.status);
+  }
   const failure = callbackFailure(error, 'github');
   const body: Record<string, unknown> = { error: failure.code };
   if (failure.retryAfterSeconds !== null) body.retry_after_seconds = failure.retryAfterSeconds;
@@ -675,9 +711,6 @@ async function beginGithubInstall(request: Request, env: Partial<Env>): Promise<
   const requestedJobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
   const jobId = requestedJobId || crypto.randomUUID();
   if (!validJobId(jobId)) return json({ error: 'invalid_job_id' }, 400);
-  if (!await hasValidatedNotionTemplate(env as Pick<Env, 'JOBS'>, jobId)) {
-    return notionTemplateNotValidatedResponse();
-  }
 
   const now = Math.floor(Date.now() / 1000);
   const payload: SignedStatePayload = {
@@ -702,7 +735,7 @@ async function beginGithubInstall(request: Request, env: Partial<Env>): Promise<
 }
 
 async function finishGithubCallback(request: Request, env: Partial<Env>): Promise<Response> {
-  if (!env.JOBS || !env.PROVISIONING_QUEUE || !env.GITHUB_APP_ID || !env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+  if (!env.JOBS || !env.GITHUB_APP_ID || !env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
     return json({ error: 'github_configuration_missing' }, 500);
   }
   const url = new URL(request.url);
@@ -721,9 +754,6 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   }
   if (record.phase === 'consumed') return json({ error: 'github_state_replayed' }, 400);
   if (record.expiresAt <= Math.floor(Date.now() / 1000)) return json({ error: 'github_state_expired' }, 400);
-  if (!await hasValidatedNotionTemplate(env as Pick<Env, 'JOBS'>, record.jobId)) {
-    return notionTemplateNotValidatedResponse();
-  }
 
   const installationId = validInstallationId(url.searchParams.get('installation_id'));
   const code = url.searchParams.get('code');
@@ -746,27 +776,83 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       // passed to KV. The GitHub code is likewise never persisted.
       const authenticatedUser = await getAuthenticatedGithubUser(accessToken);
       if (authenticatedUser.accountType !== 'User') throw new FlowFailure('github_organization_installation_not_supported');
-      // GitHub normally includes installation_id during OAuth-on-install, but
-      // the OAuth callback contract also permits code-only callbacks. Discover
-      // this App's installation from the authenticated user's installations in
-      // that case rather than trusting an unverified query parameter.
-      if (!selectedInstallationId) {
-        selectedInstallationId = await findUserInstallation(accessToken, env.GITHUB_APP_ID as string);
+      const jobs = env.JOBS;
+      const throttleConfig = provisioningThrottleConfig(env);
+      const start = await acquireProvisioningStart(jobs, { accountId: authenticatedUser.id, jobId: record.jobId }, throttleConfig, Date.now());
+      if (!start.granted) throw new ProvisioningGateRefusedError(start);
+      // L5: the lease belongs to this request until the job record is durably
+      // saved; from then on the job owns it and its first queue gate pass
+      // renews it. If anything below fails, release it before returning, so a
+      // crashed request never locks the account out for a full TTL.
+      let leaseHandedOff = false;
+      try {
+        // GitHub normally includes installation_id during OAuth-on-install, but
+        // the OAuth callback contract also permits code-only callbacks. Discover
+        // this App's installation from the authenticated user's installations in
+        // that case rather than trusting an unverified query parameter.
+        if (!selectedInstallationId) {
+          selectedInstallationId = await findUserInstallation(accessToken, env.GITHUB_APP_ID as string);
+        }
+        const userInstallation = await getUserInstallation(accessToken, selectedInstallationId);
+        identity = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
+        // Generation happens while the short-lived OAuth token is in memory:
+        // creating a repository from the template requires user-to-server
+        // authentication. An earlier attempt's generated repository is reused
+        // instead of duplicated. Only non-secret destination and repository
+        // identity metadata is retained in the job record.
+        const ownedRepositories = await listOwnedGithubRepositories(accessToken);
+        ({ destination: repository, identity: generatedRepository } = await generateOrReuseRepository(
+          accessToken,
+          identity.login,
+          ownedRepositories,
+          fetch,
+          {
+            beforeCreate: async () => {
+              const budget = await consumeGlobalMutationBudget(jobs, throttleConfig, Date.now(), Math.random);
+              if (!budget.admitted) {
+                throw new ProvisioningGateRefusedError({
+                  granted: false,
+                  reason: budget.reason,
+                  retryAfterSeconds: budget.delaySeconds,
+                });
+              }
+            },
+          },
+        ));
+        if (!identity || !repository || !generatedRepository) return json({ error: 'github_identity_missing' }, 400);
+
+        // Everything after this point — verifying the generated repository is
+        // readable, patching its config, enabling Pages, dispatching and
+        // awaiting the Notion sync, and awaiting the resulting deploy — no
+        // longer needs the short-lived OAuth token in memory: each step mints
+        // its own installation token from `selectedInstallationId`, a durable,
+        // non-secret identifier. So it moves off this request and onto the
+        // durable provisioning queue, which can retry any step independently
+        // and survives this Worker restarting mid-pipeline. The queue is not
+        // told about the job here: the Notion callback enqueues it once the
+        // repository's Actions secrets exist (see `continueNotionOnboarding`).
+        const job = createProvisioningJob({
+          jobId: record.jobId,
+          installationId: selectedInstallationId,
+          identity,
+          repository,
+          generatedRepository,
+          now: Date.now(),
+        });
+        await saveProvisioningJob(env.JOBS, job);
+        await env.JOBS.put(
+          stateKey(payload.nonce),
+          JSON.stringify({ ...record, phase: 'consumed', installationId: selectedInstallationId, identity }),
+          { expirationTtl: STATE_REPLAY_TTL_SECONDS },
+        );
+        leaseHandedOff = true;
+
+        const notionAuthorization = new URL('/connect/notion', request.url);
+        notionAuthorization.searchParams.set('job_id', job.jobId);
+        return Response.redirect(notionAuthorization.toString(), 302);
+      } finally {
+        if (!leaseHandedOff) await releaseProvisioningLeaseIfOwned(jobs, authenticatedUser.id, record.jobId);
       }
-      const userInstallation = await getUserInstallation(accessToken, selectedInstallationId);
-      const installationIdentityForUser = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
-      identity = installationIdentityForUser;
-      // Generation happens while the short-lived OAuth token is in memory:
-      // creating a repository from the template requires user-to-server
-      // authentication. An earlier attempt's generated repository is reused
-      // instead of duplicated. Only non-secret destination and repository
-      // identity metadata is retained in the job record.
-      const ownedRepositories = await listOwnedGithubRepositories(accessToken);
-      ({ destination: repository, identity: generatedRepository } = await generateOrReuseRepository(
-        accessToken,
-        identity.login,
-        ownedRepositories,
-      ));
     } else {
       // This supports a setup callback arriving before the OAuth callback. The
       // App JWT proves that the installation belongs to this App; the later
@@ -782,80 +868,6 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       await env.JOBS.put(stateKey(payload.nonce), JSON.stringify(nextRecord), { expirationTtl: STATE_REPLAY_TTL_SECONDS });
       return json({ status: 'awaiting_authorization', job_id: record.jobId }, 202);
     }
-
-    if (!identity || !repository || !generatedRepository) return json({ error: 'github_identity_missing' }, 400);
-
-    // Everything after this point — verifying the generated repository is
-    // readable, patching its config, enabling Pages, dispatching and
-    // awaiting the Notion sync, and awaiting the resulting deploy — no
-    // longer needs the short-lived OAuth token in memory: each step mints
-    // its own installation token from `selectedInstallationId`, a durable,
-    // non-secret identifier. So it moves off this request and onto the
-    // durable provisioning queue, which can retry any step independently
-    // and survives this Worker restarting mid-pipeline.
-    const job = createProvisioningJob({
-      jobId: record.jobId,
-      installationId: selectedInstallationId,
-      identity,
-      repository,
-      generatedRepository,
-      now: Date.now(),
-    });
-    await saveProvisioningJob(env.JOBS, job);
-    await env.JOBS.put(
-      stateKey(payload.nonce),
-      JSON.stringify({ ...record, phase: 'consumed', installationId: selectedInstallationId, identity }),
-      { expirationTtl: STATE_REPLAY_TTL_SECONDS },
-    );
-    try {
-      await env.PROVISIONING_QUEUE.send({ jobId: job.jobId });
-      emitProvisioningEvent(env, { type: 'job_queued', jobId: job.jobId, ts: Date.now() });
-    } catch (enqueueError) {
-      // Without a message nothing will ever process this job, but its record
-      // would otherwise sit `queued` until the TTL with no trace of why. Mark
-      // the enqueue failure on the job so durable state reflects reality,
-      // then let the request surface as a 502.
-      const failedStep = nextPendingStep(job);
-      if (failedStep) {
-        await saveProvisioningJob(env.JOBS, {
-          ...job,
-          status: 'dead_letter',
-          steps: {
-            ...job.steps,
-            [failedStep]: {
-              ...job.steps[failedStep],
-              status: 'failed',
-              lastError: { code: 'provisioning_enqueue_failed', retryable: false },
-            },
-          },
-          completedAt: Date.now(),
-          updatedAt: Date.now(),
-        });
-      }
-      emitProvisioningEvent(env, {
-        type: 'job_enqueue_failed',
-        jobId: job.jobId,
-        ts: Date.now(),
-        errorCode: 'provisioning_enqueue_failed',
-      });
-      throw enqueueError;
-    }
-
-    return json({
-      ok: true,
-      status: 'provisioning',
-      job_id: job.jobId,
-      installation_id: job.installationId,
-      github: { id: identity.id, login: identity.login },
-      repository: {
-        name: repository.name,
-        url: repository.url,
-        baseurl: repository.baseurl,
-        id: generatedRepository.id,
-        html_url: generatedRepository.htmlUrl,
-        default_branch: generatedRepository.defaultBranch,
-      },
-    }, 202);
   } catch (error) {
     return authError(error);
   }
@@ -863,34 +875,130 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
 
 /**
  * The production Notion onboarding continuation: while the short-lived access
- * token is still in this request's scope, resolve the duplicated template
- * root into the Pages and Posts database IDs and persist that non-secret
- * resolution for the later provisioning steps. The token itself is never
- * written anywhere. Template-resolution failures surface as distinct,
- * actionable Notion OAuth errors; the programmatic database-creation fallback
- * for a non-duplicated authorization (ADR 0002 §2) is deliberately not
- * implemented yet, so that case fails with `notion_template_not_duplicated`.
+ * token is still in this request's scope, resolve the duplicated template root
+ * into the Pages and Posts database IDs and write all three Actions secrets
+ * into the repository the GitHub callback already created. This is the only
+ * place the Notion token exists, so it is also the only place those secrets
+ * can be written; the token itself is never persisted, queued, or returned.
+ * The job reaches the provisioning queue only after that write is durable, so
+ * no queue step can run against a repository whose sync workflow would have no
+ * credentials. Template-resolution failures surface as distinct, actionable
+ * Notion OAuth errors; the programmatic database-creation fallback for a
+ * non-duplicated authorization (ADR 0002 §2) is deliberately not implemented
+ * yet, so that case fails with `notion_template_not_duplicated`.
  */
 export function continueNotionOnboarding(
   env: Partial<Env>,
   runtime: { fetcher?: typeof fetch; sleep?: (milliseconds: number) => Promise<void> } = {},
 ): NotionOAuthContinuationHandler {
   return async ({ jobId, accessToken, duplicatedTemplateId }) => {
-    if (!env.JOBS) throw new NotionOAuthError('notion_configuration_missing', 500);
-    try {
-      if (!duplicatedTemplateId) throw new NotionTemplateError('notion_template_not_duplicated', 400);
-      const resolution = await resolveNotionTemplateDatabases(accessToken, duplicatedTemplateId, {
-        fetcher: runtime.fetcher,
-        sleep: runtime.sleep,
-      });
-      await saveNotionTemplateResolution(env.JOBS, { version: 1, jobId, resolution });
-    } catch (error) {
-      if (error instanceof NotionTemplateError) {
-        throw new NotionOAuthError(error.code, error.status, error.details);
-      }
-      throw error;
+    if (!env.JOBS || !env.PROVISIONING_QUEUE || !env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY) {
+      throw new NotionOAuthError('notion_configuration_missing', 500);
     }
+    const job = await loadProvisioningJob(env.JOBS, jobId);
+    if (!job) throw new NotionOAuthError('provisioning_job_missing', 409, { connect_url: '/connect/github' });
+    // Any later status means this job was already handed to the queue, so a
+    // duplicate callback must not write secrets or enqueue it again.
+    if (job.status !== 'awaiting_notion') return;
+
+    let ready = job;
+    if (!ready.data.notionSecretsWrittenAt) {
+      try {
+        if (!duplicatedTemplateId) throw new NotionTemplateError('notion_template_not_duplicated', 400);
+        // Resolved fresh every time, never from the stored record: a second
+        // authorization duplicates the template again, so the stored database
+        // IDs can belong to the previous duplicate and would pair this token
+        // with databases the user is no longer writing in.
+        const resolution = await resolveNotionTemplateDatabases(accessToken, duplicatedTemplateId, {
+          fetcher: runtime.fetcher,
+          sleep: runtime.sleep,
+        });
+        await saveNotionTemplateResolution(env.JOBS, { version: 1, jobId, resolution });
+        const installationToken = await createGithubInstallationToken(
+          env as Pick<Env, 'GITHUB_APP_ID' | 'GITHUB_APP_PRIVATE_KEY'>,
+          job.installationId,
+          runtime.fetcher,
+        );
+        await writeGithubActionsSecrets(
+          installationToken,
+          {
+            repositoryFullName: job.data.generatedRepository.fullName,
+            secrets: {
+              NOTION_TOKEN: accessToken,
+              NOTION_PAGES_DATABASE_ID: resolution.pagesDatabaseId,
+              NOTION_POSTS_DATABASE_ID: resolution.postsDatabaseId,
+            },
+          },
+          runtime.fetcher,
+        );
+      } catch (error) {
+        if (error instanceof NotionTemplateError) throw new NotionOAuthError(error.code, error.status, error.details);
+        if (error instanceof GithubActionsSecretsError) throw new NotionOAuthError(error.code, error.status);
+        throw error;
+      }
+      const writtenAt = Date.now();
+      ready = { ...job, data: { ...job.data, notionSecretsWrittenAt: writtenAt }, updatedAt: writtenAt };
+      await saveProvisioningJob(env.JOBS, ready);
+    }
+
+    try {
+      await env.PROVISIONING_QUEUE.send({ jobId });
+    } catch {
+      // The status deliberately stays `awaiting_notion`: the secrets are
+      // already durable, so re-authorizing Notion for this job comes back
+      // here and retries only the handoff. Marking the job dead — or
+      // reporting success — would strand it with nothing able to advance it.
+      emitProvisioningEvent(env, {
+        type: 'job_enqueue_failed',
+        jobId,
+        ts: Date.now(),
+        errorCode: 'provisioning_enqueue_failed',
+      });
+      throw new NotionOAuthError('provisioning_handoff_failed', 502, {
+        retry_url: `/connect/notion?job_id=${encodeURIComponent(jobId)}`,
+      });
+    }
+
+    // Re-read before advancing the status: the queue may already have picked
+    // the job up and taken its lock, and KV has no compare-and-swap to write
+    // through (see `tryAcquireProvisioningLock`).
+    const queuedAt = Date.now();
+    const handedOff = await loadProvisioningJob(env.JOBS, jobId);
+    if (handedOff?.status === 'awaiting_notion') {
+      await saveProvisioningJob(env.JOBS, { ...handedOff, status: 'queued', updatedAt: queuedAt });
+    }
+    emitProvisioningEvent(env, { type: 'job_queued', jobId, ts: queuedAt });
+
+    return {
+      repository: {
+        name: ready.data.generatedRepository.name,
+        html_url: ready.data.generatedRepository.htmlUrl,
+      },
+      site: { url: ready.data.repository.url },
+    };
   };
+}
+
+/**
+ * Notion authorization is the second half of onboarding, so it only starts
+ * for a job the GitHub callback already created. Without this an old
+ * bookmark walks the user through a full Notion consent for a job that can
+ * never finish: there is no repository to write the secrets into.
+ */
+async function beginNotionForJob(request: Request, env: Partial<Env>): Promise<Response> {
+  if (!env.JOBS || !env.NOTION_CLIENT_ID || !env.NOTION_CLIENT_SECRET) {
+    return json({ error: 'notion_configuration_missing' }, 500);
+  }
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
+  if (!jobId || !validJobId(jobId) || !await loadProvisioningJob(env.JOBS, jobId)) {
+    return json({
+      error: 'provisioning_job_missing',
+      message: 'Connect GitHub first.',
+      connect_url: '/connect/github',
+    }, 409);
+  }
+  return beginNotionAuthorization(request, env);
 }
 
 export function route(
@@ -913,7 +1021,7 @@ export function route(
   }
 
   if (request.method === 'GET' && url.pathname === '/connect/notion') {
-    return beginNotionAuthorization(request, env);
+    return beginNotionForJob(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/github/callback') {
@@ -935,8 +1043,9 @@ export function route(
 
 const worker: ExportedHandler<Env, ProvisioningMessage> = {
   fetch(request, env) {
-    // The deployed worker resolves the duplicated template inside the Notion
-    // callback; `route` keeps the continuation injectable for tests.
+    // The deployed worker resolves the duplicated template and writes the
+    // repository's Actions secrets inside the Notion callback; `route` keeps
+    // the continuation injectable for tests.
     return route(request, env, { continueOnboarding: continueNotionOnboarding(env) });
   },
 

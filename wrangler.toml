@@ -11,6 +11,12 @@ libsodium-raw = "./spikes/libsodium-workers/node_modules/libsodium/dist/modules-
 [vars]
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
+# Provisioning throttle. GitHub's app-wide secondary limits are ~80
+# mutations/min and ~500/hour; provisioningThrottleConfig clamps these to
+# ceilings inside those bounds whatever an operator sets here.
+PROVISIONING_MUTATIONS_PER_MINUTE = "30"
+PROVISIONING_MUTATIONS_PER_HOUR = "240"
+PROVISIONING_LEASE_TTL_SECONDS = "1800"
 CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
 PROVISIONING_METRICS_DATASET = "notiongit_provisioning_events"
 
@@ -64,6 +70,10 @@ workers_dev = true
 [env.staging.vars]
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
+# Same provisioning throttle settings and clamps as the top-level [vars].
+PROVISIONING_MUTATIONS_PER_MINUTE = "30"
+PROVISIONING_MUTATIONS_PER_HOUR = "240"
+PROVISIONING_LEASE_TTL_SECONDS = "1800"
 CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
 PROVISIONING_METRICS_DATASET = "notiongit_staging_provisioning_events"
 
@@ -93,6 +103,10 @@ workers_dev = true
 [env.production.vars]
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
+# Same provisioning throttle settings and clamps as the top-level [vars].
+PROVISIONING_MUTATIONS_PER_MINUTE = "30"
+PROVISIONING_MUTATIONS_PER_HOUR = "240"
+PROVISIONING_LEASE_TTL_SECONDS = "1800"
 CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
 PROVISIONING_METRICS_DATASET = "notiongit_provisioning_events"
 

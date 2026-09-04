@@ -22,28 +22,28 @@ The Worker entrypoint is [`src/index.ts`](src/index.ts). `GET /` serves the
 public landing page ([`src/landing-page.ts`](src/landing-page.ts)): a
 self-contained, server-rendered document with no client JavaScript and no
 external requests (fonts, scripts, or images), so its core content and the
-single `/connect/notion` call to action work with JavaScript disabled. It
+single `/connect/github` call to action work with JavaScript disabled. It
 explains what InkDrafts creates, owns, and costs; the real three-stage
 onboarding flow and why each provider's permissions are requested; and
 privacy/security notes and links to the three public repositories. It
-deliberately never links `/connect/github` or the App install page — the
-GitHub App stays unadvertised from inkdrafts.com until the M5 launch issue
+deliberately never links the App install page directly — the GitHub App stays
+unadvertised from inkdrafts.com until the M5 launch issue
 (see [`docs/github-app-runbook.md`](docs/github-app-runbook.md)). It also
-exposes
-`GET /healthz`, starts Notion-first onboarding at `GET /connect/notion?job_id=...`,
-and handles the signed Notion callback at `GET /auth/notion/callback`. The Notion
-callback exchanges the code server-side and, while the access token is still
-request-local, resolves the duplicated template root into the Pages and Posts
-database IDs (see below); it returns only a redacted authorization summary. It
-also starts the GitHub App
-flow at `GET /connect/github?job_id=...`, whose signed callback
+exposes `GET /healthz` and starts GitHub-first onboarding at
+`GET /connect/github?job_id=...`, whose signed callback
 exchanges the OAuth code server-side, verifies that the authenticated personal
 account owns the installation, selects a collision-safe repository destination,
 and generates that repository from `inkdrafts/notiongit-template` — the only
 part of provisioning that needs the short-lived OAuth token in memory. It then
-persists a durable `ProvisioningJob` record and enqueues it on
-`PROVISIONING_QUEUE`, responding `202` with only the GitHub identity and
-repository destination known so far. Everything after that — verifying the
+persists a durable `ProvisioningJob` record with status `awaiting_notion` and
+redirects the browser to `GET /connect/notion?job_id=...`, the second half of
+onboarding. The signed Notion callback at `GET /auth/notion/callback` exchanges
+the code server-side and, while the access token is still request-local,
+resolves the duplicated template root into the Pages and Posts database IDs
+(see below), writes those and the token into the generated repository's three
+Actions secrets, and only then enqueues the job on `PROVISIONING_QUEUE`. It
+returns a redacted authorization summary plus the non-secret repository and
+site URLs. Everything after that — verifying the
 generated repository, enabling legacy GitHub Pages from `main:/`, dispatching
 the generated repository's own Notion sync workflow and waiting for it to
 complete, then waiting for the matching Pages build and confirming the public
@@ -102,13 +102,15 @@ Pages `Type` values), and checks optional fallback fields when they are
 present. Missing fields, wrong types, and unsupported options are returned per
 database with plain-language remediation. The normalized database IDs and
 non-secret validated schema summary are persisted under
-`notion:template-resolution:<job id>` in `JOBS`; `/connect/github` refuses to
-start until that record exists and still validates. The access token is never
+`notion:template-resolution:<job id>` in `JOBS`. The databases are resolved
+fresh on every authorization rather than read back from that record, because
+re-authorizing duplicates the template again. The access token is never
 persisted, and page content (titles, rows, text) is never read.
 
-`/connect/notion` accepts an optional `job_id` (or `jobId`) and generates one
-when omitted. `/connect/github` requires the job id from a successful Notion
-validation. Both signed states expire after ten minutes and are replay-tracked
+`/connect/github` accepts an optional `job_id` (or `jobId`) and generates one
+when omitted. `/connect/notion` requires the job id of an existing provisioning
+job and answers `409 provisioning_job_missing` without
+one. Both signed states expire after ten minutes and are replay-tracked
 in KV. Notion additionally binds the state to an HttpOnly, Secure, SameSite
 cookie. Neither flow stores OAuth codes or user tokens.
 

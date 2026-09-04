@@ -1,13 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 
-import worker, {
-  continueNotionOnboarding,
+import {
   NOTION_TEMPLATE_RESOLUTION_PREFIX,
   NOTION_TEMPLATE_RESOLUTION_TTL_SECONDS,
-  route,
-  type Env,
 } from '../src/index';
-import { NotionOAuthError } from '../src/notion-oauth';
 import {
   loadNotionTemplateResolution,
   normalizeNotionId,
@@ -26,14 +22,6 @@ const POSTS_DB = '22222222-2222-4222-8222-222222222222';
 const UNRELATED_DB = '33333333-3333-4333-8333-333333333333';
 const SUB_PAGE = '44444444-4444-4444-8444-444444444444';
 const TOKEN = 'synthetic-notion-access-token';
-
-const TOKEN_RESPONSE = {
-  access_token: TOKEN,
-  token_type: 'bearer',
-  bot_id: 'synthetic-bot-id',
-  workspace_id: 'synthetic-workspace-id',
-  duplicated_template_id: ROOT_DASHED,
-};
 
 function pagesProperties(): Record<string, unknown> {
   return {
@@ -160,14 +148,6 @@ class MemoryKV {
     this.values.set(key, value);
     this.puts.push({ key, value, ttl: options?.expirationTtl });
   }
-}
-
-function fakeEnv(kv = new MemoryKV()): Partial<Env> {
-  return {
-    JOBS: kv as unknown as KVNamespace,
-    NOTION_CLIENT_ID: 'notion-client-id',
-    NOTION_CLIENT_SECRET: 'notion-client-secret',
-  };
 }
 
 async function caught(promise: Promise<unknown>): Promise<unknown> {
@@ -600,119 +580,3 @@ describe('Notion template resolution record', () => {
   });
 });
 
-describe('Wired Notion onboarding continuation', () => {
-  test('resolves and persists the duplicate while the token stays request-local', async () => {
-    const fake = new NotionFake();
-    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])]);
-    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
-    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
-    const kv = new MemoryKV();
-
-    await continueNotionOnboarding(fakeEnv(kv), { fetcher: fake.fetcher })({
-      jobId: 'job-continuation',
-      accessToken: TOKEN,
-      duplicatedTemplateId: ROOT_DASHED,
-    });
-
-    const stored = await loadNotionTemplateResolution(kv as unknown as KVNamespace, 'job-continuation');
-    expect(stored?.resolution.pagesDatabaseId).toBe(PAGES_DB);
-    expect(stored?.resolution.postsDatabaseId).toBe(POSTS_DB);
-    // The token is never persisted anywhere.
-    expect(kv.puts.map((put) => put.value).join('\n')).not.toContain(TOKEN);
-  });
-
-  test('fails a manual-page authorization with a distinct, actionable error', async () => {
-    const fake = new NotionFake();
-    const error = await caught(
-      continueNotionOnboarding(fakeEnv(), { fetcher: fake.fetcher })({
-        jobId: 'job-manual',
-        accessToken: TOKEN,
-        duplicatedTemplateId: null,
-      }),
-    );
-
-    expect(error).toBeInstanceOf(NotionOAuthError);
-    expect((error as NotionOAuthError).code).toBe('notion_template_not_duplicated');
-    expect((error as NotionOAuthError).status).toBe(400);
-    expect(fake.calls).toHaveLength(0);
-  });
-
-  test('surfaces resolution failures through the callback response with non-secret details', async () => {
-    const fake = new NotionFake();
-    fake.children(ROOT_DASHED, [childrenList([])]);
-    const kv = new MemoryKV();
-    const env = fakeEnv(kv);
-
-    const begin = await route(new Request('https://staging.example/connect/notion?job_id=job-route'), env);
-    expect(begin.status).toBe(302);
-    const location = new URL(begin.headers.get('location')!);
-    const cookie = begin.headers.get('set-cookie')!.split(';', 1)[0];
-
-    const response = await route(
-      new Request(
-        `https://staging.example/auth/notion/callback?state=${encodeURIComponent(location.searchParams.get('state')!)}&code=synthetic-code`,
-        { headers: { Cookie: cookie } },
-      ),
-      env,
-      {
-        // Route-level fetcher answers the token exchange; the continuation's
-        // transport answers the resolution calls, whose root never shows
-        // content. Sleep is stubbed so the retry budget costs nothing.
-        fetcher: async () => Response.json(TOKEN_RESPONSE),
-        continueOnboarding: continueNotionOnboarding(env, { fetcher: fake.fetcher, sleep: noSleep() }),
-      },
-    );
-
-    expect(response.status).toBe(502);
-    const bodyText = await response.text();
-    expect(JSON.parse(bodyText)).toEqual({ error: 'notion_template_root_empty' });
-    // The response never carries the access token.
-    expect(bodyText).not.toContain(TOKEN);
-  });
-
-  test('worker.fetch wires the production continuation end-to-end', async () => {
-    const fake = new NotionFake();
-    fake.children(ROOT_DASHED, [childrenList([block(PAGES_DB, 'child_database'), block(POSTS_DB, 'child_database')])]);
-    fake.database(PAGES_DB, [databaseResponse(PAGES_DB, pagesProperties())]);
-    fake.database(POSTS_DB, [databaseResponse(POSTS_DB, postsProperties())]);
-    const kv = new MemoryKV();
-    const env = fakeEnv(kv);
-    const workerFetch = worker.fetch as unknown as (request: Request, env: unknown) => Promise<Response>;
-
-    const begin = await workerFetch(new Request('https://staging.example/connect/notion?job_id=job-wired'), env);
-    expect(begin.status).toBe(302);
-    const location = new URL(begin.headers.get('location')!);
-    const cookie = begin.headers.get('set-cookie')!.split(';', 1)[0];
-
-    // The wired continuation resolves through the global fetch transport, so
-    // the production wiring is proven by stubbing exactly that boundary.
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
-      if (url.href === 'https://api.notion.com/v1/oauth/token') return Response.json(TOKEN_RESPONSE);
-      return fake.fetcher(input, init);
-    }) as typeof fetch;
-    try {
-      const callback = await workerFetch(
-        new Request(
-          `https://staging.example/auth/notion/callback?state=${encodeURIComponent(location.searchParams.get('state')!)}&code=synthetic-code`,
-          { headers: { Cookie: cookie } },
-        ),
-        env,
-      );
-      expect(callback.status).toBe(202);
-      expect(await callback.json()).toMatchObject({
-        ok: true,
-        status: 'notion_authorized',
-        job_id: 'job-wired',
-        template: { duplicated: true },
-      });
-      const stored = await loadNotionTemplateResolution(kv as unknown as KVNamespace, 'job-wired');
-      expect(stored?.resolution.pagesDatabaseId).toBe(PAGES_DB);
-      expect(stored?.resolution.postsDatabaseId).toBe(POSTS_DB);
-      expect(kv.puts.map((put) => put.value).join('\n')).not.toContain(TOKEN);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-});

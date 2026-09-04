@@ -61,6 +61,14 @@ credential rotation procedure are maintained in the
 
 ## Notion authorization continuation
 
+Notion authorization is the second half of onboarding: `GET /connect/notion`
+only starts for a `jobId` that `/auth/github/callback` already created a
+`ProvisioningJob` for, and answers `409 provisioning_job_missing` otherwise, so
+an old bookmark cannot walk a user through consent for a job with no repository
+to configure. GitHub-first ordering, and writing the Notion secrets from this
+second authorization rather than the queue, is
+[ADR 0005](decisions/0005-notion-secret-handoff.md).
+
 `GET /connect/notion` creates a ten-minute HMAC-signed state containing only a
 job reference and nonce. The nonce is replay-tracked in `JOBS` and copied into
 an HttpOnly, Secure, SameSite cookie so a callback from a different browser
@@ -94,12 +102,30 @@ non-duplicated authorization, an unreadable or empty root, and exhausted
  resolution record (`notion:template-resolution:<job id>`, same 24-hour TTL as
  every other record): normalized Pages/Posts database IDs plus each database's
  non-secret schema summary (property types and select/multi-select option
- names). `/connect/github` requires that record and revalidates it before
- issuing any GitHub authorization or provisioning call. No token, page title,
- or row content ever reaches it. The HTTP response contains only the job ID
- and whether template duplication occurred; failures return their distinct
- error code with non-secret details (missing roles, scanned count, or schema
- validation issues).
+ names). No token, page title, or row content ever reaches it.
+
+The continuation then spends the token a second time, in the same request: it
+mints an installation token from the job's `installationId` and writes
+`NOTION_TOKEN`, `NOTION_PAGES_DATABASE_ID`, and `NOTION_POSTS_DATABASE_ID` into
+the generated repository's Actions secrets (`actions-secrets.ts`). This is the
+only place the Notion token exists, so it is the only place those secrets can
+be written. The databases are resolved fresh on every authorization rather than
+read back from the resolution record: re-authorizing duplicates the template
+again, so a stored resolution can name databases the user is no longer writing
+in. Only once all three secrets are durably written does the job get a
+`notionSecretsWrittenAt` timestamp (a timestamp, never the values) and reach
+`PROVISIONING_QUEUE`. A secret write that fails partway leaves the job
+`awaiting_notion` with that field still null; the OAuth code is single-use, so
+recovery is a fresh `/connect/notion?job_id=...` authorization, which re-runs
+the whole write. A queue handoff that fails after the secrets are written also
+leaves the job `awaiting_notion` and answers `502 provisioning_handoff_failed`
+with a retry URL — re-authorizing then skips straight back to the handoff
+instead of rewriting anything.
+
+The HTTP response contains the job ID, whether template duplication occurred,
+and the non-secret repository and site URLs; failures return their distinct
+error code with non-secret details (missing roles, scanned count, or schema
+validation issues).
 
 ## Durable provisioning job queue
 
@@ -112,14 +138,14 @@ token, resolving identity, and generating (or reusing) the destination
 repository — GitHub requires user-to-server authentication for
 generate-from-template, so this step needs the OAuth token in memory and
 cannot be deferred. Once generation succeeds, the callback persists a
-`ProvisioningJob` record (`provisioning-job.ts`), enqueues `{ jobId }` to
-`PROVISIONING_QUEUE`, and responds `202` with only the identity and
-repository data known so far — the OAuth token and code are already out of
-scope by the time the response is written and are never queued or stored.
-If the enqueue itself fails, the job record is marked `dead_letter` with a
-`provisioning_enqueue_failed` step error before the request surfaces a 502,
-so durable state never shows a `queued` job that no message will ever
-process; restarting the flow creates a fresh job.
+`ProvisioningJob` record (`provisioning-job.ts`) with status `awaiting_notion`
+and redirects the browser to `/connect/notion?job_id=...` — the OAuth token and
+code are already out of scope by the time the response is written and are never
+queued or stored. The queue is not told about the job here. The Notion callback
+enqueues it, and only after writing the repository's three Actions secrets (see
+"Notion authorization continuation" above), so no step can run against a
+repository whose sync workflow would find no credentials. A job that a user
+abandons between the two authorizations simply expires with its record's TTL.
 
 Everything after generation — verifying the generated repository is
 readable, patching `_config.yml`, enabling Pages, dispatching and awaiting
@@ -202,6 +228,92 @@ adjacent to an in-flight operation — is written with the same
 `expirationTtl` used everywhere else in this project (24 hours), so expired
 jobs and their transient state are removed on KV's own schedule rather than
 needing a separate sweep.
+
+## Provisioning throttle and per-account quota
+
+All provisioning mutations — everything that creates or changes content on
+GitHub — pass through two gates owned by `provisioning-throttle.ts`, guarding
+GitHub's app-wide secondary rate limits (~80 mutations per minute, ~500 per
+hour) with the existing `JOBS` KV namespace and no Durable Object.
+
+**What gates where.** The synchronous onboarding callback gates twice: at
+its very start, as soon as the authenticated account id exists and before
+any further token spend (`acquireProvisioningStart`), and once per real
+generate POST via `generateOrReuseRepository`'s `beforeCreate` hook, which
+consumes the global budget immediately before each POST fires
+(`consumeGlobalMutationBudget`). The queue consumer gates every step before
+minting its installation token (`gateProvisioningStep`): every pass renews
+the account lease — so a job that spends minutes inside one inline poll
+never outlives its lease — but only the content-creating steps
+`patch_config`, `configure_pages`, and `dispatch_sync` consume global
+budget. Reads and polls (`verify_repository`, `await_sync`,
+`await_deploy_build`, `verify_deploy`) are free. Reuse never spends budget:
+a callback that adopts an existing repository fires no generate POST, and
+re-running an idempotent step that turns out to need no change still paid
+only its gate check.
+
+**The lease is the per-account quota.** `github:account-lease:<account id>`
+names the one job allowed to provision for a GitHub account while it lives
+(`leaseTtlSeconds`, renewed at every queue step, released the moment the job
+reaches a terminal status). Capacity one is the honest quota for this
+product: every attempt converges on the same reuse-biased destination
+repository, so admitting spaced-out concurrent provisionings for one account
+would buy nothing except duplicate GitHub work — and the lease doubles as
+the anti-replay quota, turning a replayed or duplicated callback into a 409
+`github_provisioning_already_active` instead of a second round of mutations.
+A wedged job (one that stopped renewing) recovers through the TTL alone: the
+next *sync-path* contender finds the lease expired — or live but naming a
+job record that is missing or terminal — and breaks it. A queue-side job
+that finds a foreign live lease is instead superseded: it terminal-fails
+with `github_provisioning_superseded` and never steals the lease.
+
+**Global budget semantics.** `github:rate:global` holds both fixed-window
+counters (minute and hour) in one key, written only by
+`consumeGlobalMutationBudget`, and only for real content-creating calls —
+the sync generate and the three queue mutations. The increment is written
+before the external call fires, so a crash in between over-counts, the
+conservative direction; there is no decrement or refund path anywhere. The
+read-modify-write is serialized per key inside an isolate by a promise-chain
+mutex, which makes admission exact within one isolate — and deterministic
+in the tests. Across isolates KV is eventually consistent: each racing
+isolate can commit at most one admission per window that the others never
+saw, so the honest worst case is `budget + 32 − 1` per window at 32 racing
+isolates. The defaults (30/240) stay under GitHub's ceilings even at that
+bound (61/min, 271/hour); the ceilings exist so misconfiguration cannot do
+worse. A counter that arrives unparseable fails closed — refusing a
+mutation that might have been admitted only delays provisioning, and the
+state's two-hour TTL bounds the outage.
+
+**Operator variables** (wrangler `[vars]`, all environments; a
+present-but-invalid value — non-integer, NaN, ≤ 0 — fails the deploy's
+config parse by throwing, valid values are clamped):
+
+| Variable | Default | Clamp | Meaning |
+| --- | --- | --- | --- |
+| `PROVISIONING_MUTATIONS_PER_MINUTE` | `30` | ≤ 60 | Global content-creating mutations per fixed minute window |
+| `PROVISIONING_MUTATIONS_PER_HOUR` | `240` | ≤ 400 | Global content-creating mutations per fixed hour window |
+| `PROVISIONING_LEASE_TTL_SECONDS` | `1800` | 60–86400 | Per-account lockout bound; also how long a wedged job blocks its account |
+
+**Wait/resume guarantee.** A refused gate pass is free: no token minted, no
+provider call, no attempt consumed, no lock held. The job is persisted
+`queued` and unlocked with a wait breadcrumb (`reason: 'global_throttled'`
+plus times — never identity or error text), and the continuation is handed
+to a *fresh* queue message carrying `delaySeconds` — the next window
+boundary plus margin for budget waits, jittered, floored at 1s. A fresh
+message is a new delivery, so waiting can never exhaust the consumer's
+`max_retries = 6` platform budget and dead-letter a healthy job; the same
+transport carries a step failure that arrives with GitHub's own
+`Retry-After`, at the provider's own pacing (± 5% jitter), under its own
+much larger ceiling (`PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS` = 24) so that
+honoring GitHub's pacing cannot dead-letter the job through the regular
+five-attempt ceiling. The breadcrumb clears the moment the step next books
+and on every terminal save, so a record never shows a stall that has ended.
+`test/provisioning-load.test.ts` drives the synthetic version of this
+end-to-end: several accounts × several jobs through both gates over a
+budget far smaller than the workload, asserting every job reaches a
+terminal status, every window's observed mutations stay within the
+configured budgets, every wait or redelivery carries a delay of at least
+one second, and nothing dead-letters with a throttle code.
 
 ## GitHub Pages provisioning
 
