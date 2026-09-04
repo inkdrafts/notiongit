@@ -77,6 +77,7 @@ import {
 import { LANDING_PAGE } from './landing-page';
 import { progressPageUrl, projectProvisioning } from './progress';
 import { progressPage } from './progress-page';
+import { isStatusCallbackState, statusCallback, statusHome, statusRerun } from './status';
 import { reportError } from './safe-serialize';
 export {
   createRepositoryWithRetry,
@@ -372,6 +373,49 @@ export {
 } from './progress-page';
 
 export {
+  admitStatusRerun,
+  discoverSite,
+  isStatusCallbackState,
+  parseSafeSummary,
+  projectSiteStatus,
+  readStatusSession,
+  rerunTokenValid,
+  signRerunToken,
+  signStatusSession,
+  signStatusState,
+  statusCallback,
+  statusHome,
+  statusRerun,
+  statusRerunKey,
+  statusStatePayload,
+  STATUS_RERUN_DAILY_LIMIT,
+  STATUS_RERUN_KEY_PREFIX,
+  STATUS_RERUN_SPACING_SECONDS,
+  STATUS_RERUN_WINDOW_SECONDS,
+  STATUS_SESSION_COOKIE,
+  STATUS_SESSION_TTL_SECONDS,
+  STATUS_STATE_COOKIE,
+  STATUS_STATE_TTL_SECONDS,
+  STATUS_REFRESH_SECONDS,
+} from './status';
+export type {
+  DeployOutcome,
+  SafeSummaryParse,
+  SafeSummaryResult,
+  SiteDiscovery,
+  SiteStatus,
+  StatusEnv,
+  StatusPageModel,
+  StatusRerunAdmission,
+  StatusRerunWindow,
+  StatusSession,
+  StatusStatePayload,
+  StatusView,
+  SyncOutcome,
+  SyncResultSource,
+} from './status';
+
+export {
   loadNotionTemplateResolution,
   normalizeNotionId,
   notionTemplateResolutionKey,
@@ -451,6 +495,7 @@ const JSON_HEADERS = {
 const HTML_HEADERS = {
   'content-type': 'text/html; charset=utf-8',
   'cache-control': 'no-store',
+  'referrer-policy': 'no-referrer',
 };
 
 function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -638,11 +683,17 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
     return json({ error: 'github_configuration_missing' }, 500);
   }
   const url = new URL(request.url);
+  const encodedState = url.searchParams.get('state');
+  // Purpose dispatch runs before the shared error check: each leg's state
+  // verifies only against its own kind, so the status leg finishes here —
+  // including its own denied-callback page — while install states fall
+  // through to the KV-backed flow below. No redirect-URI registration change.
+  if (encodedState && await isStatusCallbackState(encodedState, stateSecret(env as Pick<Env, 'GITHUB_CLIENT_SECRET'>))) {
+    return statusCallback(request, env);
+  }
   if (url.searchParams.has('error')) {
     return json({ error: 'github_authorization_denied' }, 400);
   }
-
-  const encodedState = url.searchParams.get('state');
   if (!encodedState) return json({ error: 'github_state_missing' }, 400);
   const payload = await verifyGithubState(encodedState, stateSecret(env as Pick<Env, 'GITHUB_CLIENT_SECRET'>));
   if (!payload) return json({ error: 'github_state_invalid' }, 400);
@@ -978,6 +1029,14 @@ async function progressStatusResponse(request: Request, env: Partial<Env>): Prom
   return json(projectProvisioning(job, Date.now()));
 }
 
+async function statusPageResponse(request: Request, env: Partial<Env>): Promise<Response> {
+  return statusHome(request, env);
+}
+
+async function statusRerunResponse(request: Request, env: Partial<Env>): Promise<Response> {
+  return statusRerun(request, env);
+}
+
 export function route(
   request: Request,
   env: Partial<Env> = {},
@@ -1007,6 +1066,14 @@ export function route(
 
   if (request.method === 'GET' && url.pathname === '/progress/status') {
     return progressStatusResponse(request, env);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/status') {
+    return statusPageResponse(request, env);
+  }
+
+  if (request.method === 'POST' && url.pathname === '/status/rerun') {
+    return statusRerunResponse(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/github/callback') {

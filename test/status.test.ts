@@ -1,7 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 
-import { signGithubState } from '../src/index';
+import {
+  GENERATED_REPOSITORY_DESCRIPTION,
+  route,
+  signGithubState,
+  type Env,
+} from '../src/index';
 import type { NotionSyncRunIdentity } from '../src/notion-sync';
+import { admitProvisioningRequest, provisioningAdmissionConfig } from '../src/provisioning-throttle';
 import type { GeneratedRepositoryIdentity } from '../src/repository-generation';
 import type { GithubPagesBuildIdentity } from '../src/site-deployment';
 import {
@@ -20,6 +26,8 @@ import {
   STATUS_RERUN_SPACING_SECONDS,
   STATUS_RERUN_WINDOW_SECONDS,
   STATUS_SESSION_COOKIE,
+  STATUS_SESSION_TTL_SECONDS,
+  STATUS_STATE_COOKIE,
   STATUS_STATE_TTL_SECONDS,
   verifyStatusState,
   type SiteDiscovery,
@@ -54,6 +62,14 @@ class MemoryKV {
 
   ttlFor(key: string): number | undefined {
     return this.ttls.get(key);
+  }
+
+  keysWithPrefix(prefix: string): string[] {
+    return [...this.values.keys()].filter((key) => key.startsWith(prefix));
+  }
+
+  entries(): string[] {
+    return [...this.values.values()];
   }
 }
 
@@ -401,5 +417,599 @@ describe('status signing', () => {
 
     const expired: StatusSession = { ...SESSION, exp: START_SECONDS - 1 };
     expect(await rerunTokenValid(await signRerunToken(expired, SECRET), expired, SECRET, START_SECONDS)).toBe(false);
+  });
+});
+
+// ============================================================================
+// Route tests. Every test drives route(new Request(...), env) directly with
+// scripted fetch, per house convention.
+// ============================================================================
+
+/** Throwaway RSA key so the App-JWT mint never touches real key material. */
+let throwawayPrivateKey: Promise<string> | undefined;
+
+function generateThrowawayPrivateKey(): Promise<string> {
+  throwawayPrivateKey ??= (async () => {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+      true,
+      ['sign', 'verify'],
+    );
+    const der = new Uint8Array(await crypto.subtle.exportKey('pkcs8', keyPair.privateKey));
+    let base64 = '';
+    for (const byte of der) base64 += String.fromCharCode(byte);
+    return `-----BEGIN PRIVATE KEY-----\n${btoa(base64)}\n-----END PRIVATE KEY-----`;
+  })();
+  return throwawayPrivateKey;
+}
+
+interface RecordedRequest {
+  method: string;
+  url: string;
+  authorization: string | null;
+  bodyText: string;
+}
+
+type FetchHandler = (request: Request) => Promise<Response> | Response;
+
+async function withScriptedFetch<T>(
+  handler: FetchHandler,
+  journey: (requests: RecordedRequest[]) => Promise<T>,
+): Promise<T> {
+  const requests: RecordedRequest[] = [];
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      requests.push({
+        method: request.method,
+        url: request.url,
+        authorization: request.headers.get('authorization'),
+        bodyText: request.method === 'GET' || request.method === 'HEAD' ? '' : await request.text(),
+      });
+      return handler(request);
+    };
+    return await journey(requests);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+function statusEnv(kv: MemoryKV, overrides: Partial<Record<string, string>> = {}): Partial<Env> {
+  return {
+    JOBS: kv as unknown as KVNamespace,
+    GITHUB_APP_ID: '4798518',
+    GITHUB_APP_PRIVATE_KEY: 'not-a-real-key-until-mint',
+    GITHUB_CLIENT_ID: 'client-id',
+    GITHUB_CLIENT_SECRET: 'client-secret',
+    ...overrides,
+  };
+}
+
+async function statusEnvWithAppKey(kv: MemoryKV, overrides: Partial<Record<string, string>> = {}): Promise<Partial<Env>> {
+  return statusEnv(kv, { GITHUB_APP_PRIVATE_KEY: await generateThrowawayPrivateKey(), ...overrides });
+}
+
+const VIEWER: StatusSession = {
+  v: 1,
+  accountId: 42,
+  login: 'alice',
+  installationId: 987654,
+  exp: Math.floor(Date.now() / 1000) + 3600,
+};
+
+async function sessionCookie(): Promise<string> {
+  return `${STATUS_SESSION_COOKIE}=${encodeURIComponent(await signStatusSession(VIEWER, 'client-secret'))}`;
+}
+
+const GENERATED_REPOSITORY = {
+  id: 1001,
+  name: 'alice.github.io',
+  full_name: 'alice/alice.github.io',
+  html_url: 'https://github.com/alice/alice.github.io',
+  default_branch: 'main',
+  description: GENERATED_REPOSITORY_DESCRIPTION,
+  fork: false,
+};
+
+const COMPLETED_RUN = {
+  id: 555,
+  html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
+  status: 'completed',
+  conclusion: 'success',
+  head_sha: 'head-sha',
+  created_at: '2026-09-01T10:00:00Z',
+  updated_at: '2026-09-01T10:05:00Z',
+  event: 'workflow_dispatch',
+};
+
+/** The discovery + dispatch routes of one healthy site. */
+function healthySiteHandler(request: Request): Response {
+  const url = request.url;
+  if (request.method === 'GET' && url === 'https://api.github.com/app/installations/987654') {
+    return Response.json({
+      account: { id: 42, login: 'alice', type: 'User' },
+      suspended_at: null,
+      suspended_by: null,
+    });
+  }
+  if (request.method === 'POST' && url === 'https://api.github.com/app/installations/987654/access_tokens') {
+    return Response.json({ token: 'installation-token' });
+  }
+  if (request.method === 'GET' && url.startsWith('https://api.github.com/installation/repositories')) {
+    return Response.json({ total_count: 1, repositories: [GENERATED_REPOSITORY] });
+  }
+  if (request.method === 'GET' && url.includes('/actions/workflows/sync-notion.yml/runs')) {
+    return Response.json({ workflow_runs: [COMPLETED_RUN] });
+  }
+  if (request.method === 'GET' && url.includes('/pages/builds/latest')) {
+    return Response.json({ url: 'https://api.github.com/repos/alice/alice.github.io/pages/builds/3', status: 'built', commit: 'head-sha' });
+  }
+  if (request.method === 'POST' && url.includes('/actions/workflows/sync-notion.yml/dispatches')) {
+    return new Response(null, { status: 204 });
+  }
+  return Response.json({ message: 'unexpected provider request' }, { status: 500 });
+}
+
+function setCookieValues(response: Response): string[] {
+  return response.headers.getSetCookie();
+}
+
+describe('status routes', () => {
+  test('GET /status without a session renders the entry page with zero side effects', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    await withScriptedFetch(() => {
+      throw new Error('no provider request expected');
+    }, async (requests) => {
+      const response = await route(new Request('https://example.com/status'), env);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+      expect(await response.text()).toContain('Sign in with GitHub');
+      expect(kv.puts).toBe(0);
+      expect(requests).toEqual([]);
+    });
+  });
+
+  test('?connect=1 redirects into the authorize leg and sets the double-submit state cookie', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const response = await route(new Request('https://example.com/status?connect=1'), env);
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.origin).toBe('https://github.com');
+    expect(location.pathname).toBe('/login/oauth/authorize');
+    expect(location.searchParams.get('client_id')).toBe('client-id');
+    expect(location.searchParams.get('redirect_uri')).toBe('https://example.com/auth/github/callback');
+
+    const cookies = setCookieValues(response);
+    const stateCookieHeader = cookies.find((cookie) => cookie.startsWith(`${STATUS_STATE_COOKIE}=`))!;
+    expect(stateCookieHeader).toContain('Max-Age=600');
+    expect(stateCookieHeader).toContain('HttpOnly');
+    expect(stateCookieHeader).toContain('Secure');
+    expect(stateCookieHeader).toContain('SameSite=Lax');
+    expect(stateCookieHeader).toContain('Path=/');
+
+    const nonce = decodeURIComponent(stateCookieHeader.split('=')[1].split(';')[0]);
+    const payload = await verifyStatusState(location.searchParams.get('state')!, 'client-secret', Math.floor(Date.now() / 1000));
+    expect(payload).toMatchObject({ v: 1, purpose: 'status', nonce });
+    expect(kv.puts).toBe(0);
+  });
+
+  test('the status callback proves identity fresh, sets only the session cookie, and persists nothing', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const payload = statusStatePayload(Math.floor(Date.now() / 1000));
+    const state = await signStatusState(payload, 'client-secret');
+
+    await withScriptedFetch((request) => {
+      if (request.method === 'POST' && request.url === 'https://github.com/login/oauth/access_token') {
+        return Response.json({ access_token: 'user-token', token_type: 'bearer' });
+      }
+      if (request.url === 'https://api.github.com/user') {
+        return Response.json({ id: 42, login: 'alice', type: 'User' });
+      }
+      if (request.url === 'https://api.github.com/user/installations') {
+        return Response.json({ installations: [{ id: 987654, app_id: '4798518' }] });
+      }
+      throw new Error(`unexpected provider request: ${request.method} ${request.url}`);
+    }, async (requests) => {
+      const response = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code`, {
+          headers: { Cookie: `${STATUS_STATE_COOKIE}=${payload.nonce}` },
+        }),
+        env,
+      );
+      expect(response.status).toBe(303);
+      expect(response.headers.get('location')).toBe('https://example.com/status');
+
+      const cookies = setCookieValues(response);
+      const session = cookies.find((cookie) => cookie.startsWith(`${STATUS_SESSION_COOKIE}=`))!;
+      expect(session).toContain(`Max-Age=${STATUS_SESSION_TTL_SECONDS}`);
+      expect(cookies.some((cookie) => cookie.startsWith(`${STATUS_STATE_COOKIE}=;`) && cookie.includes('Max-Age=0'))).toBe(true);
+
+      const token = decodeURIComponent(session.split('=')[1].split(';')[0]);
+      const proved = await readStatusSession(
+        new Request('https://example.com/status', { headers: { Cookie: `${STATUS_SESSION_COOKIE}=${token}` } }),
+        'client-secret',
+      );
+      expect(proved).toEqual({ v: 1, accountId: 42, login: 'alice', installationId: 987654, exp: proved!.exp });
+
+      expect(kv.puts).toBe(0);
+      expect(kv.entries()).toEqual([]);
+      const persistedSurface = JSON.stringify({ kv: kv.entries(), cookies });
+      expect(persistedSurface).not.toContain('user-token');
+      expect(persistedSurface).not.toContain('one-time-code');
+      const unwrapped = requests.filter((request) => request.authorization === 'Bearer user-token');
+      expect(unwrapped.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  test('a session cannot ride a foreign installation: discovery re-proofs the account', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const forged: StatusSession = { ...VIEWER, login: 'bob' };
+    const cookie = `${STATUS_SESSION_COOKIE}=${encodeURIComponent(await signStatusSession(forged, 'client-secret'))}`;
+
+    await withScriptedFetch((request) => {
+      if (request.method === 'GET' && request.url === 'https://api.github.com/app/installations/987654') {
+        return Response.json({
+          account: { id: 42, login: 'alice', type: 'User' },
+          suspended_at: null,
+          suspended_by: null,
+        });
+      }
+      throw new Error(`unexpected provider request: ${request.method} ${request.url}`);
+    }, async (requests) => {
+      const response = await route(
+        new Request('https://example.com/status', { headers: { Cookie: cookie } }),
+        env,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('InkDrafts no longer has access');
+      expect(requests).toHaveLength(1);
+    });
+  });
+
+  test('callback failure modes render the auth_failed page and clear the state cookie', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const payload = statusStatePayload(Math.floor(Date.now() / 1000));
+    const state = await signStatusState(payload, 'client-secret');
+    const stateCookieHeader = `${STATUS_STATE_COOKIE}=${payload.nonce}`;
+
+    const deniedState = await signStatusState(statusStatePayload(Math.floor(Date.now() / 1000)), 'client-secret');
+    const denied = await route(
+      new Request(`https://example.com/auth/github/callback?error=access_denied&error_description=nope&state=${encodeURIComponent(deniedState)}`),
+      env,
+    );
+    expect(denied.status).toBe(400);
+    expect(await denied.text()).toContain('Sign-in did not complete');
+    expect(setCookieValues(denied).some((cookie) => cookie.startsWith(`${STATUS_STATE_COOKIE}=;`))).toBe(true);
+
+    const validState = `https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=code`;
+    expect((await route(new Request('https://example.com/auth/github/callback'), env)).status).toBe(400);
+    expect((await route(
+      new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}`),
+      env,
+    )).status).toBe(400);
+    const noCookie = await route(new Request(validState), env);
+    expect(noCookie.status).toBe(400);
+    expect(await noCookie.text()).toContain('Sign-in did not complete');
+
+    await withScriptedFetch((request) => {
+      if (request.method === 'POST' && request.url === 'https://github.com/login/oauth/access_token') {
+        return Response.json({ error: 'bad_verification_code' }, { status: 400 });
+      }
+      throw new Error(`unexpected provider request: ${request.method} ${request.url}`);
+    }, async (requests) => {
+      const refused = await route(
+        new Request(validState, { headers: { Cookie: stateCookieHeader } }),
+        env,
+      );
+      expect(refused.status).toBe(400);
+      expect(requests).toHaveLength(1);
+    });
+
+    await withScriptedFetch(() => new Response(null, { status: 500 }), async () => {
+      const unavailable = await route(
+        new Request(validState, { headers: { Cookie: stateCookieHeader } }),
+        env,
+      );
+      expect(unavailable.status).toBe(502);
+      expect(await unavailable.text()).toContain('GitHub is not answering');
+    });
+    expect(kv.puts).toBe(0);
+  });
+
+  test('the purpose dispatch routes each kind to its own finisher', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+
+    const statusToken = await signStatusState(statusStatePayload(Math.floor(Date.now() / 1000)), 'client-secret');
+    const statusLeg = await route(
+      new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(statusToken)}&code=code`),
+      env,
+    );
+    expect(statusLeg.status).toBe(400);
+    expect(await statusLeg.text()).toContain('Sign-in did not complete');
+
+    const foreign = await signStatusState(statusStatePayload(Math.floor(Date.now() / 1000)), 'other-key');
+    const installLeg = await route(
+      new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(foreign)}&code=code`),
+      env,
+    );
+    expect(installLeg.status).toBe(400);
+    expect(await installLeg.json()).toEqual({ error: 'github_state_invalid' });
+  });
+
+  test('the rerun gates refuse in order: origin, session, form token', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+    const form = new URLSearchParams({ token });
+
+    const crossOrigin = await route(
+      new Request('https://example.com/status/rerun', {
+        method: 'POST',
+        headers: { Origin: 'https://evil.example', Cookie: await sessionCookie() },
+        body: form,
+      }),
+      env,
+    );
+    expect(crossOrigin.status).toBe(403);
+    expect(kv.puts).toBe(0);
+
+    const signedOut = await route(
+      new Request('https://example.com/status/rerun', { method: 'POST', body: form }),
+      env,
+    );
+    expect(signedOut.status).toBe(303);
+    expect(signedOut.headers.get('location')).toBe('https://example.com/status?notice=signin_required');
+
+    const badToken = await route(
+      new Request('https://example.com/status/rerun', {
+        method: 'POST',
+        headers: { Cookie: await sessionCookie() },
+        body: new URLSearchParams({ token: 'forged' }),
+      }),
+      env,
+    );
+    expect(badToken.status).toBe(403);
+    expect(kv.puts).toBe(0);
+  });
+
+  test('a healthy rerun dispatches with bulk delete pinned off and consumes the window first', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+
+    await withScriptedFetch(healthySiteHandler, async (requests) => {
+      const response = await route(
+        new Request('https://example.com/status/rerun', {
+          method: 'POST',
+          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+          body: new URLSearchParams({ token }),
+        }),
+        env,
+      );
+      expect(response.status).toBe(303);
+      expect(response.headers.get('location')).toBe('https://example.com/status?notice=sync_triggered');
+
+      const dispatch = requests.find((request) => request.url.includes('/dispatches'));
+      expect(dispatch).toBeDefined();
+      expect(dispatch!.method).toBe('POST');
+      expect(dispatch!.authorization).toBe('Bearer installation-token');
+      expect(JSON.parse(dispatch!.bodyText)).toEqual({ ref: 'main', inputs: { allow_bulk_delete: 'false' } });
+
+      const window = JSON.parse(kv.value(statusRerunKey(42))!);
+      expect(window).toMatchObject({ version: 1, count: 1 });
+      expect(kv.keysWithPrefix('provisioning:admission:burst:')).toHaveLength(1);
+      expect(kv.value('github:rate:global')).toBeDefined();
+    });
+  });
+
+  test('a live run converges the rerun to already_running without consuming the window', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+
+    await withScriptedFetch((request) => {
+      if (request.url.includes('/actions/workflows/sync-notion.yml/runs')) {
+        return Response.json({ workflow_runs: [{ ...COMPLETED_RUN, status: 'in_progress', conclusion: null }] });
+      }
+      return healthySiteHandler(request);
+    }, async (requests) => {
+      const response = await route(
+        new Request('https://example.com/status/rerun', {
+          method: 'POST',
+          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+          body: new URLSearchParams({ token }),
+        }),
+        env,
+      );
+      expect(response.status).toBe(303);
+      expect(response.headers.get('location')).toBe('https://example.com/status?notice=already_running');
+      expect(kv.value(statusRerunKey(42))).toBeUndefined();
+      expect(requests.find((request) => request.url.includes('/dispatches'))).toBeUndefined();
+    });
+  });
+
+  test('a discovery failure on rerun renders the reason page without gating further', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+
+    await withScriptedFetch((request) => {
+      if (request.url.startsWith('https://api.github.com/installation/repositories')) {
+        return Response.json({ total_count: 0, repositories: [] });
+      }
+      return healthySiteHandler(request);
+    }, async (requests) => {
+      const response = await route(
+        new Request('https://example.com/status/rerun', {
+          method: 'POST',
+          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+          body: new URLSearchParams({ token }),
+        }),
+        env,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('We could not find an InkDrafts site');
+      expect(kv.value(statusRerunKey(42))).toBeUndefined();
+      expect(requests.find((request) => request.url.includes('/dispatches'))).toBeUndefined();
+    });
+  });
+
+  test('the IP burst window refuses an over-eager rerun with 429 and Retry-After', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+    const config = provisioningAdmissionConfig(env);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const admission = await admitProvisioningRequest(env as Env, config, {
+        request: new Request('https://example.com/status/rerun', { method: 'POST' }),
+        jobId: `filler-${attempt}`,
+        hmacSecret: 'client-secret',
+      }, Date.now(), 'status_rerun');
+      expect(admission.action).toBe('allow');
+    }
+
+    await withScriptedFetch(healthySiteHandler, async (requests) => {
+      const response = await route(
+        new Request('https://example.com/status/rerun', {
+          method: 'POST',
+          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+          body: new URLSearchParams({ token }),
+        }),
+        env,
+      );
+      expect(response.status).toBe(429);
+      expect(response.headers.get('retry-after')).toBeTruthy();
+      expect(requests.find((request) => request.url.includes('/dispatches'))).toBeUndefined();
+    });
+  });
+
+  test('a paused admission stage refuses the rerun with 503', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv, { PROVISIONING_CONTROL_MODE: 'pause' });
+    const token = await signRerunToken(VIEWER, 'client-secret');
+    const response = await route(
+      new Request('https://example.com/status/rerun', {
+        method: 'POST',
+        headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+        body: new URLSearchParams({ token }),
+      }),
+      env,
+    );
+    expect(response.status).toBe(503);
+  });
+
+  test('the per-account window and the global budget each refuse with their retry seconds', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+    const rerunRequest = async () => new Request('https://example.com/status/rerun', {
+      method: 'POST',
+      headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+      body: new URLSearchParams({ token }),
+    });
+
+    const nowMs = Date.now();
+    await kv.put(statusRerunKey(42), JSON.stringify({
+      version: 1, windowStartedAt: nowMs, lastRerunAt: nowMs, count: STATUS_RERUN_DAILY_LIMIT,
+    }), { expirationTtl: 60 });
+    await withScriptedFetch(healthySiteHandler, async (requests) => {
+      const capped = await route(await rerunRequest(), env);
+      expect(capped.status).toBe(429);
+      expect(capped.headers.get('retry-after')).toBeTruthy();
+      expect(requests.find((request) => request.url.includes('/dispatches'))).toBeUndefined();
+    });
+
+    await kv.delete(statusRerunKey(42));
+    await kv.put('github:rate:global', JSON.stringify({
+      version: 1,
+      minuteBucket: Math.floor(Date.now() / 60_000),
+      minuteCount: 30,
+      hourBucket: Math.floor(Date.now() / 3_600_000),
+      hourCount: 240,
+    }), { expirationTtl: 7200 });
+    await withScriptedFetch(healthySiteHandler, async (requests) => {
+      const throttled = await route(await rerunRequest(), env);
+      expect(throttled.status).toBe(429);
+      expect(throttled.headers.get('retry-after')).toBeTruthy();
+      expect(requests.find((request) => request.url.includes('/dispatches'))).toBeUndefined();
+    });
+  });
+
+  test('GET /status with a session renders the derived page, leaks nothing, and refreshes only while running', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const cookie = await sessionCookie();
+
+    await withScriptedFetch(healthySiteHandler, async (requests) => {
+      const settled = await route(
+        new Request('https://example.com/status', { headers: { Cookie: cookie } }),
+        env,
+      );
+      expect(settled.status).toBe(200);
+      expect(settled.headers.get('referrer-policy')).toBe('no-referrer');
+      const html = await settled.text();
+      expect(html).toContain('Your site');
+      expect(html).toContain('alice');
+      expect(html).toContain('https://alice.github.io');
+      expect(html).toContain('Derived from the workflow run result');
+      expect(html).not.toContain('http-equiv="refresh"');
+      expect(html).not.toContain('987654');
+      expect(html).not.toContain('installation-token');
+      expect(requests.length).toBeGreaterThan(0);
+    });
+
+    await withScriptedFetch((request) => {
+      if (request.url.includes('/actions/workflows/sync-notion.yml/runs')) {
+        return Response.json({ workflow_runs: [{ ...COMPLETED_RUN, status: 'in_progress', conclusion: null }] });
+      }
+      return healthySiteHandler(request);
+    }, async () => {
+      const running = await route(
+        new Request('https://example.com/status', { headers: { Cookie: cookie } }),
+        env,
+      );
+      expect(running.status).toBe(200);
+      expect(await running.text()).toContain('http-equiv="refresh" content="30"');
+    });
+  });
+
+  test('a degraded discovery renders its own page without inventing failure detail', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const cookie = await sessionCookie();
+
+    await withScriptedFetch((request) => {
+      if (request.method === 'GET' && request.url === 'https://api.github.com/app/installations/987654') {
+        return Response.json({
+          account: { id: 42, login: 'alice', type: 'User' },
+          suspended_at: new Date().toISOString(),
+          suspended_by: 'github',
+        });
+      }
+      throw new Error(`unexpected provider request: ${request.method} ${request.url}`);
+    }, async () => {
+      const response = await route(
+        new Request('https://example.com/status', { headers: { Cookie: cookie } }),
+        env,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('suspended');
+    });
+
+    await withScriptedFetch(() => new Response(null, { status: 500 }), async () => {
+      const unavailable = await route(
+        new Request('https://example.com/status', { headers: { Cookie: cookie } }),
+        env,
+      );
+      expect(unavailable.status).toBe(200);
+      expect(await unavailable.text()).toContain('GitHub is not answering');
+    });
   });
 });

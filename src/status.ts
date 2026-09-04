@@ -20,20 +20,39 @@ import {
   type GithubAppAuthEnv,
   type GithubInstallationAccount,
 } from './github-app-auth';
+import { userCopy, type ProvisioningFailureCode } from './failures';
+import { dispatchNotionSyncWorkflow, GithubSyncError, latestDispatchedSyncRun, type NotionSyncRunIdentity } from './notion-sync';
+import {
+  admitProvisioningRequest,
+  admitProvisioningStage,
+  admissionFailureCode,
+  consumeGlobalMutationBudget,
+  provisioningAdmissionConfig,
+  provisioningThrottleConfig,
+  withKeyLock,
+  type ProvisioningThrottleVars,
+} from './provisioning-throttle';
 import {
   findReusableGeneratedRepository,
   type GeneratedRepositoryIdentity,
 } from './repository-generation';
 import { repositoryDestination } from './repository-naming';
-import { latestDispatchedSyncRun, type NotionSyncRunIdentity } from './notion-sync';
 import { latestPagesBuild, type GithubPagesBuildIdentity } from './site-deployment';
 import { payloadExpired, signSignedPayload, verifySignedPayload } from './signed-payload';
-import { withKeyLock } from './provisioning-throttle';
 import type { Secret } from './secret';
+import { statusPage, statusRefusalPage, type StatusPageChrome } from './status-page';
+import {
+  exchangeGithubCode,
+  findUserInstallation,
+  getAuthenticatedGithubUser,
+  GithubApiError,
+} from './github-user-auth';
 
 /** The bindings and secrets the status surface needs; structurally part of
- * `Env`, declared here so this module never imports `index.ts`. */
-export interface StatusEnv extends GithubAppAuthEnv {
+ * `Env`, declared here so this module never imports `index.ts`. The throttle
+ * vars ride along because the rerun POST feeds the whole env to the shared
+ * admission and budget config parsers. */
+export interface StatusEnv extends GithubAppAuthEnv, ProvisioningThrottleVars {
   JOBS: KVNamespace;
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
@@ -508,4 +527,243 @@ export async function admitStatusRerun(
     });
     return { admitted: true };
   });
+}
+
+// ============================================================================
+// Handlers. Thin shells: session gate, discovery, projection, renderer.
+// All policy lives in the pieces above.
+// ============================================================================
+
+function statusHtml(document: string, status = 200, cookies: string[] = [], retryAfterSeconds: number | null = null): Response {
+  const headers = new Headers({
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+  });
+  if (retryAfterSeconds !== null) headers.set('retry-after', String(retryAfterSeconds));
+  for (const cookie of cookies) headers.append('Set-Cookie', cookie);
+  return new Response(document, { status, headers });
+}
+
+function redirectResponse(status: 302 | 303, location: string, cookies: string[] = []): Response {
+  const headers = new Headers({ Location: location });
+  for (const cookie of cookies) headers.append('Set-Cookie', cookie);
+  return new Response(null, { status, headers });
+}
+
+function configMissingResponse(): Response {
+  return new Response(JSON.stringify({ error: 'github_configuration_missing' }), {
+    status: 500,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  });
+}
+
+function stateCookie(nonce: string): string {
+  return `${STATUS_STATE_COOKIE}=${encodeURIComponent(nonce)}; Max-Age=${STATUS_STATE_TTL_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+}
+
+const CLEAR_STATE_COOKIE = `${STATUS_STATE_COOKIE}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`;
+
+function sessionCookie(token: string): string {
+  return `${STATUS_SESSION_COOKIE}=${encodeURIComponent(token)}; Max-Age=${STATUS_SESSION_TTL_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function noticeOf(url: URL): StatusPageChrome['notice'] {
+  const notice = url.searchParams.get('notice');
+  return notice === 'signin_required' || notice === 'sync_triggered' || notice === 'already_running' ? notice : null;
+}
+
+function refusedResponse(code: ProvisioningFailureCode, status: number, retryAfterSeconds: number | null): Response {
+  const copy = userCopy(code);
+  return statusHtml(
+    statusRefusalPage({ title: copy.message, body: copy.action, retryAfterSeconds }),
+    status,
+    [],
+    retryAfterSeconds,
+  );
+}
+
+/** `GET /status`. No session renders the entry page (or the authorize
+ * redirect for `?connect=1`); a session re-derives the site from GitHub. */
+export async function statusHome(request: Request, env: Partial<StatusEnv>): Promise<Response> {
+  const { GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY } = env;
+  if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET || !GITHUB_APP_ID || !GITHUB_APP_PRIVATE_KEY) {
+    return configMissingResponse();
+  }
+  const url = new URL(request.url);
+  const session = await readStatusSession(request, GITHUB_CLIENT_SECRET);
+  if (!session) {
+    const chrome: StatusPageChrome = { notice: noticeOf(url), rerunFormToken: null };
+    if (url.searchParams.get('connect') === '1') {
+      const payload = statusStatePayload(Math.floor(Date.now() / 1000));
+      const authorizeUrl = new URL('https://github.com/login/oauth/authorize');
+      authorizeUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
+      authorizeUrl.searchParams.set('redirect_uri', new URL('/auth/github/callback', request.url).toString());
+      authorizeUrl.searchParams.set('state', await signStatusState(payload, GITHUB_CLIENT_SECRET));
+      return redirectResponse(302, authorizeUrl.toString(), [stateCookie(payload.nonce)]);
+    }
+    return statusHtml(statusPage({ kind: 'entry' }, chrome));
+  }
+
+  const discovery = await discoverSite({ GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY }, session);
+  const view = projectSiteStatus(discovery, session);
+  return statusHtml(statusPage(view, {
+    notice: noticeOf(url),
+    rerunFormToken: await signRerunToken(session, GITHUB_CLIENT_SECRET),
+  }));
+}
+
+/**
+ * The status leg of the shared GitHub OAuth callback, dispatched from
+ * `finishGithubCallback` when the signed state proves purpose `status`.
+ * Everything the session carries — account, login, installation — derives
+ * from the identity GitHub just proved; nothing is trusted from the state
+ * payload beyond its kind and nonce, so a session can never name another
+ * user's installation. Zero KV writes: the state nonce lives only in the
+ * double-submit cookie, cleared on every response, which is the replay
+ * defense. The user access token dies inside this request.
+ */
+export async function statusCallback(request: Request, env: Partial<StatusEnv>): Promise<Response> {
+  const { GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_APP_ID } = env;
+  if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET || !GITHUB_APP_ID) {
+    return configMissingResponse();
+  }
+  const authFailed = (reason: 'denied' | 'state_invalid' = 'state_invalid'): Response =>
+    statusHtml(statusPage({ kind: 'auth_failed', reason }, { notice: null, rerunFormToken: null }), 400, [CLEAR_STATE_COOKIE]);
+  const githubUnavailable = (): Response =>
+    statusHtml(
+      statusPage({ kind: 'github_unavailable', retryAfterSeconds: null }, { notice: null, rerunFormToken: null }),
+      502,
+      [CLEAR_STATE_COOKIE],
+    );
+
+  const url = new URL(request.url);
+  if (url.searchParams.has('error')) return authFailed('denied');
+  const encodedState = url.searchParams.get('state');
+  if (!encodedState) return authFailed();
+  const payload = await verifyStatusState(encodedState, GITHUB_CLIENT_SECRET, Math.floor(Date.now() / 1000));
+  if (!payload) return authFailed();
+  if (cookieValue(request, STATUS_STATE_COOKIE) !== payload.nonce) return authFailed();
+  const code = url.searchParams.get('code');
+  if (!code) return authFailed();
+
+  try {
+    const userToken = await exchangeGithubCode(
+      code,
+      { GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET },
+      new URL('/auth/github/callback', request.url).toString(),
+    );
+    // The token is scoped to this request. It is never logged, returned, or
+    // passed to KV; it leaves the Secret only at these provider-call unwraps.
+    const authenticatedUser = await getAuthenticatedGithubUser(userToken.bearer());
+    const installationId = await findUserInstallation(userToken.bearer(), GITHUB_APP_ID);
+    const session: StatusSession = {
+      v: 1,
+      accountId: authenticatedUser.id,
+      login: authenticatedUser.login,
+      installationId,
+      exp: Math.floor(Date.now() / 1000) + STATUS_SESSION_TTL_SECONDS,
+    };
+    return redirectResponse(303, new URL('/status', request.url).toString(), [
+      sessionCookie(await signStatusSession(session, GITHUB_CLIENT_SECRET)),
+      CLEAR_STATE_COOKIE,
+    ]);
+  } catch (error) {
+    // GitHub auth failures are a failed sign-in; a rate limit or outage is
+    // GitHub being unreachable. No provider detail reaches either page.
+    if (!(error instanceof GithubApiError) || error.status === 429 || error.status >= 500) return githubUnavailable();
+    return authFailed();
+  }
+}
+
+/**
+ * `POST /status/rerun`. Gate order: origin, session, form token, IP burst,
+ * admission stage, discovery (failure arms render as pages, since there is
+ * then nothing to re-run), live-run convergence, per-account window, global
+ * budget, dispatch. The window slot is consumed before the dispatch, so a
+ * crash overcounts conservatively.
+ */
+export async function statusRerun(request: Request, env: Partial<StatusEnv>): Promise<Response> {
+  const url = new URL(request.url);
+  const origin = request.headers.get('Origin');
+  if (origin !== null && origin !== url.origin) {
+    return statusHtml(statusPage({ kind: 'auth_failed', reason: 'state_invalid' }, { notice: null, rerunFormToken: null }), 403);
+  }
+
+  const { JOBS, GITHUB_CLIENT_SECRET, GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY } = env;
+  if (!JOBS || !GITHUB_CLIENT_SECRET || !GITHUB_APP_ID || !GITHUB_APP_PRIVATE_KEY) {
+    return configMissingResponse();
+  }
+
+  const session = await readStatusSession(request, GITHUB_CLIENT_SECRET);
+  if (!session) {
+    return redirectResponse(303, new URL('/status?notice=signin_required', request.url).toString());
+  }
+
+  const form = await request.formData().catch(() => null);
+  const token = form?.get('token');
+  if (
+    typeof token !== 'string' ||
+    !(await rerunTokenValid(token, session, GITHUB_CLIENT_SECRET, Math.floor(Date.now() / 1000)))
+  ) {
+    return statusHtml(statusPage({ kind: 'auth_failed', reason: 'state_invalid' }, { notice: null, rerunFormToken: null }), 403);
+  }
+
+  const admissionConfig = provisioningAdmissionConfig(env);
+  // No jobId exists on this leg; the burst bucket needs a per-request label
+  // only, so its audit rows stay keyed without inventing a durable id.
+  const requestLabel = crypto.randomUUID();
+  const burst = await admitProvisioningRequest(env as StatusEnv, admissionConfig, {
+    request,
+    jobId: requestLabel,
+    hmacSecret: GITHUB_CLIENT_SECRET,
+  }, Date.now(), 'status_rerun');
+  if (burst.action !== 'allow') {
+    return refusedResponse(admissionFailureCode(burst.reason), burst.action === 'pause' ? 503 : 429, burst.retryAfterSeconds);
+  }
+  const stage = await admitProvisioningStage(env as StatusEnv, admissionConfig, {
+    stage: 'status_rerun',
+    jobId: requestLabel,
+    accountId: session.accountId,
+  }, Date.now());
+  if (stage.action !== 'allow') {
+    return refusedResponse(admissionFailureCode(stage.reason), 503, stage.retryAfterSeconds);
+  }
+
+  const discovery = await discoverSite({ GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY }, session);
+  if (!discovery.ok) {
+    return statusHtml(statusPage(projectSiteStatus(discovery, session), { notice: null, rerunFormToken: null }));
+  }
+  const repository = discovery.repository;
+
+  // The idempotence check: GitHub says whether a run is live, so a double
+  // POST converges on the same redirect instead of a second dispatch.
+  if (discovery.syncRun !== null && discovery.syncRun.status !== 'completed') {
+    return redirectResponse(303, new URL('/status?notice=already_running', request.url).toString());
+  }
+
+  const rerunWindow = await admitStatusRerun(JOBS, session.accountId, Date.now());
+  if (!rerunWindow.admitted) {
+    const code = rerunWindow.reason === 'daily_cap' ? 'github_request_burst_limited' : 'github_rate_limited';
+    return refusedResponse(code, 429, rerunWindow.retryAfterSeconds);
+  }
+  const budget = await consumeGlobalMutationBudget(JOBS, provisioningThrottleConfig(env), Date.now(), Math.random);
+  if (!budget.admitted) {
+    return refusedResponse('github_rate_limited', 429, budget.delaySeconds);
+  }
+
+  try {
+    const installationToken = await createGithubInstallationToken({ GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY }, session.installationId);
+    await dispatchNotionSyncWorkflow(installationToken.raw, repository.fullName);
+  } catch (error) {
+    if (error instanceof GithubSyncError) {
+      return refusedResponse(error.code, error.status, error.retryAfterSeconds);
+    }
+    if (error instanceof GithubAppAuthError) {
+      return refusedResponse(error.code, error.status === 429 ? 429 : 502, error.retryAfterSeconds);
+    }
+    return refusedResponse('github_app_unavailable', 502, null);
+  }
+
+  return redirectResponse(303, new URL('/status?notice=sync_triggered', request.url).toString());
 }
