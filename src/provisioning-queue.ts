@@ -19,6 +19,7 @@ import { createGithubInstallationToken, type GithubAppAuthEnv } from './github-a
 import { classifyProvisioningError, type ProvisioningErrorClassification } from './failures';
 import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import { PROVISIONING_STEP_HANDLERS, type StepRunnerContext } from './provisioning-steps';
+import type { Secret } from './secret';
 import {
   isTerminalProvisioningStatus,
   loadProvisioningJob,
@@ -291,7 +292,7 @@ export async function processProvisioningMessage(
     attempt: locked.steps[step].attempts + 1,
   });
 
-  let installationToken: string;
+  let installationToken: Secret<'github-installation'>;
   try {
     installationToken = await createGithubInstallationToken(env, locked.installationId, fetcher);
   } catch (error) {
