@@ -126,6 +126,7 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
 class MemoryKV {
   private values = new Map<string, string>();
   private ttls = new Map<string, number>();
+  puts = 0;
 
   async get<T>(key: string, type?: string): Promise<T | string | null> {
     const value = this.values.get(key);
@@ -134,6 +135,7 @@ class MemoryKV {
   }
 
   async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+    this.puts += 1;
     this.values.set(key, value);
     if (options?.expirationTtl !== undefined) this.ttls.set(key, options.expirationTtl);
   }
@@ -1154,10 +1156,7 @@ describe('Notion onboarding continuation', () => {
       NOTION_POSTS_DATABASE_ID: POSTS_DB,
     });
     expect(queue.sent).toEqual([{ jobId: JOB_ID }]);
-    expect(details).toEqual({
-      repository: { name: 'alice.github.io', html_url: 'https://github.com/alice/alice.github.io' },
-      site: { url: 'https://alice.github.io' },
-    });
+    expect(details).toBeUndefined();
 
     const stored = await kv.get<ProvisioningJob>(`github:onboarding-job:${JOB_ID}`, 'json');
     expect(stored?.status).toBe('queued');
@@ -1316,11 +1315,13 @@ describe('Notion onboarding continuation', () => {
       continueOnboarding: continueNotionOnboarding(env, { fetcher: fake.fetcher, sleep: async () => {} }),
     });
 
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({
-      error: 'provisioning_handoff_failed',
-      retry_url: `/connect/notion?job_id=${JOB_ID}`,
-    });
+    // The awaiting-Notion progress page is the handoff failure's prescribed
+    // recovery, so the browser lands there instead of on a JSON error.
+    expect(response.status).toBe(303);
+    expect(response.headers.get('location')).toBe(`https://example.com/progress?job_id=${JOB_ID}`);
+    const stalled = await kv.get<ProvisioningJob>(`github:onboarding-job:${JOB_ID}`, 'json');
+    expect(stalled?.status).toBe('awaiting_notion');
+    expect(stalled?.data.notionSecretsWrittenAt).toBeGreaterThan(0);
   });
 
   test('surfaces resolution failures through the callback response with non-secret details', async () => {
@@ -1365,22 +1366,97 @@ describe('Notion onboarding continuation', () => {
     try {
       const callback = await workerFetch(notionCallbackRequest(state, cookie), env);
 
-      expect(callback.status).toBe(202);
-      const bodyText = await callback.clone().text();
-      expect(await callback.json()).toEqual({
-        ok: true,
-        status: 'notion_authorized',
-        job_id: JOB_ID,
-        template: { duplicated: true },
-        repository: { name: 'alice.github.io', html_url: 'https://github.com/alice/alice.github.io' },
-        site: { url: 'https://alice.github.io' },
-      });
-      expect(bodyText).not.toContain(NOTION_ACCESS_TOKEN);
-      expect(bodyText).not.toContain(INSTALLATION_TOKEN);
+      expect(callback.status).toBe(303);
+      expect(callback.headers.get('location')).toBe(`https://example.com/progress?job_id=${JOB_ID}`);
+      expect(await callback.text()).toBe('');
       expect(queue.sent).toEqual([{ jobId: JOB_ID }]);
       expect(kv.entries().join('\n')).not.toContain(NOTION_ACCESS_TOKEN);
+      expect(kv.entries().join('\n')).not.toContain(INSTALLATION_TOKEN);
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+describe('progress routes', () => {
+  test('the page renders the job\u2019s current stage server-side and carries no job internals', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    const job = awaitingNotionJob();
+    job.data.notionSecretsWrittenAt = 2_000;
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, job);
+
+    const response = await route(new Request(`https://example.com/progress?job_id=${JOB_ID}`), env);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const page = await response.text();
+    expect(page).toContain('<h1 id="progress-heading">Connect Notion to finish setup</h1>');
+    expect(page).toContain('href="/connect/notion?job_id=job-123"');
+    expect(page).not.toContain('installationId');
+    expect(page).not.toContain('login');
+    expect(page).not.toContain('alice');
+  });
+
+  test('the status endpoint mirrors the projection snapshot', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    const job = awaitingNotionJob();
+    job.data.notionSecretsWrittenAt = 2_000;
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, job);
+
+    const response = await route(new Request(`https://example.com/progress/status?job_id=${JOB_ID}`), env);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    expect(await response.json()).toMatchObject({
+      progress: { status: 'awaiting_notion' },
+    });
+  });
+
+  test('a malformed job id is a 400 on the status route and a 404 missing page on the page route', async () => {
+    const env = await githubEnv();
+
+    const status = await route(new Request('https://example.com/progress/status?job_id=not%20valid!'), env);
+    expect(status.status).toBe(400);
+    expect(await status.json()).toEqual({ error: 'invalid_job_id' });
+
+    const page = await route(new Request('https://example.com/progress?job_id=not%20valid!'), env);
+    expect(page.status).toBe(404);
+    expect(await page.text()).toContain('We could not find a site setup in progress for this link');
+  });
+
+  test('an unknown but well-formed job id is a missing snapshot and a 404 missing page', async () => {
+    const env = await githubEnv();
+
+    const status = await route(new Request('https://example.com/progress/status?job_id=job-nope'), env);
+    expect(status.status).toBe(200);
+    expect(await status.json()).toEqual({
+      updatedAt: 0,
+      progress: {
+        status: 'missing',
+        message: 'We could not find a site setup in progress for this link.',
+        action: 'Start again from the beginning: connect GitHub first, then Notion.',
+        restartUrl: '/connect/github',
+      },
+    });
+
+    const page = await route(new Request('https://example.com/progress?job_id=job-nope'), env);
+    expect(page.status).toBe(404);
+  });
+
+  test('reading progress performs zero KV puts and zero queue sends', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const putsBefore = kv.puts;
+
+    await route(new Request(`https://example.com/progress?job_id=${JOB_ID}`), env);
+    await route(new Request(`https://example.com/progress/status?job_id=${JOB_ID}`), env);
+
+    expect(kv.puts).toBe(putsBefore);
+    expect(queue.sent).toEqual([]);
   });
 });

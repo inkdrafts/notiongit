@@ -585,15 +585,9 @@ describe('J1 Notion callback journey', () => {
     });
 
     const callback = journey.responses[1];
-    expect(callback.status).toBe(202);
-    expect(await callback.json()).toEqual({
-      ok: true,
-      status: 'notion_authorized',
-      job_id: NOTION_JOB_ID,
-      template: { duplicated: true },
-      repository: { name: 'alice.github.io', html_url: 'https://github.com/alice/alice.github.io' },
-      site: { url: 'https://alice.github.io' },
-    });
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get('location')).toBe(`https://staging.example/progress?job_id=${NOTION_JOB_ID}`);
+    expect(await callback.text()).toBe('');
 
     // Positive flow: the canary Notion token genuinely authenticated the
     // template-resolution calls, the one-time code genuinely went to the
@@ -979,7 +973,7 @@ describe('J3 queue pipeline journey', () => {
   test('seven batches: each step spends its own fresh mint, the user token never reappears, every job write keeps the 24h TTL, zero deletes', async () => {
     const { journey, queueCalls, mintCount, analyticsPoints } = await withCapturedConsole(async (recorder) => {
       const driven = await runFullOnboarding();
-      expect(driven.responses[3].status).toBe(202);
+      expect(driven.responses[3].status).toBe(303);
 
       const analyticsPoints: unknown[] = [];
       (driven.env as Record<string, unknown>).PROVISIONING_METRICS = {
@@ -1224,7 +1218,7 @@ describe('J5 disconnect timeline journey', () => {
   test('mint 404 dead-letters with lastError.code only; the terminal save refreshes the 24h TTL; only the lease is released', async () => {
     const journey = await withCapturedConsole(async (recorder) => {
       const driven = await runFullOnboarding();
-      expect(driven.responses[3].status).toBe(202);
+      expect(driven.responses[3].status).toBe(303);
 
       const { fetcher } = scriptedFetch(() => new Response(null, { status: 404 }));
       const originalFetch = globalThis.fetch;

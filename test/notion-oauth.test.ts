@@ -125,15 +125,9 @@ describe('Notion OAuth', () => {
       },
     );
 
-    expect(response.status).toBe(202);
-    const responseBody = await response.clone().text();
-    expect(await response.json()).toEqual({
-      ok: true,
-      status: 'notion_authorized',
-      job_id: 'job-123',
-      template: { duplicated: true },
-    });
-    expect(responseBody).not.toContain('synthetic-access-token');
+    expect(response.status).toBe(303);
+    expect(response.headers.get('location')).toBe('https://staging.example/progress?job_id=job-123');
+    expect(response.headers.get('set-cookie')).toContain(`${NOTION_STATE_COOKIE}=`);
     // The continuation hands the token over as a self-redacting Secret; the
     // value is only readable through the explicit raw unwrap.
     const handed = continuation as NotionOAuthContinuation;
@@ -244,8 +238,8 @@ describe('Notion OAuth', () => {
         continueOnboarding: ({ duplicatedTemplateId }) => { duplicate = duplicatedTemplateId; },
       },
     );
-    expect(response.status).toBe(202);
-    expect(await response.json()).toMatchObject({ template: { duplicated: false } });
+    expect(response.status).toBe(303);
+    expect(response.headers.get('location')).toBe('https://staging.example/progress?job_id=job-123');
     expect(duplicate).toBeNull();
   });
 });

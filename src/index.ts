@@ -66,6 +66,8 @@ import {
   saveNotionTemplateResolution,
 } from './notion-template';
 import { LANDING_PAGE } from './landing-page';
+import { progressPageUrl, projectProvisioning } from './progress';
+import { progressPage } from './progress-page';
 import { Secret } from './secret';
 import { reportError } from './safe-serialize';
 export {
@@ -335,9 +337,31 @@ export type {
   NotionOAuthEnv,
   NotionOAuthErrorCode,
   NotionOAuthRouteOptions,
-  NotionOAuthSummary,
   NotionStatePayload,
 } from './notion-oauth';
+
+export {
+  progressPageUrl,
+  projectProvisioning,
+  PROGRESS_STAGE_ORDER,
+  PROGRESS_STAGE_REGISTRY,
+  STAGE_BY_STEP,
+} from './progress';
+export type {
+  ProgressSnapshot,
+  ProgressStageEntry,
+  ProgressStageId,
+  ProgressStageState,
+  ProgressStageView,
+  PublicProgress,
+} from './progress';
+
+export {
+  progressPage,
+  PROGRESS_POLL_BASE_INTERVAL_FLOOR,
+  PROGRESS_POLL_INTERVAL_MS,
+  PROGRESS_POLL_MAX_INTERVAL_MS,
+} from './progress-page';
 
 export {
   loadNotionTemplateResolution,
@@ -1095,14 +1119,6 @@ export function continueNotionOnboarding(
       await saveProvisioningJob(env.JOBS, { ...handedOff, status: 'queued', updatedAt: queuedAt });
     }
     emitProvisioningEvent(env, { type: 'job_queued', jobId, ts: queuedAt });
-
-    return {
-      repository: {
-        name: ready.data.generatedRepository.name,
-        html_url: ready.data.generatedRepository.htmlUrl,
-      },
-      site: { url: ready.data.repository.url },
-    };
   };
 }
 
@@ -1135,6 +1151,23 @@ async function beginNotionForJob(request: Request, env: Partial<Env>): Promise<R
   return beginNotionAuthorization(request, env);
 }
 
+async function progressPageResponse(request: Request, env: Partial<Env>): Promise<Response> {
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get('job_id') ?? '';
+  const job = validJobId(jobId) && env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  // An absent, malformed, or unknown id renders the same missing page; only
+  // the status differs, so a bookmark of an expired job still reads as gone.
+  return html(progressPage(jobId, projectProvisioning(job, Date.now())), job ? 200 : 404);
+}
+
+async function progressStatusResponse(request: Request, env: Partial<Env>): Promise<Response> {
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get('job_id');
+  if (!jobId || !validJobId(jobId)) return json({ error: 'invalid_job_id' }, 400);
+  const job = env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  return json(projectProvisioning(job, Date.now()));
+}
+
 export function route(
   request: Request,
   env: Partial<Env> = {},
@@ -1156,6 +1189,14 @@ export function route(
 
   if (request.method === 'GET' && url.pathname === '/connect/notion') {
     return beginNotionForJob(request, env);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/progress') {
+    return progressPageResponse(request, env);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/progress/status') {
+    return progressStatusResponse(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/github/callback') {
