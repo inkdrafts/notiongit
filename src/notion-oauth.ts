@@ -13,6 +13,13 @@ import type { NotionTemplateErrorCode } from './notion-template';
 import { callbackFailure, codedFailureCode } from './failures';
 import { Secret } from './secret';
 import { redactValue, reportError } from './safe-serialize';
+import {
+  admitProvisioningCallback,
+  admitProvisioningStage,
+  admissionFailureCode,
+  provisioningAdmissionConfig,
+  type ProvisioningThrottleVars,
+} from './provisioning-throttle';
 
 export const NOTION_AUTHORIZATION_URL = 'https://api.notion.com/v1/oauth/authorize';
 export const NOTION_TOKEN_URL = 'https://api.notion.com/v1/oauth/token';
@@ -27,7 +34,7 @@ const JSON_HEADERS = {
   'cache-control': 'no-store',
 };
 
-export interface NotionOAuthEnv extends ObservabilityEnv {
+export interface NotionOAuthEnv extends ObservabilityEnv, ProvisioningThrottleVars {
   JOBS: KVNamespace;
   NOTION_CLIENT_ID: string;
   NOTION_CLIENT_SECRET: string;
@@ -109,6 +116,12 @@ export type NotionOAuthErrorCode =
   // because the recovery is to re-authorize Notion for the same job, which
   // then skips straight to the handoff.
   | 'provisioning_handoff_failed'
+  | 'provisioning_paused'
+  | 'provisioning_rejected'
+  | 'provisioning_control_invalid'
+  | 'github_request_burst_limited'
+  | 'github_account_attempt_limited'
+  | 'github_identity_temporarily_denied'
   // The onboarding continuation (the database resolver wired in issue #7 and
   // the Actions secret write) reports through the same error channel;
   // `details` may add non-secret schema metadata to the response body.
@@ -394,8 +407,33 @@ export async function finishNotionCallback(
     return response({ error: 'notion_state_expired' }, 400, clearCookieHeaders);
   }
 
-  // Consume before any provider call. A code is single-use, and this also
-  // closes the replay race between two callback requests.
+  const admissionConfig = provisioningAdmissionConfig(env);
+  const control = await admitProvisioningStage(env as NotionOAuthEnv, admissionConfig, {
+    stage: 'notion_callback',
+    jobId: payload.jobId,
+  }, Date.now());
+  if (control.action !== 'allow') {
+    const code = admissionFailureCode(control.reason);
+    const retryAfter = control.retryAfterSeconds;
+    const status = control.reason === 'callback_replay' ? 400
+      : control.reason === 'request_burst' || control.reason === 'account_attempt_limit' ? 429
+        : control.reason === 'identity_denied' ? 423 : 503;
+    return response({ error: code }, status, {
+      ...clearCookieHeaders,
+      ...(retryAfter === null ? {} : { 'Retry-After': String(retryAfter) }),
+    });
+  }
+  const replay = await admitProvisioningCallback(env as NotionOAuthEnv, admissionConfig, {
+    provider: 'notion',
+    phase: 'oauth',
+    nonce: payload.nonce,
+    stage: 'notion_callback',
+    jobId: payload.jobId,
+  }, Date.now());
+  if (replay.action !== 'allow') return response({ error: admissionFailureCode(replay.reason, 'notion') }, 400, clearCookieHeaders);
+
+  // Claiming the callback above closes the replay race. Consume the signed
+  // state before the provider call because the authorization code is single-use.
   await env.JOBS.put(stateKey(payload.nonce), JSON.stringify({ ...record, phase: 'consumed' }), {
     expirationTtl: NOTION_STATE_REPLAY_TTL_SECONDS,
   });

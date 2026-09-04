@@ -37,6 +37,7 @@ import {
 import {
   gateProvisioningStep,
   jitteredDelaySeconds,
+  provisioningAdmissionConfig,
   provisioningThrottleConfig,
   saveTerminalProvisioningJob,
   type ProvisioningThrottleVars,
@@ -244,7 +245,15 @@ export async function processProvisioningMessage(
     return { outcome: 'acked' };
   }
 
-  const gate = await gateProvisioningStep(env.JOBS, locked, step, provisioningThrottleConfig(env), now(), rng);
+  const gate = await gateProvisioningStep(
+    env.JOBS,
+    locked,
+    step,
+    provisioningThrottleConfig(env),
+    now(),
+    rng,
+    provisioningAdmissionConfig(env),
+  );
   if (gate.action === 'superseded') {
     const supersededMs = now();
     await saveTerminalProvisioningJob(env, {
@@ -265,11 +274,11 @@ export async function processProvisioningMessage(
     });
     return { outcome: 'acked' };
   }
-  if (gate.action === 'wait') {
+  if (gate.action === 'wait' || gate.action === 'pause') {
     const waitMs = now();
     await saveProvisioningJob(env.JOBS, {
       ...locked,
-      status: 'queued',
+      status: gate.action === 'pause' ? 'paused' : 'queued',
       lock: null,
       wait: { reason: gate.reason, untilMs: waitMs + gate.delaySeconds * 1000, updatedAt: waitMs },
     });

@@ -72,12 +72,12 @@ export interface ProvisioningJobLock {
 }
 
 /**
- * Non-secret breadcrumb that a delivery was throttled rather than failed:
- * reason and time only — never identity, provider text, or a token. A wait
- * is not an error, so `lastError` stays reserved for failures.
+ * Non-secret breadcrumb that a delivery was throttled or paused rather than
+ * failed: reason and time only — never identity, provider text, or a token. A
+ * wait is not an error, so `lastError` stays reserved for failures.
  */
 export interface ProvisioningJobWait {
-  reason: 'global_throttled';
+  reason: 'global_throttled' | 'operator_paused' | 'stage_paused';
   /** Epoch ms after which the next delivery should re-evaluate; null re-evaluates now. */
   untilMs: number | null;
   updatedAt: number;
@@ -86,6 +86,7 @@ export interface ProvisioningJobWait {
 export type ProvisioningJobStatus =
   | 'awaiting_notion'
   | 'queued'
+  | 'paused'
   | 'running'
   | 'succeeded'
   | 'failed'
@@ -149,9 +150,9 @@ export interface ProvisioningJob {
   steps: Record<ProvisioningStepName, ProvisioningStepState>;
   data: ProvisioningJobData;
   lock: ProvisioningJobLock | null;
-  /** Set while the job is parked behind the global throttle; cleared when
-   * the step next books and on every terminal save, so a breadcrumb never
-   * outlives the stall it describes. Absent in pre-throttle records. */
+  /** Set while the job is parked behind a throttle or admission control;
+   * cleared when the step next books and on every terminal save. Absent in
+   * pre-throttle records. */
   wait: ProvisioningJobWait | null;
   createdAt: number;
   updatedAt: number;

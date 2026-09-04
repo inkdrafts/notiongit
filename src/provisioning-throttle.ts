@@ -1,5 +1,5 @@
 /**
- * Global content-creation throttle and per-GitHub-account provisioning quota.
+ * Provisioning admission controls, content-creation throttle, and per-account quota.
  *
  * Two limits guard GitHub's app-wide secondary rate limits (~80 mutations per
  * minute, ~500 per hour) without a Durable Object:
@@ -56,13 +56,206 @@
 import {
   isTerminalProvisioningStatus,
   loadProvisioningJob,
-  PROVISIONING_STEP_ORDER,
   saveProvisioningJob,
   type ProvisioningJob,
   type ProvisioningStepName,
 } from './provisioning-job';
+import type { ProvisioningFailureCode } from './failures';
 
-export interface ProvisioningThrottleVars {
+export const PROVISIONING_ADMISSION_STAGES = [
+  'github_connect',
+  'github_callback',
+  'github_repository',
+  'notion_callback',
+  'notion_secrets',
+  'queue_verify_repository',
+  'queue_patch_config',
+  'queue_configure_pages',
+  'queue_dispatch_sync',
+  'queue_await_sync',
+  'queue_await_deploy_build',
+  'queue_verify_deploy',
+] as const;
+
+export type ProvisioningAdmissionStage = (typeof PROVISIONING_ADMISSION_STAGES)[number];
+export type ProvisioningControlMode = 'active' | 'pause' | 'kill';
+
+export interface ProvisioningAdmissionVars {
+  PROVISIONING_CONTROL_MODE?: string;
+  PROVISIONING_PAUSED_STAGES?: string;
+  PROVISIONING_REJECTED_STAGES?: string;
+  PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_SECONDS?: string;
+  PROVISIONING_ACCOUNT_ATTEMPT_LIMIT?: string;
+  PROVISIONING_REQUEST_BURST_WINDOW_SECONDS?: string;
+  PROVISIONING_REQUEST_BURST_LIMIT?: string;
+  PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS?: string;
+  PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS?: string;
+}
+
+export interface ProvisioningAdmissionConfig {
+  readonly mode: ProvisioningControlMode;
+  readonly pausedStages: readonly ProvisioningAdmissionStage[];
+  readonly rejectedStages: readonly ProvisioningAdmissionStage[];
+  readonly accountAttemptWindowSeconds: number;
+  readonly accountAttemptLimit: number;
+  readonly requestBurstWindowSeconds: number;
+  readonly requestBurstLimit: number;
+  readonly deniedIdentityCooldownSeconds: number;
+  readonly auditTtlSeconds: number;
+}
+
+/** Operator-written value at `PROVISIONING_CONTROL_KEY`. Expired records are ignored. */
+export interface ProvisioningControl {
+  readonly version: 1;
+  readonly mode: ProvisioningControlMode;
+  readonly pausedStages: readonly ProvisioningAdmissionStage[];
+  readonly rejectedStages: readonly ProvisioningAdmissionStage[];
+  readonly updatedAt: number;
+  readonly expiresAt: number | null;
+}
+
+export type ProvisioningAdmissionReason =
+  | 'global_pause'
+  | 'global_kill'
+  | 'stage_paused'
+  | 'stage_rejected'
+  | 'control_invalid'
+  | 'callback_replay'
+  | 'request_burst'
+  | 'account_attempt_limit'
+  | 'identity_denied'
+  | 'account_busy'
+  | 'global_throttled';
+
+export type ProvisioningAdmissionDecision =
+  | { readonly action: 'allow'; readonly stage: ProvisioningAdmissionStage }
+  | {
+      readonly action: 'pause';
+      readonly stage: ProvisioningAdmissionStage;
+      readonly reason: 'global_pause' | 'stage_paused';
+      readonly retryAfterSeconds: number;
+    }
+  | {
+      readonly action: 'reject';
+      readonly stage: ProvisioningAdmissionStage;
+      readonly reason: Exclude<ProvisioningAdmissionReason, 'global_pause' | 'stage_paused'>;
+      readonly retryAfterSeconds: number | null;
+    };
+
+export interface ProvisioningAccountAdmissionRecord {
+  readonly version: 1;
+  readonly accountId: number;
+  readonly windowStartedAt: number;
+  readonly expiresAt: number;
+  readonly jobIds: readonly string[];
+}
+
+export interface ProvisioningRequestBurstRecord {
+  readonly version: 1;
+  readonly requestDigest: string;
+  readonly windowStartedAt: number;
+  readonly expiresAt: number;
+  readonly count: number;
+  readonly lastJobId: string;
+}
+
+export interface ProvisioningCallbackClaimRecord {
+  readonly version: 1;
+  readonly provider: 'github' | 'notion';
+  readonly phase: 'setup' | 'oauth';
+  readonly jobId: string;
+  readonly claimedAt: number;
+  readonly expiresAt: number;
+}
+
+export interface ProvisioningIdentityDenialRecord {
+  readonly version: 1;
+  readonly accountId: number;
+  readonly reason: 'suspended' | 'provider_denied';
+  readonly deniedAt: number;
+  readonly expiresAt: number;
+}
+
+export interface ProvisioningAdmissionAuditRecord {
+  readonly version: 1;
+  readonly jobId: string;
+  readonly accountId?: number;
+  readonly requestDigest?: string;
+  readonly stage: ProvisioningAdmissionStage;
+  readonly decision: 'pause' | 'reject';
+  readonly reason: ProvisioningAdmissionReason;
+  readonly decidedAt: number;
+  readonly expiresAt: number;
+}
+
+export interface ProvisioningAdmissionEnv extends ProvisioningAdmissionVars {
+  JOBS: KVNamespace;
+}
+
+export const PROVISIONING_CONTROL_KEY = 'provisioning:admission:control';
+export const PROVISIONING_ACCOUNT_PREFIX = 'provisioning:admission:account:';
+export const PROVISIONING_CALLBACK_PREFIX = 'provisioning:admission:callback:';
+export const PROVISIONING_BURST_PREFIX = 'provisioning:admission:burst:';
+export const PROVISIONING_DENIAL_PREFIX = 'provisioning:admission:denial:';
+export const PROVISIONING_AUDIT_PREFIX = 'provisioning:admission:audit:';
+
+export const PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_DEFAULT_SECONDS = 24 * 60 * 60;
+export const PROVISIONING_ACCOUNT_ATTEMPT_LIMIT_DEFAULT = 3;
+export const PROVISIONING_REQUEST_BURST_WINDOW_DEFAULT_SECONDS = 60;
+export const PROVISIONING_REQUEST_BURST_LIMIT_DEFAULT = 10;
+export const PROVISIONING_DENIED_IDENTITY_COOLDOWN_DEFAULT_SECONDS = 60 * 60;
+export const PROVISIONING_ADMISSION_AUDIT_TTL_DEFAULT_SECONDS = 7 * 24 * 60 * 60;
+export const PROVISIONING_CONTROL_RECHECK_SECONDS = 60;
+const ADMISSION_TTL_MIN_SECONDS = 60;
+const ADMISSION_TTL_MAX_SECONDS = 30 * 24 * 60 * 60;
+const ADMISSION_LIMIT_MAX = 10_000;
+
+export function admissionFailureCode(
+  decisionOrReason: Exclude<ProvisioningAdmissionDecision, { action: 'allow' }> | ProvisioningAdmissionReason,
+  callbackProvider?: 'github' | 'notion',
+): ProvisioningFailureCode {
+  const reason = typeof decisionOrReason === 'string' ? decisionOrReason : decisionOrReason.reason;
+  switch (reason) {
+    case 'global_pause':
+    case 'stage_paused':
+      return 'provisioning_paused';
+    case 'global_kill':
+    case 'stage_rejected':
+      return 'provisioning_rejected';
+    case 'control_invalid':
+      return 'provisioning_control_invalid';
+    case 'callback_replay':
+      return callbackProvider === 'notion' ? 'notion_state_replayed' : 'github_state_replayed';
+    case 'request_burst':
+      return 'github_request_burst_limited';
+    case 'account_attempt_limit':
+      return 'github_account_attempt_limited';
+    case 'identity_denied':
+      return 'github_identity_temporarily_denied';
+    case 'account_busy':
+      return 'github_provisioning_already_active';
+    case 'global_throttled':
+      return 'github_rate_limited';
+  }
+}
+
+export class ProvisioningAdmissionRefusedError extends Error {
+  readonly code: ProvisioningFailureCode;
+  readonly retryAfterSeconds: number | null;
+
+  constructor(
+    decision: Exclude<ProvisioningAdmissionDecision, { action: 'allow' }>,
+    callbackProvider?: 'github' | 'notion',
+  ) {
+    const code = admissionFailureCode(decision, callbackProvider);
+    super(code);
+    this.name = 'ProvisioningAdmissionRefusedError';
+    this.code = code;
+    this.retryAfterSeconds = decision.retryAfterSeconds;
+  }
+}
+
+export interface ProvisioningThrottleVars extends ProvisioningAdmissionVars {
   PROVISIONING_MUTATIONS_PER_MINUTE?: string;
   PROVISIONING_MUTATIONS_PER_HOUR?: string;
   PROVISIONING_LEASE_TTL_SECONDS?: string;
@@ -123,6 +316,117 @@ export function provisioningThrottleConfig(vars: ProvisioningThrottleVars): Prov
       PROVISIONING_LEASE_TTL_MAX_SECONDS,
     ),
   };
+}
+
+function parseControlMode(raw: string | undefined): ProvisioningControlMode {
+  if (raw === undefined) return 'active';
+  if (raw === 'active' || raw === 'pause' || raw === 'kill') return raw;
+  const failure = new Error('invalid provisioning admission configuration value') as Error & { variable: string };
+  failure.variable = 'PROVISIONING_CONTROL_MODE';
+  throw failure;
+}
+
+function parseStageList(raw: string | undefined, name: string): readonly ProvisioningAdmissionStage[] {
+  if (raw === undefined || raw.trim() === '') return [];
+  const known = new Set<string>(PROVISIONING_ADMISSION_STAGES);
+  const stages = [...new Set(raw.split(',').map((value) => value.trim()).filter(Boolean))];
+  if (stages.some((stage) => !known.has(stage))) {
+    const failure = new Error('invalid provisioning admission configuration value') as Error & { variable: string };
+    failure.variable = name;
+    throw failure;
+  }
+  return stages as ProvisioningAdmissionStage[];
+}
+
+function boundedConfigInteger(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const value = parsePositiveInteger(raw, name) ?? fallback;
+  if (value < minimum || value > maximum) {
+    const failure = new Error('invalid provisioning admission configuration value') as Error & { variable: string };
+    failure.variable = name;
+    throw failure;
+  }
+  return value;
+}
+
+/** Parse operator environment input at each request or queue invocation. */
+export function provisioningAdmissionConfig(vars: ProvisioningAdmissionVars): ProvisioningAdmissionConfig {
+  return {
+    mode: parseControlMode(vars.PROVISIONING_CONTROL_MODE),
+    pausedStages: parseStageList(vars.PROVISIONING_PAUSED_STAGES, 'PROVISIONING_PAUSED_STAGES'),
+    rejectedStages: parseStageList(vars.PROVISIONING_REJECTED_STAGES, 'PROVISIONING_REJECTED_STAGES'),
+    accountAttemptWindowSeconds: boundedConfigInteger(
+      vars.PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_SECONDS,
+      'PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_SECONDS',
+      PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_DEFAULT_SECONDS,
+      ADMISSION_TTL_MIN_SECONDS,
+      ADMISSION_TTL_MAX_SECONDS,
+    ),
+    accountAttemptLimit: boundedConfigInteger(
+      vars.PROVISIONING_ACCOUNT_ATTEMPT_LIMIT,
+      'PROVISIONING_ACCOUNT_ATTEMPT_LIMIT',
+      PROVISIONING_ACCOUNT_ATTEMPT_LIMIT_DEFAULT,
+      1,
+      ADMISSION_LIMIT_MAX,
+    ),
+    requestBurstWindowSeconds: boundedConfigInteger(
+      vars.PROVISIONING_REQUEST_BURST_WINDOW_SECONDS,
+      'PROVISIONING_REQUEST_BURST_WINDOW_SECONDS',
+      PROVISIONING_REQUEST_BURST_WINDOW_DEFAULT_SECONDS,
+      ADMISSION_TTL_MIN_SECONDS,
+      60 * 60,
+    ),
+    requestBurstLimit: boundedConfigInteger(
+      vars.PROVISIONING_REQUEST_BURST_LIMIT,
+      'PROVISIONING_REQUEST_BURST_LIMIT',
+      PROVISIONING_REQUEST_BURST_LIMIT_DEFAULT,
+      1,
+      ADMISSION_LIMIT_MAX,
+    ),
+    deniedIdentityCooldownSeconds: boundedConfigInteger(
+      vars.PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS,
+      'PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS',
+      PROVISIONING_DENIED_IDENTITY_COOLDOWN_DEFAULT_SECONDS,
+      ADMISSION_TTL_MIN_SECONDS,
+      ADMISSION_TTL_MAX_SECONDS,
+    ),
+    auditTtlSeconds: boundedConfigInteger(
+      vars.PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS,
+      'PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS',
+      PROVISIONING_ADMISSION_AUDIT_TTL_DEFAULT_SECONDS,
+      ADMISSION_TTL_MIN_SECONDS,
+      ADMISSION_TTL_MAX_SECONDS,
+    ),
+  };
+}
+
+export function provisioningAccountKey(accountId: number): string {
+  return `${PROVISIONING_ACCOUNT_PREFIX}${accountId}`;
+}
+
+export function provisioningDenialKey(accountId: number): string {
+  return `${PROVISIONING_DENIAL_PREFIX}${accountId}`;
+}
+
+export function provisioningBurstKey(requestDigest: string): string {
+  return `${PROVISIONING_BURST_PREFIX}${requestDigest}`;
+}
+
+export function provisioningCallbackKey(
+  provider: ProvisioningCallbackClaimRecord['provider'],
+  phase: ProvisioningCallbackClaimRecord['phase'],
+  nonce: string,
+): string {
+  return `${PROVISIONING_CALLBACK_PREFIX}${provider}:${phase}:${nonce}`;
+}
+
+export function provisioningQueueStage(step: ProvisioningStepName): ProvisioningAdmissionStage {
+  return `queue_${step}` as ProvisioningAdmissionStage;
 }
 
 export const ACCOUNT_LEASE_PREFIX = 'github:account-lease:';
@@ -234,6 +538,330 @@ function withKeyLock<T>(key: string, work: () => Promise<T>): Promise<T> {
     if (keyLocks.get(key) === tail) keyLocks.delete(key);
   });
   return result;
+}
+
+function validStageList(value: unknown): value is readonly ProvisioningAdmissionStage[] {
+  const known = new Set<string>(PROVISIONING_ADMISSION_STAGES);
+  return Array.isArray(value) && value.every((stage) => typeof stage === 'string' && known.has(stage));
+}
+
+function parseStoredControl(value: unknown, nowMs: number): ProvisioningControl | null | 'corrupted' {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object') return 'corrupted';
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1
+    || (record.mode !== 'active' && record.mode !== 'pause' && record.mode !== 'kill')
+    || !validStageList(record.pausedStages)
+    || !validStageList(record.rejectedStages)
+    || !Number.isSafeInteger(record.updatedAt)
+    || (record.expiresAt !== null && !Number.isSafeInteger(record.expiresAt))
+  ) return 'corrupted';
+  if (typeof record.expiresAt === 'number' && record.expiresAt <= nowMs) return null;
+  return record as unknown as ProvisioningControl;
+}
+
+function stricterMode(left: ProvisioningControlMode, right: ProvisioningControlMode): ProvisioningControlMode {
+  const rank: Record<ProvisioningControlMode, number> = { active: 0, pause: 1, kill: 2 };
+  return rank[left] >= rank[right] ? left : right;
+}
+
+async function controlDecision(
+  kv: KVNamespace,
+  config: ProvisioningAdmissionConfig,
+  stage: ProvisioningAdmissionStage,
+  nowMs: number,
+): Promise<ProvisioningAdmissionDecision> {
+  let stored: ProvisioningControl | null | 'corrupted';
+  try {
+    stored = parseStoredControl(await kv.get(PROVISIONING_CONTROL_KEY, 'json'), nowMs);
+  } catch {
+    stored = 'corrupted';
+  }
+  if (stored === 'corrupted') {
+    return { action: 'reject', stage, reason: 'control_invalid', retryAfterSeconds: PROVISIONING_CONTROL_RECHECK_SECONDS };
+  }
+
+  const mode = stored ? stricterMode(config.mode, stored.mode) : config.mode;
+  const pausedStages = new Set<ProvisioningAdmissionStage>([
+    ...config.pausedStages,
+    ...(stored?.pausedStages ?? []),
+  ]);
+  const rejectedStages = new Set<ProvisioningAdmissionStage>([
+    ...config.rejectedStages,
+    ...(stored?.rejectedStages ?? []),
+  ]);
+  if (mode === 'kill') {
+    return { action: 'reject', stage, reason: 'global_kill', retryAfterSeconds: PROVISIONING_CONTROL_RECHECK_SECONDS };
+  }
+  if (rejectedStages.has(stage)) {
+    return { action: 'reject', stage, reason: 'stage_rejected', retryAfterSeconds: PROVISIONING_CONTROL_RECHECK_SECONDS };
+  }
+  if (mode === 'pause') {
+    return { action: 'pause', stage, reason: 'global_pause', retryAfterSeconds: PROVISIONING_CONTROL_RECHECK_SECONDS };
+  }
+  if (pausedStages.has(stage)) {
+    return { action: 'pause', stage, reason: 'stage_paused', retryAfterSeconds: PROVISIONING_CONTROL_RECHECK_SECONDS };
+  }
+  return { action: 'allow', stage };
+}
+
+async function recordAdmissionDecision(
+  env: ProvisioningAdmissionEnv,
+  config: ProvisioningAdmissionConfig,
+  decision: ProvisioningAdmissionDecision,
+  context: { jobId: string; accountId?: number; requestDigest?: string },
+  nowMs: number,
+): Promise<ProvisioningAdmissionDecision> {
+  if (decision.action === 'allow') {
+    return decision;
+  }
+
+  const expiresAt = nowMs + config.auditTtlSeconds * 1000;
+  const audit: ProvisioningAdmissionAuditRecord = {
+    version: 1,
+    jobId: context.jobId,
+    ...(context.accountId === undefined ? {} : { accountId: context.accountId }),
+    ...(context.requestDigest === undefined ? {} : { requestDigest: context.requestDigest }),
+    stage: decision.stage,
+    decision: decision.action,
+    reason: decision.reason,
+    decidedAt: nowMs,
+    expiresAt,
+  };
+  const auditKey = `${PROVISIONING_AUDIT_PREFIX}${context.jobId}:${decision.stage}:${decision.reason}`;
+  if ((await env.JOBS.get(auditKey)) === null) {
+    await env.JOBS.put(auditKey, JSON.stringify(audit), { expirationTtl: config.auditTtlSeconds });
+  }
+  return decision;
+}
+
+export async function admitProvisioningStage(
+  env: ProvisioningAdmissionEnv,
+  config: ProvisioningAdmissionConfig,
+  params: { stage: ProvisioningAdmissionStage; jobId: string; accountId?: number },
+  nowMs: number,
+): Promise<ProvisioningAdmissionDecision> {
+  const decision = await controlDecision(env.JOBS, config, params.stage, nowMs);
+  return recordAdmissionDecision(env, config, decision, params, nowMs);
+}
+
+/** Admit one identified account attempt before any repository mutation. */
+export async function admitProvisioningAccount(
+  env: ProvisioningAdmissionEnv,
+  config: ProvisioningAdmissionConfig,
+  params: { accountId: number; jobId: string },
+  nowMs: number,
+): Promise<ProvisioningAdmissionDecision> {
+  const stage = 'github_repository' as const;
+  const control = await controlDecision(env.JOBS, config, stage, nowMs);
+  if (control.action !== 'allow') return recordAdmissionDecision(env, config, control, params, nowMs);
+
+  const key = provisioningAccountKey(params.accountId);
+  const decision = await withKeyLock(key, async (): Promise<ProvisioningAdmissionDecision> => {
+    const denial = await env.JOBS.get<ProvisioningIdentityDenialRecord>(provisioningDenialKey(params.accountId), 'json');
+    if (denial && denial.version === 1 && denial.expiresAt > nowMs) {
+      return { action: 'reject', stage, reason: 'identity_denied', retryAfterSeconds: Math.max(Math.ceil((denial.expiresAt - nowMs) / 1000), 1) };
+    }
+
+    const stored = await env.JOBS.get<ProvisioningAccountAdmissionRecord>(key, 'json');
+    const valid = stored
+      && stored.version === 1
+      && stored.accountId === params.accountId
+      && Number.isSafeInteger(stored.windowStartedAt)
+      && Number.isSafeInteger(stored.expiresAt)
+      && Array.isArray(stored.jobIds)
+      && stored.jobIds.every((jobId) => typeof jobId === 'string')
+      && stored.expiresAt > nowMs;
+    if (stored && !valid) {
+      return { action: 'reject', stage, reason: 'account_attempt_limit', retryAfterSeconds: config.accountAttemptWindowSeconds };
+    }
+    const count = valid ? stored!.jobIds.length : 0;
+    if (count >= config.accountAttemptLimit) {
+      return { action: 'reject', stage, reason: 'account_attempt_limit', retryAfterSeconds: Math.max(Math.ceil((stored!.expiresAt - nowMs) / 1000), 1) };
+    }
+    const expiresAt = valid ? stored!.expiresAt : nowMs + config.accountAttemptWindowSeconds * 1000;
+    const updated: ProvisioningAccountAdmissionRecord = {
+      version: 1,
+      accountId: params.accountId,
+      windowStartedAt: valid ? stored!.windowStartedAt : nowMs,
+      expiresAt,
+      jobIds: [...(valid ? stored!.jobIds : []), params.jobId],
+    };
+    await env.JOBS.put(key, JSON.stringify(updated), { expirationTtl: Math.max(Math.ceil((expiresAt - nowMs) / 1000), 60) });
+    return { action: 'allow', stage };
+  });
+  return recordAdmissionDecision(env, config, decision, params, nowMs);
+}
+
+function parseIpv4(value: string): number[] | null {
+  const parts = value.split('.');
+  if (parts.length !== 4) return null;
+  const octets = parts.map(Number);
+  if (octets.some((part, index) => !/^\d{1,3}$/u.test(parts[index]!) || !Number.isInteger(part) || part < 0 || part > 255)) {
+    return null;
+  }
+  return octets;
+}
+
+function ipv6Groups(value: string): number[] | null {
+  if (!/^[0-9a-f:.]+$/u.test(value)) return null;
+  const pieces = value.split('::');
+  if (pieces.length > 2) return null;
+  const parseSide = (side: string): number[] | null => {
+    if (!side) return [];
+    const groups: number[] = [];
+    const parts = side.split(':');
+    for (const [index, part] of parts.entries()) {
+      if (part.includes('.')) {
+        if (index !== parts.length - 1) return null;
+        const ipv4 = parseIpv4(part);
+        if (!ipv4) return null;
+        groups.push((ipv4[0]! << 8) | ipv4[1]!, (ipv4[2]! << 8) | ipv4[3]!);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/u.test(part)) return null;
+        groups.push(Number.parseInt(part, 16));
+      }
+    }
+    return groups;
+  };
+  const left = parseSide(pieces[0]!);
+  const right = parseSide(pieces[1] ?? '');
+  if (!left || !right) return null;
+  if (pieces.length === 1) return left.length === 8 ? left : null;
+  const omitted = 8 - left.length - right.length;
+  if (omitted < 1) return null;
+  return [...left, ...Array.from({ length: omitted }, () => 0), ...right];
+}
+
+function normalizedConnectingIpPrefix(raw: string | null): string {
+  const value = raw?.trim().toLowerCase() ?? '';
+  const ipv4 = parseIpv4(value);
+  if (ipv4) return `ipv4:${ipv4[0]}.${ipv4[1]}.${ipv4[2]}.0/24`;
+  const groups = ipv6Groups(value);
+  if (!groups) return 'unknown';
+  const bytes = groups.flatMap((group) => [group >> 8, group & 0xff]);
+  return `ipv6:${bytes.slice(0, 7).map((byte) => byte.toString(16).padStart(2, '0')).join('')}/56`;
+}
+
+/** HMAC of an IPv4 /24 or IPv6 /56. The normalized prefix never leaves this function. */
+export async function provisioningRequestDigest(request: Request, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(normalizedConnectingIpPrefix(request.headers.get('CF-Connecting-IP'))),
+  );
+  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export async function admitProvisioningRequest(
+  env: ProvisioningAdmissionEnv,
+  config: ProvisioningAdmissionConfig,
+  params: { request: Request; jobId: string; hmacSecret: string },
+  nowMs: number,
+): Promise<ProvisioningAdmissionDecision> {
+  const stage = 'github_connect';
+  const control = await controlDecision(env.JOBS, config, stage, nowMs);
+  if (control.action !== 'allow') return recordAdmissionDecision(env, config, control, params, nowMs);
+
+  const requestDigest = await provisioningRequestDigest(params.request, params.hmacSecret);
+  const key = provisioningBurstKey(requestDigest);
+  const decision = await withKeyLock(key, async (): Promise<ProvisioningAdmissionDecision> => {
+    const stored = await env.JOBS.get<ProvisioningRequestBurstRecord>(key, 'json');
+    const fresh = !stored
+      || stored.version !== 1
+      || stored.requestDigest !== requestDigest
+      || stored.expiresAt <= nowMs;
+    const count = fresh ? 0 : stored.count;
+    if (!Number.isSafeInteger(count) || count < 0) {
+      return { action: 'reject', stage, reason: 'request_burst', retryAfterSeconds: config.requestBurstWindowSeconds };
+    }
+    if (count >= config.requestBurstLimit) {
+      return {
+        action: 'reject',
+        stage,
+        reason: 'request_burst',
+        retryAfterSeconds: Math.max(Math.ceil(((stored?.expiresAt ?? nowMs) - nowMs) / 1000), 1),
+      };
+    }
+    const windowStartedAt = fresh ? nowMs : stored.windowStartedAt;
+    const expiresAt = fresh ? nowMs + config.requestBurstWindowSeconds * 1000 : stored.expiresAt;
+    const updated: ProvisioningRequestBurstRecord = {
+      version: 1,
+      requestDigest,
+      windowStartedAt,
+      expiresAt,
+      count: count + 1,
+      lastJobId: params.jobId,
+    };
+    await env.JOBS.put(key, JSON.stringify(updated), { expirationTtl: config.requestBurstWindowSeconds });
+    return { action: 'allow', stage };
+  });
+  return recordAdmissionDecision(env, config, decision, { jobId: params.jobId, requestDigest }, nowMs);
+}
+
+export const PROVISIONING_CALLBACK_CLAIM_TTL_SECONDS = 60 * 60;
+
+export async function admitProvisioningCallback(
+  env: ProvisioningAdmissionEnv,
+  config: ProvisioningAdmissionConfig,
+  params: {
+    provider: ProvisioningCallbackClaimRecord['provider'];
+    phase: ProvisioningCallbackClaimRecord['phase'];
+    nonce: string;
+    jobId: string;
+    stage: 'github_callback' | 'notion_callback';
+  },
+  nowMs: number,
+): Promise<ProvisioningAdmissionDecision> {
+  const control = await controlDecision(env.JOBS, config, params.stage, nowMs);
+  if (control.action !== 'allow') return recordAdmissionDecision(env, config, control, params, nowMs);
+
+  const key = provisioningCallbackKey(params.provider, params.phase, params.nonce);
+  const decision = await withKeyLock(key, async (): Promise<ProvisioningAdmissionDecision> => {
+    const stored = await env.JOBS.get<ProvisioningCallbackClaimRecord>(key, 'json');
+    if (stored && stored.expiresAt > nowMs) {
+      return { action: 'reject', stage: params.stage, reason: 'callback_replay', retryAfterSeconds: null };
+    }
+    const record: ProvisioningCallbackClaimRecord = {
+      version: 1,
+      provider: params.provider,
+      phase: params.phase,
+      jobId: params.jobId,
+      claimedAt: nowMs,
+      expiresAt: nowMs + PROVISIONING_CALLBACK_CLAIM_TTL_SECONDS * 1000,
+    };
+    await env.JOBS.put(key, JSON.stringify(record), { expirationTtl: PROVISIONING_CALLBACK_CLAIM_TTL_SECONDS });
+    return { action: 'allow', stage: params.stage };
+  });
+  return recordAdmissionDecision(env, config, decision, params, nowMs);
+}
+
+export async function recordProvisioningIdentityDenial(
+  kv: KVNamespace,
+  config: ProvisioningAdmissionConfig,
+  params: { accountId: number; reason: ProvisioningIdentityDenialRecord['reason'] },
+  nowMs: number,
+): Promise<void> {
+  const record: ProvisioningIdentityDenialRecord = {
+    version: 1,
+    accountId: params.accountId,
+    reason: params.reason,
+    deniedAt: nowMs,
+    expiresAt: nowMs + config.deniedIdentityCooldownSeconds * 1000,
+  };
+  await withKeyLock(provisioningDenialKey(params.accountId), async () => {
+    await kv.put(provisioningDenialKey(params.accountId), JSON.stringify(record), {
+      expirationTtl: config.deniedIdentityCooldownSeconds,
+    });
+  });
 }
 
 // ============================================================================
@@ -383,11 +1011,10 @@ export async function saveTerminalProvisioningJob(env: { JOBS: KVNamespace }, jo
 // ============================================================================
 
 /**
- * The `PROVISIONING_STEP_ORDER` names that create or change content on
- * GitHub and therefore consume global budget. The set is typed against the
- * step-name union derived from `PROVISIONING_STEP_ORDER`, so renaming a step
- * fails typecheck; a newly added step defaults to non-budgeted and must be
- * classified here deliberately. `verify_repository`, `await_sync`,
+ * These `ProvisioningStepName` values create or change content on GitHub and
+ * therefore consume global budget. The set is typed against the step-name
+ * union, so a renamed step fails typecheck. A newly added step defaults to
+ * non-budgeted and must be classified here deliberately. `verify_repository`, `await_sync`,
  * `await_deploy_build`, and `verify_deploy` are reads and polls: gated for
  * lease renewal, never for budget. `generate` is sync-path-only and never
  * appears in the order.
@@ -404,23 +1031,24 @@ export function isBudgetedMutationStep(step: ProvisioningStepName): boolean {
 
 export type StepGateDecision =
   | { action: 'proceed' }
+  | { action: 'pause'; reason: 'operator_paused' | 'stage_paused'; delaySeconds: number }
   | { action: 'wait'; reason: 'global_throttled'; delaySeconds: number }
   | { action: 'superseded' };
 
 /**
- * One gate pass = conflict check + lease renewal + (iff budgeted step)
- * budget consumption, run for EVERY step so slow inline poll steps keep
- * renewing their lease. Rules:
+ * One gate pass first checks admission control, then checks the account lease,
+ * renews the lease, and consumes budget for a mutation step. It runs for every
+ * step so slow inline poll steps keep renewing their lease. Rules:
  * - foreign live lease ⇒ superseded (L2: never steal — the caller
  *   terminal-fails the job);
  * - own, expired, or absent lease ⇒ (re)claim by writing ours;
+ * - paused or rejected admission ⇒ pause before the lease or token mint;
  * - budgeted step ⇒ consumeGlobalMutationBudget; a refusal becomes a wait.
  *
- * Caller contract: on 'wait' the queue persists the job queued, unlocked,
- * and carrying the wait breadcrumb with attempts untouched, then hands the
- * continuation to a fresh message — never the platform's retry, whose
- * max_retries budget gate waits must not consume. On 'superseded' the caller
- * saves the terminal record via saveTerminalProvisioningJob and acks.
+ * Caller contract: on 'wait' or 'pause' the queue persists the job unlocked,
+ * carries the wait breadcrumb with attempts untouched, and hands the
+ * continuation to a fresh message. On 'superseded' the caller saves the
+ * terminal record via saveTerminalProvisioningJob and acks.
  */
 export async function gateProvisioningStep(
   kv: KVNamespace,
@@ -429,7 +1057,17 @@ export async function gateProvisioningStep(
   config: ProvisioningThrottleConfig,
   nowMs: number,
   rng: () => number,
+  admission: ProvisioningAdmissionConfig = provisioningAdmissionConfig({}),
 ): Promise<StepGateDecision> {
+  const control = await admitProvisioningStage(
+    { JOBS: kv } as ProvisioningAdmissionEnv,
+    admission,
+    { stage: provisioningQueueStage(step), jobId: job.jobId, accountId: job.identity.id },
+    nowMs,
+  );
+  if (control.action !== 'allow') {
+    return { action: 'pause', reason: 'stage_paused', delaySeconds: control.retryAfterSeconds ?? 60 };
+  }
   const leaseKey = accountLeaseKey(job.identity.id);
   const lease = await kv.get<AccountLease>(leaseKey, 'json');
   if (lease && lease.version === 1 && lease.expiresAt > nowMs && lease.jobId !== job.jobId) {
