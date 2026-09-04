@@ -156,6 +156,8 @@ describe('progress page', () => {
     expect(page).toContain(`const POLL_MAX_MS = ${PROGRESS_POLL_MAX_INTERVAL_MS}`);
     expect(page).not.toContain('innerHTML');
     expect(page).not.toContain('document.write');
+    const script = page.slice(page.lastIndexOf('<script>') + '<script>'.length).split('</script>')[0];
+    expect(() => new Function(script)).not.toThrow();
   });
 
   test('makes no request outside the origin', () => {
@@ -263,6 +265,42 @@ describe('progress page', () => {
     expect(script.match(/if \(isTerminal\(snapshot\)\) return;/gu)).toHaveLength(2);
     expect(script).not.toContain('location.');
     expect(script).not.toContain('window.open');
+  });
+
+  test('the ?check=1 outcome renders inline in the propagation area of a succeeded snapshot', () => {
+    const okPage = progressPage('job-123', SUCCEEDED_LINKS, { reachable: true, checkedAt: NOW });
+    expect(okPage)
+      .toContain('<p id="site-check-result" class="muted">Checked just now: your site is answering.</p>');
+    const lagPage = progressPage('job-123', SUCCEEDED, { reachable: false, checkedAt: NOW });
+    expect(lagPage)
+      .toContain('<p id="site-check-result" class="muted">Checked just now: not answering yet. Try again in a minute.</p>');
+  });
+
+  test('a plain render hides the result line and carries the no-JS check link', () => {
+    for (const snapshot of [ACTIVE, SUCCEEDED, MISSING]) {
+      expect(progressPage('job-123', snapshot)).toContain('<p id="site-check-result" class="muted" hidden></p>');
+    }
+    expect(progressPage('job-123', SUCCEEDED))
+      .toContain('<a id="site-check-link" href="/progress?job_id=job-123&amp;check=1">Check if it is up yet</a>');
+  });
+
+  test('the client-side check binds at most once, writes the shared copy, and never reschedules', () => {
+    const page = progressPage('job-123', SUCCEEDED);
+    const script = page.slice(page.lastIndexOf('<script>'));
+    const bindStart = script.indexOf('function bindSiteCheck');
+    const bindEnd = script.indexOf('function render(');
+    expect(bindStart).toBeGreaterThan(-1);
+    expect(bindEnd).toBeGreaterThan(bindStart);
+    const bindBody = script.slice(bindStart, bindEnd);
+    expect(bindBody).toContain('if (siteCheckBound) return;');
+    expect(bindBody).toContain("fetch(siteCheckUrl, { headers: { accept: 'application/json' } })");
+    expect(bindBody).not.toContain('schedule');
+    expect(bindBody).not.toContain('timer');
+    // The result line reuses the same constants the server rendered the ?check=1
+    // outcome from, so both transports phrase it identically.
+    expect(script).toContain('reachable ? CHECK_OK : CHECK_NOT_YET');
+    // Entering succeeded binds it; a second render call must not rebind.
+    expect(script.match(/bindSiteCheck\(\);/gu)).toHaveLength(1);
   });
 
   test('escapes snapshot data in text, attributes, and the JSON island', () => {

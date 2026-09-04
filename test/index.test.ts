@@ -12,6 +12,7 @@ import {
   isValidGithubRepositoryName,
   loadNotionTemplateResolution,
   NotionOAuthError,
+  PROVISIONING_STEP_ORDER,
   route,
   saveProvisioningJob,
   selectGithubRepositoryDestination,
@@ -1091,6 +1092,20 @@ function awaitingNotionJob(): ProvisioningJob {
   });
 }
 
+/** The record `awaitingNotionJob` becomes after every provisioning step ran. */
+function succeededJob(): ProvisioningJob {
+  const job = awaitingNotionJob();
+  for (const step of PROVISIONING_STEP_ORDER) {
+    job.steps[step] = { ...job.steps[step], status: 'succeeded', attempts: 1 };
+  }
+  return {
+    ...job,
+    status: 'succeeded',
+    data: { ...job.data, notionSecretsWrittenAt: 2_000 },
+    completedAt: 3_000,
+  };
+}
+
 function runContinuation(
   env: Partial<Env>,
   fetcher: typeof fetch,
@@ -1510,5 +1525,120 @@ describe('progress routes', () => {
 
     expect(kv.puts).toBe(putsBefore);
     expect(queue.sent).toEqual([]);
+  });
+
+  test('the site-check endpoint answers only for a succeeded job and probes only the recorded site URL', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    const job = succeededJob();
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, job);
+    const originalFetch = globalThis.fetch;
+    const requested: string[] = [];
+
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        requested.push(String(input));
+        return new Response('ok', { status: 200 });
+      }) as typeof fetch;
+      const ok = await route(new Request(`https://example.com/progress/site-check?job_id=${JOB_ID}`), env);
+      expect(ok.status).toBe(200);
+      expect(ok.headers.get('cache-control')).toBe('no-store');
+      const body = await ok.json() as { reachable: boolean; checkedAt: number };
+      expect(body.reachable).toBe(true);
+      expect(body.checkedAt).toBeGreaterThan(0);
+      // Exactly one probe, and its URL is the job record's, never request input.
+      expect(requested).toEqual([job.data.repository.url]);
+
+      requested.length = 0;
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        requested.push(String(input));
+        return new Response('', { status: 503 });
+      }) as typeof fetch;
+      const down = await route(new Request(`https://example.com/progress/site-check?job_id=${JOB_ID}`), env);
+      expect(await down.json()).toMatchObject({ reachable: false });
+      expect(requested).toEqual([job.data.repository.url]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('the site-check endpoint 404s a missing, malformed, unknown, or non-succeeded job without probing', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const originalFetch = globalThis.fetch;
+    let probes = 0;
+
+    try {
+      globalThis.fetch = (async () => {
+        probes += 1;
+        return new Response('ok', { status: 200 });
+      }) as typeof fetch;
+      for (const query of ['', '?job_id=', '?job_id=not%20valid!', '?job_id=job-nope', `?job_id=${JOB_ID}`]) {
+        const response = await route(new Request(`https://example.com/progress/site-check${query}`), env);
+        expect(response.status).toBe(404);
+        expect(await response.json()).toEqual({ error: 'not_found' });
+      }
+      expect(probes).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('check=1 probes exactly once during the render and shows the outcome; a plain render probes zero times', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    const job = succeededJob();
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, job);
+    const originalFetch = globalThis.fetch;
+    const requested: string[] = [];
+
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        requested.push(String(input));
+        return new Response('ok', { status: 200 });
+      }) as typeof fetch;
+      const probed = await route(new Request(`https://example.com/progress?job_id=${JOB_ID}&check=1`), env);
+      expect(probed.status).toBe(200);
+      expect(requested).toEqual([job.data.repository.url]);
+      expect(await probed.text()).toContain('Checked just now: your site is answering.');
+
+      requested.length = 0;
+      globalThis.fetch = (async () => {
+        requested.push('down');
+        return new Response('', { status: 503 });
+      }) as typeof fetch;
+      const lagging = await route(new Request(`https://example.com/progress?job_id=${JOB_ID}&check=1`), env);
+      expect(await lagging.text()).toContain('Checked just now: not answering yet. Try again in a minute.');
+
+      requested.length = 0;
+      const plain = await route(new Request(`https://example.com/progress?job_id=${JOB_ID}`), env);
+      expect(plain.status).toBe(200);
+      expect(requested).toEqual([]);
+      expect(await plain.text()).toContain('<p id="site-check-result" class="muted" hidden></p>');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('check=1 on a job that is not succeeded never probes and renders the current stage', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const originalFetch = globalThis.fetch;
+    let probes = 0;
+
+    try {
+      globalThis.fetch = (async () => {
+        probes += 1;
+        return new Response('ok', { status: 200 });
+      }) as typeof fetch;
+      const response = await route(new Request(`https://example.com/progress?job_id=${JOB_ID}&check=1`), env);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('Connect Notion to finish setup');
+      expect(probes).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

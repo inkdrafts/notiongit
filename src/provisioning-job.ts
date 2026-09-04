@@ -181,6 +181,10 @@ export function isTerminalProvisioningStatus(status: ProvisioningJobStatus): boo
   return status === 'succeeded' || status === 'failed' || status === 'dead_letter';
 }
 
+/** A job whose terminal success is established, so success-only helpers take
+ * exactly what they can trust instead of re-checking the status. */
+export type SucceededProvisioningJob = ProvisioningJob & { status: 'succeeded' };
+
 /** The first step that has not yet succeeded, or `null` once every step has. */
 export function nextPendingStep(job: ProvisioningJob): ProvisioningStepName | null {
   return PROVISIONING_STEP_ORDER.find((step) => job.steps[step].status !== 'succeeded') ?? null;

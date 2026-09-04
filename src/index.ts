@@ -32,6 +32,7 @@ import {
   loadProvisioningJob,
   saveProvisioningJob,
   type NotionTemplateLinks,
+  type SucceededProvisioningJob,
 } from './provisioning-job';
 import { callbackFailure, codedFailureCode, FlowFailure } from './failures';
 import {
@@ -77,7 +78,8 @@ import {
 } from './notion-template';
 import { LANDING_PAGE } from './landing-page';
 import { progressPageUrl, projectProvisioning } from './progress';
-import { progressPage } from './progress-page';
+import { progressPage, type SiteCheckOutcome } from './progress-page';
+import { checkPublicSiteReachable } from './site-deployment';
 import { isStatusCallbackState, statusCallback, statusHome, statusRerun } from './status';
 import { reportError } from './safe-serialize';
 export {
@@ -178,6 +180,7 @@ export type {
 
 export {
   awaitPagesBuildForCommit,
+  checkPublicSiteReachable,
   getRepositoryMainHeadSha,
   verifyPublicSiteReachable,
   GithubDeployError,
@@ -189,6 +192,7 @@ export type {
   GithubDeployStatus,
   GithubPagesBuildIdentity,
   PagesBuildPollOptions,
+  SiteCheckOptions,
   SiteVerifyOptions,
 } from './site-deployment';
 
@@ -231,6 +235,7 @@ export type {
   ProvisioningStepState,
   ProvisioningStepStatus,
   SiteDeploymentProgress,
+  SucceededProvisioningJob,
   SyncDispatchMarker,
 } from './provisioning-job';
 
@@ -373,6 +378,7 @@ export {
   PROGRESS_POLL_INTERVAL_MS,
   PROGRESS_POLL_MAX_INTERVAL_MS,
 } from './progress-page';
+export type { SiteCheckOutcome } from './progress-page';
 
 export {
   admitStatusRerun,
@@ -1030,9 +1036,31 @@ async function progressPageResponse(request: Request, env: Partial<Env>): Promis
   const url = new URL(request.url);
   const jobId = url.searchParams.get('job_id') ?? '';
   const job = validJobId(jobId) && env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  // No-JS retry: only an explicit ?check=1 on a succeeded job probes, and the
+  // probe is the same one-shot the site-check endpoint runs. A plain render
+  // never fetches, so it never adds latency.
+  const succeeded: SucceededProvisioningJob | null = job?.status === 'succeeded'
+    ? { ...job, status: 'succeeded' }
+    : null;
+  const siteCheck: SiteCheckOutcome | null = succeeded && url.searchParams.get('check') === '1'
+    ? { reachable: await checkPublicSiteReachable(succeeded.data.repository.url), checkedAt: Date.now() }
+    : null;
   // An absent, malformed, or unknown id renders the same missing page; only
   // the status differs, so a bookmark of an expired job still reads as gone.
-  return html(progressPage(jobId, projectProvisioning(job, Date.now())), job ? 200 : 404);
+  return html(progressPage(jobId, projectProvisioning(job, Date.now()), siteCheck), job ? 200 : 404);
+}
+
+async function progressSiteCheckResponse(request: Request, env: Partial<Env>): Promise<Response> {
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get('job_id') ?? '';
+  // The job id is the bearer capability, so missing, malformed, unknown, and
+  // non-succeeded jobs all read as the same not-found; there is no distinction
+  // to leak. The probed URL comes from the record, never from the request.
+  const job = validJobId(jobId) && env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  if (job?.status !== 'succeeded') return json({ error: 'not_found' }, 404);
+  const succeeded: SucceededProvisioningJob = { ...job, status: 'succeeded' };
+  const reachable = await checkPublicSiteReachable(succeeded.data.repository.url);
+  return json({ reachable, checkedAt: Date.now() });
 }
 
 async function progressStatusResponse(request: Request, env: Partial<Env>): Promise<Response> {
@@ -1072,6 +1100,10 @@ export function route(
 
   if (request.method === 'GET' && url.pathname === '/progress/status') {
     return progressStatusResponse(request, env);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/progress/site-check') {
+    return progressSiteCheckResponse(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/status') {

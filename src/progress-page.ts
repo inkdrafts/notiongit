@@ -21,6 +21,13 @@ export const PROGRESS_POLL_MAX_INTERVAL_MS = 60_000;
 /** Floor for the no-JS meta-refresh cadence, in seconds. */
 export const PROGRESS_POLL_BASE_INTERVAL_FLOOR = 15;
 
+/** Result of the one-shot server-side probe behind `?check=1`; null when the
+ * render never probed (the default — a plain render must add no latency). */
+export interface SiteCheckOutcome {
+  readonly reachable: boolean;
+  readonly checkedAt: number;
+}
+
 const PAGE_HEADINGS: { [S in PublicProgress['status']]: string } = {
   awaiting_notion: 'Connect Notion to finish setup',
   active: 'Setting up your site',
@@ -196,17 +203,26 @@ const HEADLINES_JSON = scriptJson(Object.fromEntries(
   PROGRESS_STAGE_ORDER.map((id) => [id, PROGRESS_STAGE_REGISTRY[id].headline]),
 ));
 
+/** The one-shot re-check's outcome copy, shared by the server render (?check=1)
+ * and the client-side writer so both transports phrase it identically. */
+const CHECK_OK_COPY = 'Checked just now: your site is answering.';
+const CHECK_NOT_YET_COPY = 'Checked just now: not answering yet. Try again in a minute.';
+
 const SCRIPT = `
   const HEADINGS = ${scriptJson(PAGE_HEADINGS)};
   const HEADLINES = ${HEADLINES_JSON};
   const STATE_WORDS = ${scriptJson(STATE_WORDS)};
+  const CHECK_OK = ${scriptJson(CHECK_OK_COPY)};
+  const CHECK_NOT_YET = ${scriptJson(CHECK_NOT_YET_COPY)};
   const POLL_MS = ${PROGRESS_POLL_INTERVAL_MS};
   const POLL_MAX_MS = ${PROGRESS_POLL_MAX_INTERVAL_MS};
 
   let snapshot = JSON.parse(document.getElementById('progress-data').textContent);
   let delayMs = POLL_MS;
   let timer = 0;
-  const statusUrl = document.getElementById('main-content').getAttribute('data-status-url');
+  const mainElement = document.getElementById('main-content');
+  const statusUrl = mainElement.getAttribute('data-status-url');
+  const siteCheckUrl = mainElement.getAttribute('data-site-check-url');
   const headingElement = document.getElementById('progress-heading');
   const liveElement = document.getElementById('progress-live');
   const rows = new Map([...document.querySelectorAll('[data-stage-id]')].map((row) => [row.getAttribute('data-stage-id'), row]));
@@ -243,6 +259,34 @@ const SCRIPT = `
     }
   };
 
+  const writeSiteCheckResult = (reachable) => {
+    setText('site-check-result', reachable ? CHECK_OK : CHECK_NOT_YET);
+    const result = document.getElementById('site-check-result');
+    if (result) result.hidden = false;
+  };
+
+  // Binds the re-check affordance at most once per document. The probe never
+  // touches the poll timer: polling stays stopped at terminal.
+  let siteCheckBound = false;
+  function bindSiteCheck() {
+    if (siteCheckBound) return;
+    siteCheckBound = true;
+    const element = document.getElementById('site-check-link');
+    if (!element || !siteCheckUrl) return;
+    element.addEventListener('click', async (event) => {
+      event.preventDefault();
+      let reachable = null;
+      try {
+        const response = await fetch(siteCheckUrl, { headers: { accept: 'application/json' } });
+        if (!response.ok) return;
+        reachable = (await response.json()).reachable;
+      } catch {
+        return;
+      }
+      if (typeof reachable === 'boolean') writeSiteCheckResult(reachable);
+    });
+  }
+
   function render(next) {
     const progress = next.progress;
     for (const [name, panel] of panels) panel.hidden = name !== progress.status;
@@ -264,6 +308,7 @@ const SCRIPT = `
       setNotionLink('notion-root-link', progress.notionLinks.templateRootUrl);
       setNotionLink('notion-pages-link', progress.notionLinks.pagesUrl);
       setNotionLink('notion-posts-link', progress.notionLinks.postsUrl);
+      bindSiteCheck();
     }
     if (progress.status === 'failed') {
       setText('failed-message', progress.message);
@@ -335,7 +380,7 @@ function notionLinkRow(name: string, url: string | null, id: string): string {
   return `<li><span class="link-name">${escapeHtml(name)}</span>${link}${missing}</li>`;
 }
 
-function panelsHtml(progress: PublicProgress, jobId: string): string {
+function panelsHtml(progress: PublicProgress, jobId: string, siteCheck: SiteCheckOutcome | null): string {
   const open = (status: PublicProgress['status']): string =>
     `<section class="panel" data-panel="${status}"${progress.status === status ? '' : ' hidden'}>`;
 
@@ -347,6 +392,11 @@ function panelsHtml(progress: PublicProgress, jobId: string): string {
   const rootUrl = progress.status === 'succeeded' ? progress.notionLinks.templateRootUrl : null;
   const pagesUrl = progress.status === 'succeeded' ? progress.notionLinks.pagesUrl : null;
   const postsUrl = progress.status === 'succeeded' ? progress.notionLinks.postsUrl : null;
+  const checkOutcome = progress.status === 'succeeded' ? siteCheck : null;
+  const checkResultLine = checkOutcome === null
+    ? '<p id="site-check-result" class="muted" hidden></p>'
+    : `<p id="site-check-result" class="muted">${escapeHtml(checkOutcome.reachable ? CHECK_OK_COPY : CHECK_NOT_YET_COPY)}</p>`;
+  const checkHref = `/progress?job_id=${encodeURIComponent(jobId)}&check=1`;
 
   return [
     `${open('active')}`,
@@ -367,6 +417,8 @@ function panelsHtml(progress: PublicProgress, jobId: string): string {
     '<p>Your site is published. It stays in sync with your Notion pages.</p>',
     `<p><a id="site-link" class="cta" href="${escapeHtml(progress.status === 'succeeded' ? progress.site.url : '')}">View your site</a></p>`,
     '<p class="muted">We checked that your site was live right before publishing finished. If the link does not open yet, GitHub’s network may still be updating it. It is usually ready within a few minutes.</p>',
+    checkResultLine,
+    `<a id="site-check-link" href="${escapeHtml(checkHref)}">Check if it is up yet</a>`,
     '<h2>Everyday writing happens in Notion</h2>',
     '<ul class="link-list">',
     notionLinkRow('Start from your home page', rootUrl, 'notion-root-link'),
@@ -395,7 +447,17 @@ function panelsHtml(progress: PublicProgress, jobId: string): string {
   ].join('\n');
 }
 
-export function progressPage(jobId: string, snapshot: ProgressSnapshot): string {
+/**
+ * Renders the one progress document. `siteCheck` carries the outcome of the
+ * optional `?check=1` propagation probe; only a succeeded snapshot renders
+ * it, and a plain render (null) never probes and keeps the result line
+ * hidden for the client writer to fill.
+ */
+export function progressPage(
+  jobId: string,
+  snapshot: ProgressSnapshot,
+  siteCheck: SiteCheckOutcome | null = null,
+): string {
   const progress = snapshot.progress;
   const heading = PAGE_HEADINGS[progress.status];
   const current = currentStageOf(progress);
@@ -425,7 +487,7 @@ ${refresh}
 ${stagesOf(progress).length ? `<ol class="checklist" aria-label="Setup steps">
 ${stagesOf(progress).map(checklistRow).join('\n')}
 </ol>` : ''}
-${panelsHtml(progress, jobId)}
+${panelsHtml(progress, jobId, siteCheck)}
 </main>
 <script type="application/json" id="progress-data">${scriptJson(snapshot)}</script>
 <script>${SCRIPT}</script>
