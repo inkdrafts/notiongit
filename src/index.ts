@@ -28,6 +28,8 @@ import {
 } from './provisioning-job';
 import { callbackFailure, FlowFailure } from './failures';
 import { processProvisioningMessage } from './provisioning-queue';
+import { emitProvisioningEvent } from './observability';
+import { runObservabilityAlertCheck } from './observability-alerts';
 import {
   beginNotionAuthorization,
   finishNotionCallback,
@@ -201,6 +203,29 @@ export type {
 export { PROVISIONING_STEP_HANDLERS } from './provisioning-steps';
 export type { ProvisioningStepHandler, StepRunnerContext } from './provisioning-steps';
 
+export { emitProvisioningEvent, OBSERVABILITY_EVENT_FIELDS } from './observability';
+export type {
+  ObservabilityEnv,
+  ProvisioningEvent,
+  ProvisioningEventErrorCode,
+} from './observability';
+
+export {
+  DEFAULT_ALERT_THRESHOLDS,
+  evaluateObservabilityAlerts,
+  runObservabilityAlertCheck,
+  summarizeAlertWindow,
+} from './observability-alerts';
+export type {
+  AlertCheckEnv,
+  AlertThresholds,
+  AlertWindowSummary,
+  AnalyticsEngineSqlResponse,
+  AnalyticsEngineSqlRow,
+  ObservabilityAlert,
+  StepFailureWindow,
+} from './observability-alerts';
+
 export { classifyProvisioningError, processProvisioningMessage } from './provisioning-queue';
 export type {
   ProvisioningErrorClassification,
@@ -275,6 +300,10 @@ export interface Env {
   JOBS: KVNamespace;
   /** Work queue for resumable provisioning jobs. */
   PROVISIONING_QUEUE: Queue<ProvisioningMessage>;
+  /** Aggregate provisioning-funnel metrics (`src/observability.ts`). */
+  PROVISIONING_METRICS?: AnalyticsEngineDataset;
+  /** Non-secret Cloudflare account ID, read only by the alert check's SQL query. */
+  CLOUDFLARE_ACCOUNT_ID?: string;
   /** Non-secret GitHub App identifier from the App settings. */
   GITHUB_APP_ID: string;
   /** Non-secret GitHub App slug used to build the installation URL. */
@@ -780,6 +809,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
     );
     try {
       await env.PROVISIONING_QUEUE.send({ jobId: job.jobId });
+      emitProvisioningEvent(env, { type: 'job_queued', jobId: job.jobId, ts: Date.now() });
     } catch (enqueueError) {
       // Without a message nothing will ever process this job, but its record
       // would otherwise sit `queued` until the TTL with no trace of why. Mark
@@ -802,6 +832,12 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
           updatedAt: Date.now(),
         });
       }
+      emitProvisioningEvent(env, {
+        type: 'job_enqueue_failed',
+        jobId: job.jobId,
+        ts: Date.now(),
+        errorCode: 'provisioning_enqueue_failed',
+      });
       throw enqueueError;
     }
 
@@ -926,6 +962,12 @@ const worker: ExportedHandler<Env, ProvisioningMessage> = {
         message.retry();
       }
     }
+  },
+
+  // Inert until the alert secrets are set, and `wrangler.toml` ships its cron
+  // trigger commented out, so nothing invokes this on a schedule yet.
+  async scheduled(_controller, env) {
+    await runObservabilityAlertCheck(env);
   },
 };
 
