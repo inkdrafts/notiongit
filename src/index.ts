@@ -1029,14 +1029,6 @@ async function progressStatusResponse(request: Request, env: Partial<Env>): Prom
   return json(projectProvisioning(job, Date.now()));
 }
 
-async function statusPageResponse(request: Request, env: Partial<Env>): Promise<Response> {
-  return statusHome(request, env);
-}
-
-async function statusRerunResponse(request: Request, env: Partial<Env>): Promise<Response> {
-  return statusRerun(request, env);
-}
-
 export function route(
   request: Request,
   env: Partial<Env> = {},
@@ -1069,11 +1061,11 @@ export function route(
   }
 
   if (request.method === 'GET' && url.pathname === '/status') {
-    return statusPageResponse(request, env);
+    return statusHome(request, env);
   }
 
   if (request.method === 'POST' && url.pathname === '/status/rerun') {
-    return statusRerunResponse(request, env);
+    return statusRerun(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/github/callback') {

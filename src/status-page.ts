@@ -300,7 +300,9 @@ wrong with your site as far as anyone can tell from here.</p>
 export function statusPage(model: StatusPageModel, chrome: StatusPageChrome): string {
   const heading = PAGE_HEADINGS[model.kind];
   const refresh = model.kind === 'session' && model.site.refreshAfterSeconds !== null
-    ? `<meta http-equiv="refresh" content="${model.site.refreshAfterSeconds}">`
+    // The refresh target drops the query so the post-redirect notice renders
+    // once instead of re-appearing on every poll.
+    ? `<meta http-equiv="refresh" content="${model.site.refreshAfterSeconds}; url=/status">`
     : '';
 
   return `<!doctype html>

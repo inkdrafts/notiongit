@@ -99,8 +99,9 @@ reaches a terminal status (below); everything else is removal by TTL.
 | `provisioning:admission:audit:{jobId}:{stage}:{reason}` | Job id, optional account id or request digest, stage, decision, reason, and timestamps | `PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS` | One deduplicated operator audit per job, stage, and reason |
 | `status:rerun:{accountId}` | Rerun window: `version` (1), `windowStartedAt`, `lastRerunAt`, `count` | Remaining window seconds, 24h max | Manual sync re-run on the status page; written before the dispatch so a crash overcounts. Numeric account id only |
 
-The status surface also sets three browser cookies; none of them is retained
-server-side.
+The worker sets three browser cookies in total; none of them is retained
+server-side. The first is pre-existing (listed for completeness); the status
+surface adds the other two.
 
 | Cookie | Value | Lifetime | Purpose |
 | --- | --- | --- | --- |

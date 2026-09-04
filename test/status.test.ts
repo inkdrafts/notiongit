@@ -976,7 +976,7 @@ describe('status routes', () => {
         env,
       );
       expect(running.status).toBe(200);
-      expect(await running.text()).toContain('http-equiv="refresh" content="30"');
+      expect(await running.text()).toContain('http-equiv="refresh" content="30; url=/status"');
     });
   });
 
