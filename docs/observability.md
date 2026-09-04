@@ -405,8 +405,8 @@ after the verification below.
 
 ## Manual verification follow-up
 
-Four things are unverified. None of them blocks the event sinks, which are covered
-by tests; all of them block turning the cron trigger on.
+Three things are unverified. None of them blocks the event sinks, which are
+covered by tests; all of them block turning the cron trigger on.
 
 1. **The Analytics Engine SQL response row shape has not been checked against a
    live account.** `AnalyticsEngineSqlResponse` in `src/observability-alerts.ts`
@@ -421,23 +421,21 @@ by tests; all of them block turning the cron trigger on.
    `count` comes back as a JSON number or a string: `summarizeAlertWindow` requires
    `typeof row.count === 'number'` and drops the row otherwise, which is the most
    likely way this silently returns zero alerts.
-2. **`ANALYTICS_DATASET` is hardcoded to the production dataset name.**
-   `src/observability-alerts.ts` sets it to `notiongit_provisioning_events` as a
-   module constant, so an alert check running in the staging Worker would query
-   production data and alert on production traffic. The `PROVISIONING_METRICS`
-   binding is per-environment and correct; only the alert query's dataset name is
-   not. Fix this before enabling alerts in staging, either by reading the dataset
-   name from a `[vars]` entry per environment or by threading it through
-   `AlertCheckOptions`.
-3. **Neither dataset has received a data point yet.** Cloudflare creates an
+2. **Neither dataset has received a data point yet.** Cloudflare creates an
    Analytics Engine dataset automatically the first time a Worker writes to it
    after the binding is declared ("Get started", verified 2026-09-03), so nothing
    needs creating by hand — but until a deploy carrying this code serves real
    traffic, every query above returns nothing. Confirm both datasets are queryable
    after the first such deploy.
-4. **The account's Workers Logs plan tier is not recorded**, so the retention
+3. **The account's Workers Logs plan tier is not recorded**, so the retention
    figure above is either 3 or 7 days. Check the plan on the Cloudflare account
    before writing 7 days into any user-facing privacy claim.
+
+`ANALYTICS_DATASET` is no longer hardcoded: `runObservabilityAlertCheck` reads
+the dataset name from `PROVISIONING_METRICS_DATASET`, a non-secret `[vars]`
+entry set per environment in `wrangler.toml` (`notiongit_provisioning_events`
+in production, `notiongit_staging_provisioning_events` in staging), so a
+staging alert check can no longer query production data.
 
 ## References
 

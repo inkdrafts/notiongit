@@ -14,6 +14,7 @@ const ENV: AlertCheckEnv = {
   CLOUDFLARE_ACCOUNT_ID: 'account-id',
   CF_ANALYTICS_API_TOKEN: 'analytics-token',
   OBSERVABILITY_ALERT_WEBHOOK_URL: 'https://hooks.example.com/observability',
+  PROVISIONING_METRICS_DATASET: 'notiongit_provisioning_events',
 };
 
 const SQL_ENDPOINT = `https://api.cloudflare.com/client/v4/accounts/${ENV.CLOUDFLARE_ACCOUNT_ID}/analytics_engine/sql`;

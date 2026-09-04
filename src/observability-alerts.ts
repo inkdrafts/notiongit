@@ -139,18 +139,22 @@ export interface AlertCheckEnv {
   CLOUDFLARE_ACCOUNT_ID: string;
   CF_ANALYTICS_API_TOKEN: string;
   OBSERVABILITY_ALERT_WEBHOOK_URL: string;
+  /** Per-environment dataset name — staging must not query production's. */
+  PROVISIONING_METRICS_DATASET: string;
 }
 
 const DEFAULT_ALERT_WINDOW_MINUTES = 60;
-const ANALYTICS_DATASET = 'notiongit_provisioning_events';
+const DATASET_NAME_PATTERN = /^[A-Za-z0-9_]+$/u;
 
-function alertWindowQuery(windowMinutes: number): string {
-  // Interpolated into SQL text, so it is reduced to a positive integer rather
-  // than trusted as an arbitrary caller-supplied number.
+function alertWindowQuery(windowMinutes: number, datasetName: string): string {
+  // Both are interpolated into SQL text, so each is reduced to a safe shape
+  // rather than trusted as an arbitrary caller-supplied value: the window to
+  // a positive integer, the dataset name to one this project could plausibly
+  // have configured.
   const minutes = Math.max(1, Math.floor(windowMinutes));
   return [
     `SELECT blob1, blob3, SUM(_sample_interval) AS count`,
-    `FROM ${ANALYTICS_DATASET}`,
+    `FROM ${datasetName}`,
     `WHERE timestamp > NOW() - INTERVAL '${minutes}' MINUTE`,
     `GROUP BY blob1, blob3`,
   ].join(' ');
@@ -186,7 +190,10 @@ export async function runObservabilityAlertCheck(
   const accountId = env.CLOUDFLARE_ACCOUNT_ID;
   const token = env.CF_ANALYTICS_API_TOKEN;
   const webhookUrl = env.OBSERVABILITY_ALERT_WEBHOOK_URL;
-  if (!accountId || !token || !webhookUrl) return { checked: false, alerts: [] };
+  const datasetName = env.PROVISIONING_METRICS_DATASET;
+  if (!accountId || !token || !webhookUrl || !datasetName || !DATASET_NAME_PATTERN.test(datasetName)) {
+    return { checked: false, alerts: [] };
+  }
 
   const fetcher = options.fetcher ?? fetch;
   const windowMinutes = options.windowMinutes ?? DEFAULT_ALERT_WINDOW_MINUTES;
@@ -198,7 +205,7 @@ export async function runObservabilityAlertCheck(
       {
         method: 'POST',
         headers: new Headers({ Authorization: `Bearer ${token}` }),
-        body: alertWindowQuery(windowMinutes),
+        body: alertWindowQuery(windowMinutes, datasetName),
       },
     );
     if (!response.ok) {

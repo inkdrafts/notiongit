@@ -135,11 +135,6 @@ the merge.
   `wrangler secret put OBSERVABILITY_ALERT_WEBHOOK_URL`, per environment. The
   analytics token needs Account Analytics read permission only; it is not a
   deploy token. `CLOUDFLARE_ACCOUNT_ID` is already a non-secret `[vars]` entry.
-- **Fix the hardcoded dataset name before enabling staging alerts.**
-  `ANALYTICS_DATASET` in `src/observability-alerts.ts` is a module constant set
-  to the production dataset, so a staging alert check would query production.
-  The `PROVISIONING_METRICS` binding is correctly per-environment; only the alert
-  query is not.
 - **Verify the SQL response shape, then uncomment `[triggers]`.** Pay particular
   attention to whether `SUM(_sample_interval) AS count` returns a JSON number or
   a string: `summarizeAlertWindow` requires `typeof row.count === 'number'` and

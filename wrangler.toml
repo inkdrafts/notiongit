@@ -12,6 +12,7 @@ libsodium-raw = "./spikes/libsodium-workers/node_modules/libsodium/dist/modules-
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
 CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
+PROVISIONING_METRICS_DATASET = "notiongit_provisioning_events"
 
 [[analytics_engine_datasets]]
 binding = "PROVISIONING_METRICS"
@@ -64,6 +65,7 @@ workers_dev = true
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
 CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
+PROVISIONING_METRICS_DATASET = "notiongit_staging_provisioning_events"
 
 [[env.staging.analytics_engine_datasets]]
 binding = "PROVISIONING_METRICS"
@@ -92,6 +94,7 @@ workers_dev = true
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
 CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
+PROVISIONING_METRICS_DATASET = "notiongit_provisioning_events"
 
 [[env.production.analytics_engine_datasets]]
 binding = "PROVISIONING_METRICS"
