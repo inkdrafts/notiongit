@@ -62,11 +62,6 @@ import {
   type ProvisioningStepName,
 } from './provisioning-job';
 
-// ============================================================================
-// Config (C1: env-adjustable, clamped so misconfiguration cannot exceed
-// GitHub's ceilings)
-// ============================================================================
-
 export interface ProvisioningThrottleVars {
   PROVISIONING_MUTATIONS_PER_MINUTE?: string;
   PROVISIONING_MUTATIONS_PER_HOUR?: string;
@@ -109,7 +104,7 @@ function parsePositiveInteger(raw: string | undefined, name: string): number | u
  * Parse, default, and clamp. A present-but-invalid value throws (a typo
  * should fail visibly, not silently halve the limits); a valid value beyond
  * a ceiling clamps (misconfiguration must not be able to exceed GitHub's
- * limits, C1).
+ * limits).
  */
 export function provisioningThrottleConfig(vars: ProvisioningThrottleVars): ProvisioningThrottleConfig {
   const perMinute = parsePositiveInteger(vars.PROVISIONING_MUTATIONS_PER_MINUTE, 'PROVISIONING_MUTATIONS_PER_MINUTE');
@@ -124,10 +119,6 @@ export function provisioningThrottleConfig(vars: ProvisioningThrottleVars): Prov
     ),
   };
 }
-
-// ============================================================================
-// KV state (the single existing JOBS namespace; JSON values with TTLs)
-// ============================================================================
 
 export const ACCOUNT_LEASE_PREFIX = 'github:account-lease:';
 export const GLOBAL_RATE_KEY = 'github:rate:global';
@@ -146,10 +137,8 @@ export interface AccountLease {
 /** Both counters in ONE key: one read plus one write per check. Fixed windows. */
 export interface GlobalRateState {
   version: 1;
-  /** floor(nowMs / 60_000) */
   minuteBucket: number;
   minuteCount: number;
-  /** floor(nowMs / 3_600_000) */
   hourBucket: number;
   hourCount: number;
 }
@@ -218,10 +207,6 @@ function secondsUntilBudgetReleases(state: GlobalRateState, config: Provisioning
   if (hourFull) seconds = Math.max(seconds, 3600 - (nowMs % 3_600_000) / 1000);
   return seconds;
 }
-
-// ============================================================================
-// In-isolate per-key serialization
-// ============================================================================
 
 const keyLocks = new Map<string, Promise<unknown>>();
 
@@ -303,11 +288,6 @@ export async function consumeGlobalMutationBudget(
   });
 }
 
-// ============================================================================
-// Sync-path start gate (call site: finishGithubCallback, the earliest point
-// the authenticated account id exists, before list/generate/token spend)
-// ============================================================================
-
 export type StartGateDecision =
   | { granted: true }
   | { granted: false; reason: 'global_throttled' | 'account_busy'; retryAfterSeconds: number };
@@ -378,7 +358,6 @@ export async function releaseProvisioningLeaseIfOwned(kv: KVNamespace, accountId
     if (!lease || lease.jobId !== jobId) return;
     await kv.delete(leaseKey);
   } catch {
-    // Best-effort by contract.
   }
 }
 
@@ -463,10 +442,6 @@ export async function gateProvisioningStep(
   }
   return { action: 'proceed' };
 }
-
-// ============================================================================
-// Refusal error and delay shaping
-// ============================================================================
 
 /** Browser-visible refusal; `authError` maps the reason to a body. */
 export class ProvisioningGateRefusedError extends Error {

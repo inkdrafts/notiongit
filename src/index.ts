@@ -785,8 +785,6 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       // passed to KV. The GitHub code is likewise never persisted.
       const authenticatedUser = await getAuthenticatedGithubUser(accessToken);
       if (authenticatedUser.accountType !== 'User') throw new Error('github_organization_installation_not_supported');
-      // The per-account quota and anti-replay gate refuse at the earliest
-      // point the account identity exists, before any further token spend.
       const jobs = env.JOBS;
       const throttleConfig = provisioningThrottleConfig(env);
       const start = await acquireProvisioningStart(jobs, { accountId: authenticatedUser.id, jobId: record.jobId }, throttleConfig, Date.now());
@@ -817,10 +815,6 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
           ownedRepositories,
           fetch,
           {
-            // The flow's one synchronous content-creating call pays the
-            // global budget immediately before each generate POST fires; a
-            // refusal propagates as a 429 and the finally above releases
-            // the lease. Reuse paths never invoke this.
             beforeCreate: async () => {
               const budget = await consumeGlobalMutationBudget(jobs, throttleConfig, Date.now(), Math.random);
               if (!budget.admitted) {

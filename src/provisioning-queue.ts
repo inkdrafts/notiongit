@@ -150,9 +150,6 @@ async function recordStepFailure(
   const persisted = await loadProvisioningJob(env.JOBS, job.jobId);
   const base = persisted ?? job;
   const attempts = base.steps[step].attempts + 1;
-  // A failure carrying GitHub's own Retry-After never counts against the
-  // regular step ceiling: honoring the provider's pacing must not
-  // dead-letter the job, so these attempts get their own, much larger bound.
   const terminal = !classification.retryable
     || attempts >= (retryAfterSeconds !== null ? PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS : PROVISIONING_STEP_MAX_ATTEMPTS);
 
@@ -268,10 +265,6 @@ export async function processProvisioningMessage(
     return { outcome: 'acked' };
   }
 
-  // One gate pass before any token spend: it supersedes a duplicate that
-  // lost this account to another job, renews the account lease (every step,
-  // so slow poll steps keep it), and — content-creating steps only —
-  // consumes the global mutation budget.
   const gate = await gateProvisioningStep(env.JOBS, locked, step, provisioningThrottleConfig(env), now(), rng);
   if (gate.action === 'superseded') {
     const supersededMs = now();
@@ -295,9 +288,6 @@ export async function processProvisioningMessage(
   }
   if (gate.action === 'wait') {
     const waitMs = now();
-    // Stay queued, unlocked, and unbilled: a wait is not an attempt. The
-    // breadcrumb carries reason and time only, and is cleared when the step
-    // next books below.
     await saveProvisioningJob(env.JOBS, {
       ...locked,
       status: 'queued',
