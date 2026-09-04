@@ -34,6 +34,15 @@ import {
 } from './provisioning-job';
 import { callbackFailure, codedFailureCode, FlowFailure } from './failures';
 import {
+  assertUsablePersonalInstallation,
+  exchangeGithubCode,
+  findUserInstallation,
+  getAuthenticatedGithubUser,
+  GithubApiError,
+  getUserInstallation,
+} from './github-user-auth';
+import { payloadExpired, signSignedPayload, verifySignedPayload } from './signed-payload';
+import {
   admitProvisioningAccount,
   admitProvisioningCallback,
   admitProvisioningRequest,
@@ -68,7 +77,6 @@ import {
 import { LANDING_PAGE } from './landing-page';
 import { progressPageUrl, projectProvisioning } from './progress';
 import { progressPage } from './progress-page';
-import { Secret } from './secret';
 import { reportError } from './safe-serialize';
 export {
   createRepositoryWithRetry,
@@ -430,9 +438,7 @@ export interface GithubIdentity {
   accountType: 'User' | 'Organization';
 }
 
-const GITHUB_API = 'https://api.github.com';
 const GITHUB_INSTALL_URL = 'https://github.com/apps';
-const GITHUB_API_VERSION = '2022-11-28';
 const STATE_TTL_SECONDS = 10 * 60;
 const STATE_REPLAY_TTL_SECONDS = 60 * 60;
 const STATE_PREFIX = 'github:oauth-state:';
@@ -490,115 +496,30 @@ interface GithubStateRecord {
   identity?: GithubIdentity;
 }
 
-interface GithubUserResponse {
-  id?: number;
-  login?: string;
-  type?: string;
-}
-
-interface GithubInstallationsResponse {
-  installations?: Array<{ id?: number; app_id?: number; app_slug?: string }>;
-}
-
-interface GithubAccessTokenResponse {
-  access_token?: string;
-  error?: string;
-}
-
-interface GithubApiErrorShape {
-  status: number;
-}
-
-class GithubApiError extends Error implements GithubApiErrorShape {
-  readonly status: number;
-
-  constructor(status: number) {
-    super('GitHub request failed');
-    this.name = 'GithubApiError';
-    this.status = status;
-  }
-}
-
-function base64UrlEncode(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
-}
-
-function base64UrlDecode(value: string): Uint8Array {
-  if (!/^[A-Za-z0-9_-]+$/u.test(value)) throw new Error('invalid base64url');
-  const padded = value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - (value.length % 4)) % 4);
-  const binary = atob(padded);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
-const textEncoder = new TextEncoder();
-
-async function hmacSign(value: string, secret: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    textEncoder.encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  const signature = await crypto.subtle.sign('HMAC', key, textEncoder.encode(value));
-  return base64UrlEncode(new Uint8Array(signature));
-}
-
 /** Exported for tests and for other onboarding entrypoints that share state. */
 export async function signGithubState(
   payload: SignedStatePayload,
   secret: string,
 ): Promise<string> {
-  const encodedPayload = base64UrlEncode(textEncoder.encode(JSON.stringify(payload)));
-  return `${encodedPayload}.${await hmacSign(encodedPayload, secret)}`;
+  return signSignedPayload(payload, secret);
 }
 
+/**
+ * Absent `purpose` means install, so states signed before the status leg
+ * shipped keep verifying across a deploy. Status-leg payloads carry their own
+ * `k`/`purpose` marks and are refused here; the callback dispatches on the
+ * payload kind before this verifier runs.
+ */
 async function verifyGithubState(
   encodedState: string,
   secret: string,
 ): Promise<SignedStatePayload | null> {
-  const parts = encodedState.split('.');
-  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
-
-  try {
-    const expectedSignature = await hmacSign(parts[0], secret);
-    const expected = textEncoder.encode(expectedSignature);
-    const actual = textEncoder.encode(parts[1]);
-    if (expected.length !== actual.length) return null;
-
-    // HMAC verification is done by WebCrypto as well; the equal-length check
-    // avoids using a non-constant-time string comparison for the signature.
-    const key = await crypto.subtle.importKey(
-      'raw',
-      textEncoder.encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['verify'],
-    );
-    const valid = await crypto.subtle.verify(
-      'HMAC',
-      key,
-      base64UrlDecode(parts[1]),
-      textEncoder.encode(parts[0]),
-    );
-    if (!valid) return null;
-
-    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[0]))) as SignedStatePayload;
-    if (
-      payload.v !== 1 ||
-      typeof payload.jobId !== 'string' ||
-      typeof payload.nonce !== 'string' ||
-      !Number.isSafeInteger(payload.exp) ||
-      payload.exp <= Math.floor(Date.now() / 1000)
-    ) {
-      return null;
-    }
-    return payload;
-  } catch {
-    return null;
-  }
+  return verifySignedPayload<SignedStatePayload>(encodedState, secret, (payload) =>
+    payload.k === undefined &&
+    payload.purpose !== 'status' &&
+    typeof payload.jobId === 'string' &&
+    typeof payload.nonce === 'string' &&
+    !payloadExpired(payload.exp, Math.floor(Date.now() / 1000)));
 }
 
 function stateSecret(env: Pick<Env, 'GITHUB_CLIENT_SECRET'>): string {
@@ -623,124 +544,6 @@ function validInstallationId(value: string | null): number | null {
 
 function callbackUrl(request: Request): string {
   return new URL('/auth/github/callback', request.url).toString();
-}
-
-function githubHeaders(authorization?: string): Headers {
-  const headers = new Headers({
-    Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': GITHUB_API_VERSION,
-  });
-  if (authorization) headers.set('Authorization', authorization);
-  return headers;
-}
-
-async function readJson<T>(response: Response): Promise<T | null> {
-  try {
-    return (await response.json()) as T;
-  } catch {
-    return null;
-  }
-}
-
-async function githubRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(githubHeaders());
-  new Headers(init.headers).forEach((value, key) => headers.set(key, value));
-  const response = await fetch(`${GITHUB_API}${path}`, {
-    ...init,
-    headers,
-  });
-  if (!response.ok) throw new GithubApiError(response.status);
-  const body = await readJson<T>(response);
-  if (body === null) throw new GithubApiError(502);
-  return body;
-}
-
-async function exchangeGithubCode(
-  code: string,
-  env: Pick<Env, 'GITHUB_CLIENT_ID' | 'GITHUB_CLIENT_SECRET'>,
-  redirectUri: string,
-): Promise<Secret<'github-user-access'>> {
-  const body = new URLSearchParams({
-    client_id: env.GITHUB_CLIENT_ID,
-    client_secret: env.GITHUB_CLIENT_SECRET,
-    code,
-    redirect_uri: redirectUri,
-  });
-  const response = await fetch('https://github.com/login/oauth/access_token', {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body,
-  });
-  const token = await readJson<GithubAccessTokenResponse>(response);
-  if (!response.ok || !token?.access_token || token.error) throw new GithubApiError(response.status || 502);
-  return Secret.githubUserAccess(token.access_token);
-}
-
-async function getAuthenticatedGithubUser(authorization: string): Promise<GithubIdentity> {
-  const user = await githubRequest<GithubUserResponse>('/user', {
-    headers: githubHeaders(authorization),
-  });
-  if (!Number.isSafeInteger(user.id) || !user.login || (user.type !== 'User' && user.type !== 'Organization')) {
-    throw new GithubApiError(502);
-  }
-  const { id, login, type } = user;
-  return { id: id as number, login: login as string, accountType: type as 'User' | 'Organization' };
-}
-
-async function getUserInstallation(
-  authorization: string,
-  installationId: number,
-): Promise<GithubInstallationAccount> {
-  return githubRequest<GithubInstallationAccount>(`/user/installations/${installationId}`, {
-    headers: githubHeaders(authorization),
-  });
-}
-
-async function findUserInstallation(
-  authorization: string,
-  appId: string,
-): Promise<number> {
-  const response = await githubRequest<GithubInstallationsResponse>('/user/installations', {
-    headers: githubHeaders(authorization),
-  });
-  const installation = response.installations?.find(
-    (candidate) => Number(candidate.app_id) === Number(appId) && Number.isSafeInteger(candidate.id) && candidate.id! > 0,
-  );
-  if (!installation?.id) throw new GithubApiError(404);
-  return installation.id;
-}
-
-function installationIdentity(
-  installation: GithubInstallationAccount,
-): GithubIdentity {
-  const account = installation.account;
-  if (!account || !Number.isSafeInteger(account.id) || !account.login) throw new GithubApiError(502);
-  if (account.type !== 'User' && account.type !== 'Organization') throw new GithubApiError(502);
-  const { id, login, type } = account;
-  return { id: id as number, login: login as string, accountType: type as 'User' | 'Organization' };
-}
-
-function assertUsablePersonalInstallation(
-  installation: GithubInstallationAccount,
-  authenticatedUser?: GithubIdentity,
-): GithubIdentity {
-  if (installation.suspended_at || installation.suspended_by) {
-    throw new FlowFailure('github_installation_suspended');
-  }
-  const identity = installationIdentity(installation);
-  if (identity.accountType === 'Organization') {
-    throw new FlowFailure('github_organization_installation_not_supported');
-  }
-  if (
-    authenticatedUser &&
-    (identity.id !== authenticatedUser.id || identity.login.toLowerCase() !== authenticatedUser.login.toLowerCase())
-  ) {
-    throw new FlowFailure('github_account_mismatch');
-  }
-  return identity;
 }
 
 function authError(error: unknown, request: Request): Response {
