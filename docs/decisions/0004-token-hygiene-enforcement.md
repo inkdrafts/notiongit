@@ -49,12 +49,16 @@ Three facts anchored the design:
    without first passing through code that holds a `Secret`.
 2. **One diagnostics module owns all stringification for logs.**
    `src/safe-serialize.ts` exposes `redactValue`, `serializeForLog`, and
-   `reportError` — the only `console.*` call in `src/`. It is wired into
-   exactly the three places that previously discarded diagnostics: the GitHub
-   callback's 502 fallthrough, the queue consumer's catch, and the Notion
-   callback's non-`NotionOAuthError` fallthrough. No levels, no sinks, no
-   framework. The Notion error `details` merge into response bodies goes
-   through `redactValue`, covering the one dynamic browser surface.
+   `reportError` — the only `console.*` producer of error diagnostics in
+   `src/`. It is wired into exactly the three places that previously
+   discarded diagnostics: the GitHub callback's 502 fallthrough, the queue
+   consumer's catch, and the Notion callback's non-`NotionOAuthError`
+   fallthrough. No levels, no sinks, no framework. The Notion error
+   `details` merge into response bodies goes through `redactValue`,
+   covering the one dynamic browser surface. The provisioning funnel and
+   alert telemetry introduced by the observability work are the other
+   sanctioned console producers; their payloads are closed typechecked
+   allowlists of non-secret fields, and the canary suite scans them too.
 3. **TTL-only retention; the resolution record is never deleted.** No
    `kv.delete`, no cron trigger, no delete endpoint, no scan. Every record
    expires on the TTL documented in `docs/security-data-flow.md` §3.
@@ -70,11 +74,15 @@ Three facts anchored the design:
    GitHub callback, the full seven-step pipeline, the three error funnels,
    and the disconnect (mint-404) timeline with synthetic canary credentials,
    asserting their absence from KV writes, queue messages, response bodies
-   and redirect headers, thrown errors, and console output — plus
+   and redirect headers, thrown errors, console output, and the Analytics
+   Engine data points captured through a fake metrics binding — plus
    positive-flow assertions proving each canary genuinely flowed, per-write
    TTL logs pinning the retention table, and zero recorded delete
-   operations. Statically: `console.*` may appear in `src/` only in
-   `safe-serialize.ts`, and no `src/` error message may be built from
+   operations. Console records are pinned to the sanctioned producers: a
+   journey fails if any console line is not a `[notiongit] …` reportError
+   line or a structured funnel event. Statically: `console.*` may appear in
+   `src/` only in `safe-serialize.ts`, `observability.ts`, and
+   `observability-alerts.ts`, and no `src/` error message may be built from
    interpolation (an interpolated message is the one channel that would
    carry a credential into an otherwise-redacted log line).
 

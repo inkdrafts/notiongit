@@ -7,9 +7,10 @@
  *   Secret instances render "[redacted]", keys matching the credential-key
  *   pattern redact regardless of value, depth and cycles are bounded, and an
  *   unserializable input degrades to a short safe string.
- * - reportError is the single console sink in src/. Nothing else in the
- *   codebase may call console.*; the canary suite fails if one appears on a
- *   route a journey drives.
+ * - reportError is the single console producer of error diagnostics in src/.
+ *   The provisioning funnel and alert telemetry are the other sanctioned
+ *   console producers; the canary suite fails on any other console call, and
+ *   on any journey console line outside these shapes.
  * - This module never inspects values to decide whether they are secret: the
  *   decision is structural (Secret type) or lexical (key name). It cannot be
  *   talked into printing a Secret.

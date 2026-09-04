@@ -76,11 +76,21 @@ of truth, so a message carries nothing else.
   credential-named key cannot reach the body. Provider response bodies are
   never echoed.
 - **Queue messages** are exactly `{ jobId }`.
-- **Platform logs** contain only what `reportError` writes:
-  `console.error('[notiongit] <context>', serializeForLog(error))`. The
-  serializer renders `Secret`s as `"[redacted]"`, redacts credential-named
-  keys regardless of value, bounds depth and cycles, and renders `Error`s as
-  `{name, message, …own fields}`. It is the only `console.*` call in `src/`.
+- **Platform logs** carry output from three sanctioned producers only:
+  `reportError` (`console.error('[notiongit] <context>', serializeForLog(error))`,
+  whose serializer renders `Secret`s as `"[redacted]"`, redacts
+  credential-named keys regardless of value, bounds depth and cycles, and
+  renders `Error`s as `{name, message, …own fields}`); the provisioning
+  funnel events (`emitProvisioningEvent` writes one
+  `JSON.stringify(event)` line, whose fields are a typechecked closed
+  allowlist — job id, step names, classified error codes, durations — never
+  an `Error`, a provider body, or a credential); and the observability
+  alert adapter's closed `{type, kind}` status lines.
+- **Analytics Engine** (`PROVISIONING_METRICS`, optional binding) receives
+  one data point per funnel event, built from the same allowlisted fields.
+  The alert evaluator queries aggregated windows and POSTs findings to an
+  operator webhook; an alert carries a step name, a closed `kind`, and
+  counts — never a job id, a token, or a provider body.
 
 ## 5. Enforcement
 
@@ -90,18 +100,25 @@ of truth, so a message carries nothing else.
   (`NotionOAuthContinuation`, `StepRunnerContext`) in a self-redacting
   `Secret`. Serialization yields `"[redacted]"`; the value leaves only
   through the greppable `.raw` / `.bearer()` unwraps at provider-call sites.
-- **Diagnostic:** all log lines are produced by `src/safe-serialize.ts`.
+- **Diagnostic:** error diagnostics are produced only by
+  `src/safe-serialize.ts`; funnel and alert telemetry only by
+  `src/observability.ts` / `src/observability-alerts.ts`, whose event
+  fields are a typechecked closed allowlist.
 - **Systematic:** `test/token-hygiene.test.ts` drives five journeys (Notion
   callback, GitHub callback, the full seven-step pipeline, the three error
   funnels, the disconnect timeline) with synthetic canary credentials and
   fails if any canary or credential-shaped key name appears in KV writes,
-  queue messages, response bodies and redirect headers, thrown errors, or
-  console output — and it fails if a journey passes vacuously, because each
-  also asserts the canary genuinely flowed (the recorded provider
-  `Authorization` headers). Per-write TTL logs pin the retention table in §3;
-  the journeys additionally assert zero delete operations. Two static
-  tripwires hold the structural invariants: `console.*` appears in `src/`
-  only in `safe-serialize.ts`, and no `src/` error message is built from
+  queue messages, response bodies and redirect headers, thrown errors,
+  console output, or the Analytics Engine data points captured through a
+  fake metrics binding — and it fails if a journey passes vacuously,
+  because each also asserts the canary genuinely flowed (the recorded
+  provider `Authorization` headers). Per-write TTL logs pin the retention
+  table in §3; the journeys additionally assert zero delete operations.
+  Console records are further pinned to the sanctioned producers: a
+  journey fails if any console line is not a `[notiongit] …` reportError
+  line or a structured funnel event. Two static tripwires hold the
+  structural invariants: `console.*` appears in `src/` only in the three
+  sanctioned sinks, and no `src/` error message is built from
   interpolation.
 
 Run `bun test test/token-hygiene.test.ts`.

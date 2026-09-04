@@ -183,6 +183,33 @@ class ConsoleRecorder {
     assertClean('console', this.allText(), { allowMarker: true });
   }
 
+  /** Texts of reportError lines, the "[notiongit] …" records. */
+  reportErrorTexts(): string[] {
+    return this.records.map((record) => record.text).filter((text) => text.startsWith('[notiongit] '));
+  }
+
+  /**
+   * Console output must come from one of the two sanctioned sinks — a
+   * reportError line or one structured funnel event. Returns the funnel event
+   * types in emission order.
+   */
+  funnelEventTypes(): string[] {
+    const types: string[] = [];
+    for (const record of this.records) {
+      if (record.text.startsWith('[notiongit] ')) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(record.text);
+      } catch {
+        throw new Error(`console record from an unsanctioned sink: ${record.text}`);
+      }
+      const type = (parsed as { type?: unknown }).type;
+      expect(typeof type === 'string' && FUNNEL_EVENT_TYPES.has(type)).toBe(true);
+      types.push(type as string);
+    }
+    return types;
+  }
+
   assertSingleRecord(context: string): void {
     expect(this.records).toHaveLength(1);
     expect(this.records[0].text).toContain(`[notiongit] ${context}`);
@@ -331,6 +358,21 @@ function assertJourneyClean(journey: Journey, recorder: ConsoleRecorder): void {
   assertClean('thrown errors', journey.thrown);
   recorder.assertNoCanary();
 }
+
+/** The observability funnel's event vocabulary (src/observability.ts). */
+const FUNNEL_EVENT_TYPES = new Set([
+  'consent_started',
+  'consent_completed',
+  'consent_failed',
+  'job_queued',
+  'job_enqueue_failed',
+  'step_started',
+  'step_succeeded',
+  'step_failed',
+  'rate_limited',
+  'job_succeeded',
+  'job_dead_lettered',
+]);
 
 // ---------------------------------------------------------------------------
 // Shared fixtures. Identifiers are synthetic but none are canaries, so the
@@ -707,7 +749,8 @@ describe('J2 GitHub callback journey', () => {
         },
       });
       assertJourneyClean(driven, recorder);
-      recorder.assertSilent();
+      expect(recorder.funnelEventTypes()).toEqual(['job_queued']);
+      expect(recorder.reportErrorTexts()).toEqual([]);
       return driven;
     });
 
@@ -842,9 +885,16 @@ function queuePhaseFetch(): {
 
 describe('J3 queue pipeline journey', () => {
   test('seven batches: each step spends its own fresh mint, the user token never reappears, every job write keeps the 24h TTL, zero deletes', async () => {
-    const { journey, queueCalls, mintCount } = await withCapturedConsole(async (recorder) => {
+    const { journey, queueCalls, mintCount, analyticsPoints } = await withCapturedConsole(async (recorder) => {
       const driven = await runGithubOnboarding();
       expect(driven.responses[1].status).toBe(202);
+
+      const analyticsPoints: unknown[] = [];
+      (driven.env as Record<string, unknown>).PROVISIONING_METRICS = {
+        writeDataPoint: (data: unknown) => {
+          analyticsPoints.push(data);
+        },
+      };
 
       const phase = queuePhaseFetch();
       const originalFetch = globalThis.fetch;
@@ -876,12 +926,19 @@ describe('J3 queue pipeline journey', () => {
         globalThis.fetch = originalFetch;
       }
       assertJourneyClean(driven, recorder);
-      return { journey: driven, queueCalls: phase.calls, mintCount: phase.mintCount() };
+      const funnel = recorder.funnelEventTypes();
+      expect(funnel.filter((type) => type === 'step_started')).toHaveLength(7);
+      expect(funnel.filter((type) => type === 'step_succeeded')).toHaveLength(7);
+      expect(funnel.at(-1)).toBe('job_succeeded');
+      expect(recorder.reportErrorTexts()).toEqual([]);
+      assertClean('analytics data points', JSON.stringify(analyticsPoints));
+      return { journey: driven, queueCalls: phase.calls, mintCount: phase.mintCount(), analyticsPoints };
     });
 
     expect(mintCount).toBe(7);
     expect(queueCalls.every((call) => call.authorization !== `Bearer ${GITHUB_USER_TOKEN}`)).toBe(true);
     expect(journey.queue.sent).toEqual(Array.from({ length: 7 }, () => ({ jobId: GITHUB_JOB_ID })));
+    expect(analyticsPoints).toHaveLength(15);
 
     const jobKey = provisioningJobKey(GITHUB_JOB_ID);
     const job = await journey.kv.get<Record<string, unknown>>(jobKey, 'json');
@@ -950,8 +1007,11 @@ describe('J4 error funnels', () => {
       await addResponse(journey, callback);
       expect(callback.status).toBe(502);
       expect(await callback.text()).toBe('{"error":"notion_unavailable"}');
-      recorder.assertSingleRecord('notion_callback_failed');
-      expect(recorder.recordText(0)).toContain('"notionAccessToken":"[redacted]"');
+      expect(recorder.funnelEventTypes()).toEqual(['consent_started', 'consent_failed']);
+      const reports = recorder.reportErrorTexts();
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toContain('[notiongit] notion_callback_failed');
+      expect(reports[0]).toContain('"notionAccessToken":"[redacted]"');
       assertJourneyClean(journey, recorder);
       return journey;
     });
@@ -1047,7 +1107,8 @@ describe('J4 error funnels', () => {
         scanned: 2,
         accessToken: REDACTED_MARKER,
       });
-      recorder.assertSilent();
+      expect(recorder.funnelEventTypes()).toEqual(['consent_started', 'consent_failed']);
+      expect(recorder.reportErrorTexts()).toEqual([]);
     });
 
     expect(kv.keysWithPrefix(NOTION_TEMPLATE_RESOLUTION_PREFIX)).toEqual([]);
@@ -1079,7 +1140,8 @@ describe('J5 disconnect timeline journey', () => {
         globalThis.fetch = originalFetch;
       }
       assertJourneyClean(driven, recorder);
-      recorder.assertSilent();
+      expect(recorder.funnelEventTypes()).toEqual(['job_queued', 'step_started', 'step_failed', 'job_dead_lettered']);
+      expect(recorder.reportErrorTexts()).toEqual([]);
       return driven;
     });
 
@@ -1113,11 +1175,12 @@ function srcFiles(directory: string = SRC_DIR): string[] {
 }
 
 describe('static tripwires', () => {
-  test('S1: console.* appears in src/ only in safe-serialize.ts', () => {
+  test('S1: console.* appears in src/ only in the three sanctioned sinks', () => {
     const offenders = srcFiles()
       .filter((file) => /console\./u.test(readFileSync(file, 'utf8')))
-      .map((file) => relative(SRC_DIR, file));
-    expect(offenders).toEqual(['safe-serialize.ts']);
+      .map((file) => relative(SRC_DIR, file))
+      .sort();
+    expect(offenders).toEqual(['observability-alerts.ts', 'observability.ts', 'safe-serialize.ts']);
   });
 
   test('S2: no error message in src/ is built from interpolation or concatenation', () => {
