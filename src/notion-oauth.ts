@@ -8,6 +8,7 @@
  */
 
 import type { NotionTemplateErrorCode } from './notion-template';
+import { callbackFailure } from './failures';
 
 export const NOTION_AUTHORIZATION_URL = 'https://api.notion.com/v1/oauth/authorize';
 export const NOTION_TOKEN_URL = 'https://api.notion.com/v1/oauth/token';
@@ -409,12 +410,10 @@ export async function finishNotionCallback(
     };
     return response(summary, 202, clearCookieHeaders);
   } catch (error) {
-    if (error instanceof NotionOAuthError) {
-      const body: Record<string, unknown> = { error: error.code };
-      // Only non-secret schema metadata the continuation attached on purpose.
-      if (error.details) Object.assign(body, error.details);
-      return response(body, error.status, clearCookieHeaders);
-    }
-    return response({ error: 'notion_unavailable' }, 502, clearCookieHeaders);
+    const failure = callbackFailure(error, 'notion');
+    const body: Record<string, unknown> = { error: failure.code };
+    // Only non-secret schema metadata the continuation attached on purpose.
+    if (failure.details) Object.assign(body, failure.details);
+    return response(body, failure.status, clearCookieHeaders);
   }
 }

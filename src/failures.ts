@@ -8,9 +8,9 @@
  * - Persist only `{ code, retryable }` in the durable record; all user copy
  *   and support metadata is derived at read time from this module and lives
  *   nowhere else.
- * - Status-only transport errors have no code at the throw site: the queue
- *   derives one from the provider status (`classifyProvisioningError`), and
- *   each callback route derives its own from the same statuses.
+ * - Throw sites that can derive their code do so (see `GithubAppAuthError`).
+ *   A transport class that cannot carries only its status and is mapped by
+ *   the surface that owns it.
  * - At an HTTP route, emit through `callbackFailure` and build the response
  *   at the wire boundary; this module never sees `Response`.
  *
@@ -953,24 +953,12 @@ function errorRetryAfterSeconds(error: unknown): number | null {
   return typeof value === 'number' ? value : null;
 }
 
-/**
- * Status-only transport classes reach the queue with no code (the app-auth
- * classes gain one at their throw site; a bare status can still arrive from a
- * raw provider response). 429 and 5xx stay retryable; any other status is a
- * terminal authorization-style failure.
- */
-function queueTransportCode(status: number): ProvisioningFailureCode {
-  if (status === 429) return 'github_rate_limited';
-  if (status >= 500) return 'github_app_unavailable';
-  return 'github_app_auth_failed';
-}
-
 /** Maps every provisioning error this queue can encounter to a retry decision. */
 export function classifyProvisioningError(error: unknown): ProvisioningErrorClassification {
-  const status = (error as { status?: unknown } | null | undefined)?.status;
-  const code = codedFailureCode(error)
-    ?? (typeof status === 'number' ? queueTransportCode(status) : null)
-    ?? 'provisioning_step_failed';
+  // An unrecognized error (a network throw, a bug) is treated as transient.
+  // The per-step attempt ceiling still bounds it to a handful of tries before
+  // the job goes to dead_letter, so this can never retry forever.
+  const code = codedFailureCode(error) ?? 'provisioning_step_failed';
   return {
     code,
     retryable: FAILURE_REGISTRY[code].retryable,

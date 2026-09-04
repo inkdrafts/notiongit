@@ -19,6 +19,7 @@ import {
   type ProvisioningFailureCode,
 } from '../src/failures';
 import type { GithubActionsSecretsErrorCode } from '../src/actions-secrets';
+import { GithubAppAuthError } from '../src/github-app-auth';
 import type { GithubConfigErrorCode } from '../src/repository-config';
 import type { GithubDeployErrorCode } from '../src/site-deployment';
 import type { GithubGenerateErrorCode } from '../src/repository-generation';
@@ -229,18 +230,22 @@ describe('classifyProvisioningError', () => {
     });
   });
 
-  test('derives transport codes from a bare provider status', () => {
-    class StatusOnlyError extends Error {
-      readonly status: number;
-      constructor(status: number) {
-        super('request failed');
-        this.status = status;
-      }
-    }
-    expect(classifyProvisioningError(new StatusOnlyError(429)).code).toBe('github_rate_limited');
-    expect(classifyProvisioningError(new StatusOnlyError(503)).code).toBe('github_app_unavailable');
-    expect(classifyProvisioningError(new StatusOnlyError(404)).code).toBe('github_app_auth_failed');
-    expect(classifyProvisioningError(new StatusOnlyError(404)).retryable).toBe(false);
+  test('classifies app-auth failures from the code derived at the throw site', () => {
+    expect(classifyProvisioningError(new GithubAppAuthError(429))).toEqual({
+      code: 'github_rate_limited',
+      retryable: true,
+      retryAfterSeconds: null,
+    });
+    expect(classifyProvisioningError(new GithubAppAuthError(503))).toEqual({
+      code: 'github_app_unavailable',
+      retryable: true,
+      retryAfterSeconds: null,
+    });
+    expect(classifyProvisioningError(new GithubAppAuthError(404))).toEqual({
+      code: 'github_app_auth_failed',
+      retryable: false,
+      retryAfterSeconds: null,
+    });
   });
 
   test('reads retry-after structurally from the error instance', () => {

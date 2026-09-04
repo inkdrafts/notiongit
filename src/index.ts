@@ -14,12 +14,8 @@ import {
 } from './repository-naming';
 import {
   generateOrReuseRepository,
-  GithubGenerateError,
   type GeneratedRepositoryIdentity,
 } from './repository-generation';
-import {
-  GithubActionsSecretsError,
-} from './actions-secrets';
 import {
   getAppInstallation,
   GithubAppAuthError,
@@ -30,6 +26,7 @@ import {
   nextPendingStep,
   saveProvisioningJob,
 } from './provisioning-job';
+import { callbackFailure, FlowFailure } from './failures';
 import { processProvisioningMessage } from './provisioning-queue';
 import {
   beginNotionAuthorization,
@@ -605,53 +602,40 @@ function assertUsablePersonalInstallation(
   authenticatedUser?: GithubIdentity,
 ): GithubIdentity {
   if (installation.suspended_at || installation.suspended_by) {
-    throw new Error('github_installation_suspended');
+    throw new FlowFailure('github_installation_suspended');
   }
   const identity = installationIdentity(installation);
   if (identity.accountType === 'Organization') {
-    throw new Error('github_organization_installation_not_supported');
+    throw new FlowFailure('github_organization_installation_not_supported');
   }
   if (
     authenticatedUser &&
     (identity.id !== authenticatedUser.id || identity.login.toLowerCase() !== authenticatedUser.login.toLowerCase())
   ) {
-    throw new Error('github_account_mismatch');
+    throw new FlowFailure('github_account_mismatch');
   }
   return identity;
 }
 
 function authError(error: unknown): Response {
-  if (error instanceof Error) {
-    switch (error.message) {
-      case 'github_installation_suspended': return json({ error: error.message }, 403);
-      case 'github_organization_installation_not_supported': return json({ error: error.message }, 403);
-      case 'github_account_mismatch': return json({ error: error.message }, 403);
-    }
-  }
+  // GithubApiError carries no code, and GithubAppAuthError's derived code
+  // reflects what the queue can retry, not what the user should do next:
+  // both resolve here from the provider status.
   if (error instanceof GithubApiError || error instanceof GithubAppAuthError) {
+    if (error.status === 429) return json({ error: 'github_rate_limited' }, 429);
     if (error.status === 404) return json({ error: 'github_installation_missing' }, 400);
     if (error.status === 400 || error.status === 401) return json({ error: 'github_authorization_failed' }, 400);
+    return json({ error: 'github_authorization_unavailable' }, 502);
   }
-  if (error instanceof GithubRepositoryApiError) {
-    if (error.status === 400 || error.status === 401) return json({ error: 'github_authorization_failed' }, 400);
+  if (error instanceof GithubRepositoryApiError && (error.status === 400 || error.status === 401)) {
+    return json({ error: 'github_authorization_failed' }, 400);
   }
-  if (error instanceof GithubGenerateError) {
-    // Timeout, rate limit, and unavailable are distinct on purpose: each has a
-    // different recovery path and all are resumable by restarting the flow,
-    // which reuses an already-generated repository instead of duplicating it.
-    const body: Record<string, unknown> = { error: error.code };
-    if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
-    return json(body, error.status);
-  }
-  if (error instanceof GithubActionsSecretsError) {
-    return json({ error: error.code }, error.status);
-  }
-  // Pages, config-patch, sync-dispatch, and deploy failures no longer surface
-  // here: those steps run in the durable provisioning queue (see
-  // `provisioning-queue.ts`), not inside this synchronous request.
+  const failure = callbackFailure(error, 'github');
+  const body: Record<string, unknown> = { error: failure.code };
+  if (failure.retryAfterSeconds !== null) body.retry_after_seconds = failure.retryAfterSeconds;
   // Deliberately do not expose provider response bodies, OAuth codes, tokens,
   // private keys, or exception messages to the browser.
-  return json({ error: 'github_authorization_unavailable' }, 502);
+  return json(body, failure.status);
 }
 
 async function beginGithubInstall(request: Request, env: Partial<Env>): Promise<Response> {
@@ -732,7 +716,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       // The token is scoped to this request. It is never logged, returned, or
       // passed to KV. The GitHub code is likewise never persisted.
       const authenticatedUser = await getAuthenticatedGithubUser(accessToken);
-      if (authenticatedUser.accountType !== 'User') throw new Error('github_organization_installation_not_supported');
+      if (authenticatedUser.accountType !== 'User') throw new FlowFailure('github_organization_installation_not_supported');
       // GitHub normally includes installation_id during OAuth-on-install, but
       // the OAuth callback contract also permits code-only callbacks. Discover
       // this App's installation from the authenticated user's installations in
