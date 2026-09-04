@@ -10,7 +10,8 @@ queue (`provisioning-job.ts`, `provisioning-steps.ts`,
 provisioning resumable and idempotent; storage owns the KV records these
 modules read and write; and the UI will contain browser-facing HTML and
 assets. These boundaries keep provider details out of routing and keep secrets
-server-only.
+server-only. The credential inventory, retention table, and their enforcement
+are documented in [`security-data-flow.md`](security-data-flow.md) (ADR 0004).
 
 ## Environments and secrets
 
