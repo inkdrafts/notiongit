@@ -923,7 +923,15 @@ export async function consumeGlobalMutationBudget(
 
 export type StartGateDecision =
   | { granted: true }
-  | { granted: false; reason: 'global_throttled' | 'account_busy'; retryAfterSeconds: number };
+  | { granted: false; reason: 'global_throttled'; retryAfterSeconds: number }
+  | {
+      granted: false;
+      reason: 'account_busy';
+      retryAfterSeconds: number;
+      /** The job holding the account's slot, when the refusal can name it.
+       * A read-back that served nothing cannot name the winner. */
+      activeJobId: string | null;
+    };
 
 /**
  * Anti-replay plus per-account quota, refusing BEFORE any further token
@@ -962,6 +970,7 @@ export async function acquireProvisioningStart(
         granted: false,
         reason: 'account_busy',
         retryAfterSeconds: Math.max(Math.ceil((lease.expiresAt - nowMs) / 1000), 1),
+        activeJobId: lease.jobId,
       };
     }
     await kv.delete(leaseKey);
@@ -973,7 +982,12 @@ export async function acquireProvisioningStart(
   await kv.put(leaseKey, JSON.stringify(renewed), { expirationTtl: config.leaseTtlSeconds });
   const readBack = await kv.get<AccountLease>(leaseKey, 'json');
   if (!readBack || readBack.jobId !== params.jobId) {
-    return { granted: false, reason: 'account_busy', retryAfterSeconds: config.leaseTtlSeconds };
+    return {
+      granted: false,
+      reason: 'account_busy',
+      retryAfterSeconds: config.leaseTtlSeconds,
+      activeJobId: readBack?.jobId ?? null,
+    };
   }
   return { granted: true };
 }
@@ -1086,11 +1100,13 @@ export async function gateProvisioningStep(
   return { action: 'proceed' };
 }
 
-/** Browser-visible refusal; `authError` maps the reason to a body. */
+/** Browser-visible refusal; `authError` maps the reason to a body or, for an
+ * account busy with a nameable job, a redirect to that job's progress page. */
 export class ProvisioningGateRefusedError extends Error {
   readonly reason: 'global_throttled' | 'account_busy';
   readonly status: 409 | 429;
   readonly retryAfterSeconds: number;
+  readonly activeJobId: string | null;
 
   constructor(decision: Extract<StartGateDecision, { granted: false }>) {
     super(`provisioning_refused_${decision.reason}`);
@@ -1098,6 +1114,7 @@ export class ProvisioningGateRefusedError extends Error {
     this.reason = decision.reason;
     this.status = decision.reason === 'account_busy' ? 409 : 429;
     this.retryAfterSeconds = decision.retryAfterSeconds;
+    this.activeJobId = decision.reason === 'account_busy' ? decision.activeJobId : null;
   }
 }
 

@@ -743,7 +743,7 @@ function assertUsablePersonalInstallation(
   return identity;
 }
 
-function authError(error: unknown): Response {
+function authError(error: unknown, request: Request): Response {
   if (error instanceof ProvisioningAdmissionRefusedError) {
     const status = error.code === 'github_account_attempt_limited' ? 429
       : error.code === 'github_identity_temporarily_denied' ? 423
@@ -765,9 +765,16 @@ function authError(error: unknown): Response {
     return json({ error: 'github_authorization_failed' }, 400);
   }
   if (error instanceof ProvisioningGateRefusedError) {
-    // A refused start is not a failure of the flow: the account already has
-    // its one provisioning in flight, or the app-wide mutation budget is
-    // spent. Both answers carry the same Retry-After contract GitHub uses.
+    // A refused start is not a failure of the flow. A double starter just
+    // OAuth'd as the account that holds the slot, so naming that job's
+    // progress page is a sound capability grant; a budget refusal names no
+    // job and keeps the Retry-After contract GitHub uses.
+    if (error.reason === 'account_busy' && error.activeJobId !== null) {
+      return new Response(null, {
+        status: 303,
+        headers: { Location: new URL(progressPageUrl(error.activeJobId), request.url).toString() },
+      });
+    }
     return json({
       error: error.reason === 'account_busy' ? 'github_provisioning_already_active' : 'github_rate_limited',
       retry_after_seconds: error.retryAfterSeconds,
@@ -1000,7 +1007,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       return json({ status: 'awaiting_authorization', job_id: record.jobId }, 202);
     }
   } catch (error) {
-    return authError(error);
+    return authError(error, request);
   }
 }
 

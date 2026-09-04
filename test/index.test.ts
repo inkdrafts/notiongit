@@ -580,11 +580,10 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(await stateFor('job-456'))}&code=one-time-code&installation_id=123&setup_action=install`),
         env,
       );
-      expect(second.status).toBe(409);
-      const body = await second.json() as Record<string, unknown>;
-      expect(body.error).toBe('github_provisioning_already_active');
-      expect(body.retry_after_seconds as number).toBeGreaterThanOrEqual(1);
-      expect(second.headers.get('retry-after')).toBe(String(body.retry_after_seconds));
+      // The double starter just OAuth'd as the account that holds the slot,
+      // so the answer is a redirect to the active job's progress page.
+      expect(second.status).toBe(303);
+      expect(second.headers.get('location')).toBe('https://example.com/progress?job_id=job-123');
       // The live job keeps the account's single slot and no second job was
       // created or enqueued for it.
       expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-123' });

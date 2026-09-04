@@ -434,7 +434,12 @@ describe('acquireProvisioningStart', () => {
 
     const before = kv.snapshot();
     const decision = await acquireProvisioningStart(kv, { accountId: IDENTITY.id, jobId: 'job-2' }, config, NOW);
-    expect(decision).toEqual({ granted: false, reason: 'account_busy', retryAfterSeconds: 600 });
+    expect(decision).toEqual({
+      granted: false,
+      reason: 'account_busy',
+      retryAfterSeconds: 600,
+      activeJobId: 'job-1',
+    });
     expect(kv.snapshot()).toBe(before);
   });
 
@@ -499,6 +504,7 @@ describe('acquireProvisioningStart', () => {
       if (!decision.granted) {
         expect(decision.reason).toBe('account_busy');
         expect(decision.retryAfterSeconds).toBeGreaterThanOrEqual(1);
+        expect(decision.activeJobId).not.toBeNull();
       }
     }
     const lease = storedLease(kv);
@@ -517,7 +523,12 @@ describe('acquireProvisioningStart', () => {
     // job-2 sees the expired lease, puts its own, but its read-back serves
     // the pre-write snapshot: it must refuse and leave the key in place.
     const decision = await acquireProvisioningStart(kv as unknown as KVNamespace, { accountId: IDENTITY.id, jobId: 'job-2' }, config, NOW);
-    expect(decision).toEqual({ granted: false, reason: 'account_busy', retryAfterSeconds: config.leaseTtlSeconds });
+    expect(decision).toEqual({
+      granted: false,
+      reason: 'account_busy',
+      retryAfterSeconds: config.leaseTtlSeconds,
+      activeJobId: 'job-1',
+    });
     expect(kv.rawValue(accountLeaseKey(IDENTITY.id))).not.toBeUndefined();
   });
 });
@@ -670,13 +681,20 @@ describe('isBudgetedMutationStep', () => {
 
 describe('ProvisioningGateRefusedError', () => {
   test('maps account_busy to 409 and global_throttled to 429', () => {
-    const busy = new ProvisioningGateRefusedError({ granted: false, reason: 'account_busy', retryAfterSeconds: 120 });
+    const busy = new ProvisioningGateRefusedError({
+      granted: false,
+      reason: 'account_busy',
+      retryAfterSeconds: 120,
+      activeJobId: 'job-9',
+    });
     expect(busy.status).toBe(409);
     expect(busy.reason).toBe('account_busy');
     expect(busy.retryAfterSeconds).toBe(120);
+    expect(busy.activeJobId).toBe('job-9');
 
     const throttled = new ProvisioningGateRefusedError({ granted: false, reason: 'global_throttled', retryAfterSeconds: 30 });
     expect(throttled.status).toBe(429);
     expect(throttled.retryAfterSeconds).toBe(30);
+    expect(throttled.activeJobId).toBeNull();
   });
 });

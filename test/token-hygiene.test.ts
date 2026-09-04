@@ -1255,6 +1255,53 @@ describe('J5 disconnect timeline journey', () => {
 });
 
 // ---------------------------------------------------------------------------
+// J6 — the progress routes: canaries planted on record fields the projection
+// must never surface (identity login, sync run URL, lock owner) stay absent
+// from both responses, and a read performs zero writes and zero sends.
+// ---------------------------------------------------------------------------
+
+describe('J6 progress route journey', () => {
+  test('page and status expose only the safe projection and write nothing', async () => {
+    const kv = new RecordingKV();
+    const queue = new RecordingQueue();
+    const journey = emptyJourney(kv, queue);
+    const env = await canaryEnv(kv, queue);
+    const job = await seedAwaitingNotionJob(kv, NOTION_JOB_ID);
+    await kv.put(provisioningJobKey(NOTION_JOB_ID), JSON.stringify({
+      ...job,
+      identity: { ...job.identity, login: NOTION_USER_TOKEN },
+      lock: { owner: MALFORMED_JUNK, acquiredAt: 1, expiresAt: 2 },
+      data: {
+        ...job.data,
+        notionSecretsWrittenAt: 3,
+        sync: { runId: 4, htmlUrl: ONE_TIME_CODE, conclusion: null },
+      },
+    }), { expirationTtl: PROVISIONING_JOB_TTL_SECONDS });
+    kv.reset();
+
+    await withCapturedConsole(async (recorder) => {
+      const page = await route(new Request(`https://staging.example/progress?job_id=${NOTION_JOB_ID}`), env);
+      await addResponse(journey, page);
+      const status = await route(new Request(`https://staging.example/progress/status?job_id=${NOTION_JOB_ID}`), env);
+      await addResponse(journey, status);
+      assertJourneyClean(journey, recorder);
+      recorder.assertSilent();
+      return journey;
+    });
+
+    const page = journey.responses[0];
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain('<h1 id="progress-heading">Connect Notion to finish setup</h1>');
+    const status = journey.responses[1];
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({ progress: { status: 'awaiting_notion' } });
+    expect(kv.writes).toEqual([]);
+    expect(kv.deletes).toEqual([]);
+    expect(queue.sent).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Static tripwires. These hold the structural guarantees the journeys cannot
 // grep for: one console sink, and no error message built from runtime values.
 // ---------------------------------------------------------------------------
