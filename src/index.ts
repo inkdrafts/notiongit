@@ -562,6 +562,7 @@ async function verifyGithubState(
   return verifySignedPayload<SignedStatePayload>(encodedState, secret, (payload) =>
     payload.k === undefined &&
     payload.purpose !== 'status' &&
+    payload.v === 1 &&
     typeof payload.jobId === 'string' &&
     typeof payload.nonce === 'string' &&
     !payloadExpired(payload.exp, Math.floor(Date.now() / 1000)));

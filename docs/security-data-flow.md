@@ -96,7 +96,7 @@ reaches a terminal status (below); everything else is removal by TTL.
 | `provisioning:admission:callback:{provider}:{phase}:{nonce}` | Provider, phase, job id, and claim timestamps | 3600s | Single-use callback claim before provider work |
 | `provisioning:admission:burst:{digest}` | HMAC digest, window timestamps, count, and last job id | `PROVISIONING_REQUEST_BURST_WINDOW_SECONDS` | Request burst control; the raw network address never leaves the digest function |
 | `provisioning:admission:denial:{accountId}` | Account id, denial reason, and timestamps | `PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS` | Temporary hold after a suspended or provider-denied identity |
-| `provisioning:admission:audit:{jobId}:{stage}:{reason}` | Job id, optional account id or request digest, stage, decision, reason, and timestamps | `PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS` | One deduplicated operator audit per job, stage, and reason |
+| `provisioning:admission:audit:{jobId}:{stage}:{reason}` | Job id, optional account id or request digest, stage, decision, reason, and timestamps | `PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS` | One deduplicated operator audit per job, stage, and reason. `status_rerun` rows are the exception: no durable job id exists on that leg, so they key on a per-request random label and are never deduplicated |
 | `status:rerun:{accountId}` | Rerun window: `version` (1), `windowStartedAt`, `lastRerunAt`, `count` | Remaining window seconds, 24h max | Manual sync re-run on the status page; written before the dispatch so a crash overcounts. Numeric account id only |
 
 The worker sets three browser cookies in total; none of them is retained

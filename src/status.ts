@@ -21,11 +21,10 @@ import {
   type GithubInstallationAccount,
 } from './github-app-auth';
 import { userCopy, type ProvisioningFailureCode } from './failures';
-import { dispatchNotionSyncWorkflow, GithubSyncError, latestDispatchedSyncRun, type NotionSyncRunIdentity } from './notion-sync';
+import { dispatchNotionSyncWorkflow, GithubSyncError, latestDispatchedSyncRun, latestSyncRun, type NotionSyncRunIdentity } from './notion-sync';
 import {
   admitProvisioningRequest,
   admitProvisioningStage,
-  admissionFailureCode,
   consumeGlobalMutationBudget,
   provisioningAdmissionConfig,
   provisioningThrottleConfig,
@@ -64,6 +63,10 @@ export const STATUS_SESSION_TTL_SECONDS = 8 * 60 * 60;
 export const STATUS_STATE_TTL_SECONDS = 10 * 60;
 /** Meta-refresh cadence while a sync run is in flight; no-JS-safe polling. */
 export const STATUS_REFRESH_SECONDS = 30;
+/** A dispatch run still non-completed after this long is treated as stuck:
+ * the page stops auto-refreshing and a manual re-run is allowed to proceed
+ * rather than answering `already_running` forever. */
+export const STATUS_RUN_STUCK_SECONDS = 60 * 60;
 
 /**
  * Signed browser session. No secrets inside: every field is identity GitHub
@@ -214,10 +217,13 @@ export type DeployOutcome =
   | { kind: 'errored' };
 
 /** One page render's worth of GitHub truth. Parsed at the provider-reader
- * boundary; the projection never sees raw provider shapes. */
+ * boundary; the projection never sees raw provider shapes. `accountLogin` is
+ * the installation account's login as GitHub just reported it, so a rename
+ * between sign-ins renders correctly instead of failing the cross-check. */
 export type SiteDiscovery =
   | {
       ok: true;
+      accountLogin: string;
       repository: GeneratedRepositoryIdentity;
       syncRun: NotionSyncRunIdentity | null;
       build: GithubPagesBuildIdentity | null;
@@ -246,7 +252,7 @@ export type StatusView =
   | { kind: 'installation_gone'; viewer: { login: string } }
   | { kind: 'installation_suspended'; viewer: { login: string } }
   | { kind: 'github_unavailable'; retryAfterSeconds: number | null }
-  | { kind: 'auth_failed'; reason: 'denied' | 'state_invalid' };
+  | { kind: 'auth_failed'; reason: 'denied' | 'state_invalid' | 'no_installation' };
 
 /** The entry page (no session) joins the union so one renderer covers all. */
 export type StatusPageModel = { kind: 'entry' } | StatusView;
@@ -332,26 +338,40 @@ function siteUrl(login: string, repositoryName: string, fallback: string): strin
 
 /** The pure projection: total, env-free, the unit that makes rendering
  * provable. The `succeeded` arm has exactly one construction site — the
- * `conclusion === 'success'` comparison in `syncOutcomeOf`. */
-export function projectSiteStatus(discovery: SiteDiscovery, session: StatusSession): StatusView {
+ * `conclusion === 'success'` comparison in `syncOutcomeOf`. `nowMs` ages the
+ * in-flight run: past `STATUS_RUN_STUCK_SECONDS` the meta-refresh hint is
+ * dropped so an open tab stops polling, while the panel keeps saying the run
+ * is in flight — only GitHub can prove otherwise. */
+export function projectSiteStatus(discovery: SiteDiscovery, session: StatusSession, nowMs: number): StatusView {
+  const viewerLogin = discovery.ok ? discovery.accountLogin : session.login;
   if (!discovery.ok) {
     if (discovery.reason === 'unavailable') {
       return { kind: 'github_unavailable', retryAfterSeconds: discovery.retryAfterSeconds };
     }
-    return { kind: discovery.reason, viewer: { login: session.login } };
+    return { kind: discovery.reason, viewer: { login: viewerLogin } };
   }
   const syncRunning = discovery.syncRun !== null && discovery.syncRun.status !== 'completed';
+  const runStuck = discovery.syncRun !== null && syncRunning && !runIsFreshlyInFlight(discovery.syncRun, nowMs);
   return {
     kind: 'session',
-    viewer: { login: session.login },
+    viewer: { login: viewerLogin },
     site: {
       repository: { name: discovery.repository.name, url: discovery.repository.htmlUrl },
-      site: { url: siteUrl(session.login, discovery.repository.name, discovery.repository.htmlUrl) },
+      site: { url: siteUrl(viewerLogin, discovery.repository.name, discovery.repository.htmlUrl) },
       sync: discovery.syncRun === null ? { kind: 'never_ran' } : syncOutcomeOf(discovery.syncRun),
       deploy: deployOutcomeOf(discovery.build),
-      refreshAfterSeconds: syncRunning ? STATUS_REFRESH_SECONDS : null,
+      refreshAfterSeconds: syncRunning && !runStuck ? STATUS_REFRESH_SECONDS : null,
     },
   };
+}
+
+/** True when a run of the sync workflow is in flight and young enough that
+ * waiting is still the right answer; the rerun convergence check and the
+ * projection's refresh hint share this definition of "in flight". */
+export function runIsFreshlyInFlight(run: NotionSyncRunIdentity, nowMs: number): boolean {
+  if (run.status === 'completed') return false;
+  const startedAgoMs = run.createdAtMs !== null ? nowMs - run.createdAtMs : 0;
+  return startedAgoMs <= STATUS_RUN_STUCK_SECONDS * 1000;
 }
 
 function discoveryFailure(error: unknown): SiteDiscovery {
@@ -365,7 +385,10 @@ function discoveryFailure(error: unknown): SiteDiscovery {
 /**
  * The one place GitHub reads happen, shared by render and rerun, in
  * fail-fast order. A stale cookie cannot ride a transferred or reinstalled
- * installation: the installation's account must still match the session. A
+ * installation: the installation's account id must still be the session's.
+ * The login is not re-checked — the id is the identity GitHub proved, and a
+ * rename between sign-ins would otherwise deny a real owner for the life of
+ * the session; the fresh login rides back to the projection instead. A
  * failed read is distinct from a successful read with zero rows — only the
  * latter yields `no_site` / `never_ran` / `never_built`, so a GitHub
  * brownout never renders as "you have no site".
@@ -385,14 +408,10 @@ export async function discoverSite(
     return { ok: false, reason: 'installation_suspended', retryAfterSeconds: null };
   }
   const account = installation.account;
-  if (
-    !account ||
-    account.id !== session.accountId ||
-    typeof account.login !== 'string' ||
-    account.login.toLowerCase() !== session.login.toLowerCase()
-  ) {
+  if (!account || account.id !== session.accountId) {
     return { ok: false, reason: 'installation_gone', retryAfterSeconds: null };
   }
+  const accountLogin = typeof account.login === 'string' && account.login ? account.login : session.login;
 
   let installationToken: Secret<'github-installation'>;
   try {
@@ -424,7 +443,7 @@ export async function discoverSite(
   } catch (error) {
     return discoveryFailure(error);
   }
-  return { ok: true, repository, syncRun, build };
+  return { ok: true, accountLogin, repository, syncRun, build };
 }
 
 /**
@@ -469,10 +488,11 @@ function validRerunWindow(value: unknown): value is StatusRerunWindow {
 /**
  * Consume one slot in the account's rerun window, written BEFORE the caller
  * dispatches so a crash in between overcounts — the conservative direction,
- * the same budget pattern the provisioning throttle uses. The fixed window
- * admits `STATUS_RERUN_DAILY_LIMIT` reruns over `STATUS_RERUN_WINDOW_SECONDS`,
- * and two reruns must sit at least `STATUS_RERUN_SPACING_SECONDS` apart. A
- * corrupted or unreadable record fails closed: a missed manual re-run only
+ * the same budget pattern the provisioning throttle uses. Within a window,
+ * two reruns must sit at least `STATUS_RERUN_SPACING_SECONDS` apart and the
+ * window admits at most `STATUS_RERUN_DAILY_LIMIT` of them; rolling to a
+ * fresh window resets both (the cap, not the spacing, is the abuse bound).
+ * A corrupted or unreadable record fails closed: a missed manual re-run only
  * delays a sync, while admitting on one could defeat the cap.
  */
 export async function admitStatusRerun(
@@ -591,22 +611,26 @@ export async function statusHome(request: Request, env: Partial<StatusEnv>): Pro
     return configMissingResponse();
   }
   const url = new URL(request.url);
+  // `?connect=1` is handled before the session read, not only for
+  // sessionless visitors: re-running the authorize leg with a live session is
+  // the "sign in as a different account" path that the no-site page's
+  // remediation copy points at.
+  if (url.searchParams.get('connect') === '1') {
+    const payload = statusStatePayload(Math.floor(Date.now() / 1000));
+    const authorizeUrl = new URL('https://github.com/login/oauth/authorize');
+    authorizeUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
+    authorizeUrl.searchParams.set('redirect_uri', new URL('/auth/github/callback', request.url).toString());
+    authorizeUrl.searchParams.set('state', await signStatusState(payload, GITHUB_CLIENT_SECRET));
+    return redirectResponse(302, authorizeUrl.toString(), [stateCookie(payload.nonce)]);
+  }
+
   const session = await readStatusSession(request, GITHUB_CLIENT_SECRET);
   if (!session) {
-    const chrome: StatusPageChrome = { notice: noticeOf(url), rerunFormToken: null };
-    if (url.searchParams.get('connect') === '1') {
-      const payload = statusStatePayload(Math.floor(Date.now() / 1000));
-      const authorizeUrl = new URL('https://github.com/login/oauth/authorize');
-      authorizeUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
-      authorizeUrl.searchParams.set('redirect_uri', new URL('/auth/github/callback', request.url).toString());
-      authorizeUrl.searchParams.set('state', await signStatusState(payload, GITHUB_CLIENT_SECRET));
-      return redirectResponse(302, authorizeUrl.toString(), [stateCookie(payload.nonce)]);
-    }
-    return statusHtml(statusPage({ kind: 'entry' }, chrome));
+    return statusHtml(statusPage({ kind: 'entry' }, { notice: noticeOf(url), rerunFormToken: null }));
   }
 
   const discovery = await discoverSite({ GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY }, session);
-  const view = projectSiteStatus(discovery, session);
+  const view = projectSiteStatus(discovery, session, Date.now());
   return statusHtml(statusPage(view, {
     notice: noticeOf(url),
     rerunFormToken: await signRerunToken(session, GITHUB_CLIENT_SECRET),
@@ -628,7 +652,7 @@ export async function statusCallback(request: Request, env: Partial<StatusEnv>):
   if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET || !GITHUB_APP_ID) {
     return configMissingResponse();
   }
-  const authFailed = (reason: 'denied' | 'state_invalid' = 'state_invalid'): Response =>
+  const authFailed = (reason: 'denied' | 'state_invalid' | 'no_installation' = 'state_invalid'): Response =>
     statusHtml(statusPage({ kind: 'auth_failed', reason }, { notice: null, rerunFormToken: null }), 400, [CLEAR_STATE_COOKIE]);
   const githubUnavailable = (): Response =>
     statusHtml(
@@ -656,7 +680,10 @@ export async function statusCallback(request: Request, env: Partial<StatusEnv>):
     // The token is scoped to this request. It is never logged, returned, or
     // passed to KV; it leaves the Secret only at these provider-call unwraps.
     const authenticatedUser = await getAuthenticatedGithubUser(userToken.bearer());
-    const installationId = await findUserInstallation(userToken.bearer(), GITHUB_APP_ID);
+    // Prefer the installation the authenticated user owns: the listing also
+    // contains organization installations, in unspecified order, and the
+    // session must bind to the account GitHub just proved.
+    const installationId = await findUserInstallation(userToken.bearer(), GITHUB_APP_ID, authenticatedUser.id);
     const session: StatusSession = {
       v: 1,
       accountId: authenticatedUser.id,
@@ -672,6 +699,7 @@ export async function statusCallback(request: Request, env: Partial<StatusEnv>):
     // GitHub auth failures are a failed sign-in; a rate limit or outage is
     // GitHub being unreachable. No provider detail reaches either page.
     if (!(error instanceof GithubApiError) || error.status === 429 || error.status >= 500) return githubUnavailable();
+    if (error.status === 404) return authFailed('no_installation');
     return authFailed();
   }
 }
@@ -679,9 +707,12 @@ export async function statusCallback(request: Request, env: Partial<StatusEnv>):
 /**
  * `POST /status/rerun`. Gate order: origin, session, form token, IP burst,
  * admission stage, discovery (failure arms render as pages, since there is
- * then nothing to re-run), live-run convergence, per-account window, global
- * budget, dispatch. The window slot is consumed before the dispatch, so a
- * crash overcounts conservatively.
+ * then nothing to re-run), live-run convergence (a stuck run does not gate —
+ * waiting forever is worse than a rare double dispatch), global budget, then
+ * the per-account window immediately before the dispatch. The window slot is
+ * consumed before the dispatch so a crash overcounts conservatively, and
+ * after the budget check so an infrastructure refusal never spends one of
+ * the account's own daily slots.
  */
 export async function statusRerun(request: Request, env: Partial<StatusEnv>): Promise<Response> {
   const url = new URL(request.url);
@@ -719,7 +750,7 @@ export async function statusRerun(request: Request, env: Partial<StatusEnv>): Pr
     hmacSecret: GITHUB_CLIENT_SECRET,
   }, Date.now(), 'status_rerun');
   if (burst.action !== 'allow') {
-    return refusedResponse(admissionFailureCode(burst.reason), burst.action === 'pause' ? 503 : 429, burst.retryAfterSeconds);
+    return statusThrottleRefusal(burst.reason, burst.retryAfterSeconds);
   }
   const stage = await admitProvisioningStage(env as StatusEnv, admissionConfig, {
     stage: 'status_rerun',
@@ -727,38 +758,63 @@ export async function statusRerun(request: Request, env: Partial<StatusEnv>): Pr
     accountId: session.accountId,
   }, Date.now());
   if (stage.action !== 'allow') {
-    return refusedResponse(admissionFailureCode(stage.reason), 503, stage.retryAfterSeconds);
+    return statusThrottleRefusal(stage.reason, stage.retryAfterSeconds);
   }
 
   const discovery = await discoverSite({ GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY }, session);
   if (!discovery.ok) {
-    return statusHtml(statusPage(projectSiteStatus(discovery, session), { notice: null, rerunFormToken: null }));
+    return statusHtml(statusPage(projectSiteStatus(discovery, session, Date.now()), { notice: null, rerunFormToken: null }));
   }
   const repository = discovery.repository;
 
-  // The idempotence check: GitHub says whether a run is live, so a double
-  // POST converges on the same redirect instead of a second dispatch.
-  if (discovery.syncRun !== null && discovery.syncRun.status !== 'completed') {
+  // The convergence check: a live dispatch run means this click would only
+  // duplicate it. The read is unfiltered so a scheduled run mid-flight also
+  // converges, and a run stuck non-completed past STATUS_RUN_STUCK_SECONDS
+  // stops gating — the owner can force a fresh dispatch.
+  if (discovery.syncRun !== null && runIsFreshlyInFlight(discovery.syncRun, Date.now())) {
     return redirectResponse(303, new URL('/status?notice=already_running', request.url).toString());
+  }
+  try {
+    const installationToken = await createGithubInstallationToken({ GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY }, session.installationId);
+    const anyLiveRun = await latestSyncRun(installationToken.raw, repository.fullName);
+    if (anyLiveRun !== null && runIsFreshlyInFlight(anyLiveRun, Date.now())) {
+      return redirectResponse(303, new URL('/status?notice=already_running', request.url).toString());
+    }
+  } catch {
+    // The convergence read is best-effort; the dispatch path below classifies
+    // its own failures.
+  }
+
+  const budget = await consumeGlobalMutationBudget(JOBS, provisioningThrottleConfig(env), Date.now(), Math.random);
+  if (!budget.admitted) {
+    return refusedResponse('github_rate_limited', 429, budget.delaySeconds);
   }
 
   const rerunWindow = await admitStatusRerun(JOBS, session.accountId, Date.now());
   if (!rerunWindow.admitted) {
     // Status-specific copy: this window is the status page's own quota, not a
     // provider or provisioning limit, so the registry copy would misname it.
-    const copy = rerunWindow.reason === 'spacing'
-      ? { title: 'That was quick', body: 'You just started a sync. Give it a few minutes before starting another.' }
-      : { title: 'That is all the syncs for today', body: 'This site has used its manual syncs for today. The scheduled sync still runs as usual.' };
+    const copy = {
+      spacing: {
+        title: 'That was quick',
+        body: 'You just started a sync. Give it a few minutes before starting another.',
+      },
+      daily_cap: {
+        title: 'That is all the syncs for today',
+        body: 'This site has used its manual syncs for today. The scheduled sync still runs as usual.',
+      },
+      unavailable: {
+        title: 'We could not check your sync limit',
+        body: 'InkDrafts could not read this site\u2019s manual-sync quota just now, so it held off rather than risk exceeding it. Try again in a few minutes; the scheduled sync is unaffected.',
+      },
+    } as const;
+    const refusal = copy[rerunWindow.reason];
     return statusHtml(
-      statusRefusalPage({ ...copy, retryAfterSeconds: rerunWindow.retryAfterSeconds }),
-      429,
+      statusRefusalPage({ ...refusal, retryAfterSeconds: rerunWindow.retryAfterSeconds }),
+      rerunWindow.reason === 'unavailable' ? 503 : 429,
       [],
       rerunWindow.retryAfterSeconds,
     );
-  }
-  const budget = await consumeGlobalMutationBudget(JOBS, provisioningThrottleConfig(env), Date.now(), Math.random);
-  if (!budget.admitted) {
-    return refusedResponse('github_rate_limited', 429, budget.delaySeconds);
   }
 
   try {
@@ -775,4 +831,21 @@ export async function statusRerun(request: Request, env: Partial<StatusEnv>): Pr
   }
 
   return redirectResponse(303, new URL('/status?notice=sync_triggered', request.url).toString());
+}
+
+/** Throttle refusals on this surface are about syncing, not about setup, so
+ * they carry status-local copy and the canonical status: operator pause or
+ * kill is 503 (do not retry into an emergency stop), a burst or budget hit is
+ * 429. `reason` is the throttle's reason union, not a failure-code. */
+function statusThrottleRefusal(reason: string, retryAfterSeconds: number | null): Response {
+  const paused = reason !== 'request_burst';
+  const copy = paused
+    ? { title: 'Manual syncing is paused', body: 'InkDrafts has paused manual syncs right now. The scheduled sync is unaffected; try again later.' }
+    : { title: 'Too many requests', body: 'A burst of requests just came through, so this one was held back. Wait a moment and try again.' };
+  return statusHtml(
+    statusRefusalPage({ ...copy, retryAfterSeconds }),
+    paused ? 503 : 429,
+    [],
+    retryAfterSeconds,
+  );
 }

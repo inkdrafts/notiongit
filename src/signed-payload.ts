@@ -44,10 +44,11 @@ export async function signSignedPayload(payload: unknown, secret: string): Promi
 }
 
 /**
- * Verify the signature in constant time, parse the payload, and apply the
- * caller's acceptance rule. Null for a malformed encoding, a bad signature,
- * an unreadable payload, or a payload the rule rejects. The payload type is
- * the caller's declaration, backed by the rule it passed in.
+ * Verify the signature with WebCrypto's constant-time comparison, parse the
+ * payload, and apply the caller's acceptance rule. Null for a malformed
+ * encoding, a bad signature, an unreadable payload, or a payload the rule
+ * rejects. The payload type is the caller's declaration, backed by the rule
+ * it passed in.
  */
 export async function verifySignedPayload<P>(
   encoded: string,
@@ -58,13 +59,6 @@ export async function verifySignedPayload<P>(
   if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
 
   try {
-    const expectedSignature = await hmacSign(parts[0], secret);
-    const expected = textEncoder.encode(expectedSignature);
-    const actual = textEncoder.encode(parts[1]);
-    if (expected.length !== actual.length) return null;
-
-    // The equal-length check keeps a non-constant-time string comparison out
-    // of the path; WebCrypto performs the real comparison.
     const key = await crypto.subtle.importKey(
       'raw',
       textEncoder.encode(secret),

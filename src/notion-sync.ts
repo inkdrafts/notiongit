@@ -172,6 +172,25 @@ export async function latestDispatchedSyncRun(
   return run ? runIdentity(run) : null;
 }
 
+/**
+ * The same read without the trigger filter, so a manual re-run can see a
+ * scheduled run of the sync workflow that is still in flight. Null and the
+ * throwing behavior match `latestDispatchedSyncRun`.
+ */
+export async function latestSyncRun(
+  installationToken: string,
+  repositoryFullName: string,
+  fetcher: typeof fetch = fetch,
+): Promise<NotionSyncRunIdentity | null> {
+  const response = await fetcher(`${GITHUB_API}${runsPath(repositoryFullName)}/runs?per_page=1`, {
+    headers: githubHeaders(installationToken),
+  });
+  if (!response.ok) throw new GithubSyncError('github_sync_unavailable', 502);
+  const body = await readJson<{ workflow_runs?: WorkflowRunResponse[] }>(response);
+  const run = (body?.workflow_runs ?? []).find(isUsableRunShape);
+  return run ? runIdentity(run) : null;
+}
+
 /** Trigger the template's documented sync workflow with safe default bulk-delete behavior. */
 export async function dispatchNotionSyncWorkflow(
   installationToken: string,

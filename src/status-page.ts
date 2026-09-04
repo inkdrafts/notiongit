@@ -152,39 +152,43 @@ const NOTICES: { [N in NonNullable<StatusPageChrome['notice']>]: string } = {
 };
 
 /** The three revocations, each with its true effect: stopping syncs, ending
- * management access, and disabling status sign-in are independent, and none
- * of them takes the repository or the published site away. */
+ * management access, and gating future sign-ins are independent, and none of
+ * them takes the repository or the published site away. */
 const DISCONNECT_HTML = `
 <section class="card">
 <h2>Leaving InkDrafts</h2>
 <ul class="revocations">
 <li>To stop future syncs, revoke the InkDrafts connection in Notion
 (Settings &#8594; Connections). The scheduled Action&#39;s next run then fails on
-missing credentials, and that is the only way to stop the syncing.</li>
+invalid credentials, and syncing stays stopped until you reconnect InkDrafts.
+You can also switch the sync off yourself in the repository&#39;s Actions tab.</li>
 <li>To end InkDrafts&#39; management access, uninstall the InkDrafts App on GitHub
 (Settings &#8594; Applications &#8594; Installed GitHub Apps). This page will show the
 access as gone, and the site itself keeps working: scheduled syncs run in your
 own repository, not through InkDrafts.</li>
-<li>To disable status sign-in only, revoke the InkDrafts OAuth authorization on
-GitHub (Settings &#8594; Applications &#8594; Authorized OAuth Apps).</li>
+<li>To require approval again before signing in, revoke the InkDrafts OAuth
+authorization on GitHub (Settings &#8594; Applications &#8594; Authorized OAuth Apps).
+A status page signed in during the last 8 hours keeps working until its
+session expires.</li>
 </ul>
 <p class="muted">In every case your repository and your published site stay yours.</p>
 </section>`;
 
 function syncHtml(sync: SyncOutcome): string {
-  if (sync.kind === 'never_ran') return '<p>Your site has not synced yet.</p>';
+  if (sync.kind === 'never_ran') return '<p>No hand-triggered sync has run yet. Your site also syncs on its schedule.</p>';
   const runLink = sync.runUrl === null ? '' : ` <a href="${escapeHtml(sync.runUrl)}">View the run on GitHub</a>.`;
   const when = (ms: number | null) => (ms === null ? '' : ` ${utcText(ms)}`);
-  // No summary payload is obtainable after a run today, so the page derives
-  // the result from the workflow run conclusion and says so.
-  const fallback = '<p class="muted">Derived from the workflow run result; per-file counts are on GitHub.</p>';
+  // This panel reads the workflow the Sync-now button starts. Scheduled runs
+  // are not visible here; the fallback line says what the result is derived
+  // from and where the rest of the history lives.
+  const fallback = '<p class="muted">Derived from the workflow run result; per-file counts and scheduled runs are on GitHub.</p>';
   switch (sync.kind) {
     case 'running':
       return `<p class="ok">A sync is running right now.${when(sync.startedAtMs)}</p>${runLink}${fallback}`;
     case 'succeeded':
-      return `<p class="ok">Last sync succeeded.${when(sync.finishedAtMs)}</p>${runLink}${fallback}`;
+      return `<p class="ok">Last hand-triggered sync succeeded.${when(sync.finishedAtMs)}</p>${runLink}${fallback}`;
     case 'failed':
-      return `<p class="danger">Last sync did not succeed (reported as &ldquo;${escapeHtml(sync.conclusion)}&rdquo;).${when(sync.finishedAtMs)}</p>${runLink}${fallback}`;
+      return `<p class="danger">Last hand-triggered sync did not succeed (reported as &ldquo;${escapeHtml(sync.conclusion)}&rdquo;).${when(sync.finishedAtMs)}</p>${runLink}${fallback}`;
     default: {
       const never: never = sync;
       return never;
@@ -201,7 +205,7 @@ function deployHtml(deploy: DeployOutcome): string {
     case 'built':
       return '<p class="ok">Your site was published.</p>';
     case 'errored':
-      return '<p class="danger">The last publish failed. The next successful sync republishes the site.</p>';
+      return '<p class="danger">The last publish failed. Publishing runs again after the next sync that changes your content.</p>';
   }
 }
 
@@ -253,7 +257,8 @@ expected a site here, check that you signed in with the same GitHub account
 that set it up.</p>
 <p>If the repository was deleted, or its description was edited, InkDrafts can
 no longer recognize it. Set a site up again from the <a href="/">InkDrafts
-homepage</a>.</p>
+homepage</a>, or <a href="${CONNECT_URL}">sign in with a different GitHub
+account</a>.</p>
 ${DISCONNECT_HTML}`;
 
     case 'installation_gone':
@@ -287,8 +292,10 @@ wrong with your site as far as anyone can tell from here.</p>
       return `
 <p>${model.reason === 'denied'
         ? 'The GitHub sign-in was cancelled, so your site status could not be shown.'
-        : 'The sign-in link was invalid, expired, or already used, so your site status could not be shown.'}</p>
-<a class="cta" href="${CONNECT_URL}">Sign in again</a>`;
+        : model.reason === 'no_installation'
+          ? 'You signed in, but the InkDrafts GitHub App is not installed on your personal GitHub account, so there is no site to show. Set a site up from the <a href="/">InkDrafts homepage</a> first.'
+          : 'The sign-in link was invalid, expired, or already used, so your site status could not be shown.'}</p>
+${model.reason === 'no_installation' ? '' : `<a class="cta" href="${CONNECT_URL}">Sign in again</a>`}`;
 
     default: {
       const never: never = model;

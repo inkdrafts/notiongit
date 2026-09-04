@@ -33,7 +33,7 @@ interface GithubUserResponse {
 }
 
 interface GithubInstallationsResponse {
-  installations?: Array<{ id?: number; app_id?: number; app_slug?: string }>;
+  installations?: Array<{ id?: number; app_id?: number; app_slug?: string; account?: { id?: number } }>;
 }
 
 interface GithubAccessTokenResponse {
@@ -108,7 +108,11 @@ export async function exchangeGithubCode(
     body,
   });
   const token = await readJson<GithubAccessTokenResponse>(response);
-  if (!response.ok || !token?.access_token || token.error) throw new GithubApiError(response.status || 502);
+  // GitHub reports a rejected code (bad_verification_code et al.) with HTTP
+  // 200 and an error body; that is a denial, not an outage, so it must not
+  // inherit the transport status.
+  if (!response.ok) throw new GithubApiError(response.status);
+  if (!token?.access_token || token.error) throw new GithubApiError(401);
   return Secret.githubUserAccess(token.access_token);
 }
 
@@ -132,16 +136,31 @@ export async function getUserInstallation(
   });
 }
 
+/**
+ * The id of the user's installation of the App. `/user/installations` also
+ * lists organization installations the account can access, in unspecified
+ * order, so `preferredAccountId` selects the installation owned by the
+ * authenticated user when one exists; callers that prove the account first
+ * should always pass it. 404 means no usable installation of this App.
+ */
 export async function findUserInstallation(
   authorization: string,
   appId: string,
+  preferredAccountId?: number,
 ): Promise<number> {
   const response = await githubRequest<GithubInstallationsResponse>('/user/installations', {
     headers: githubHeaders(authorization),
   });
-  const installation = response.installations?.find(
+  const matches = (response.installations ?? []).filter(
     (candidate) => Number(candidate.app_id) === Number(appId) && Number.isSafeInteger(candidate.id) && candidate.id! > 0,
   );
+  const own = matches.find(
+    (candidate) =>
+      preferredAccountId !== undefined &&
+      Number.isSafeInteger(candidate.account?.id) &&
+      candidate.account!.id === preferredAccountId,
+  );
+  const installation = own ?? matches[0];
   if (!installation?.id) throw new GithubApiError(404);
   return installation.id;
 }

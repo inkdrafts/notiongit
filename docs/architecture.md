@@ -388,13 +388,14 @@ After provisioning, `GET /status` is the owner's surface for the last sync and
 publish result, a manual re-run, and disconnect guidance. It is built on a
 derived-state model: the worker keeps no durable account-to-site binding, so
 every render re-derives the site from GitHub — the installation is re-read
-with the App JWT and cross-checked against the session, an installation token
-is minted on the spot, the installation's repositories are matched against the
-InkDrafts marker (`findReusableGeneratedRepository`), and the workflow's
-latest `workflow_dispatch` run and latest Pages build are read once each (one
-to five listing pages cap the render). Uninstall, repository rename, and
-marker edits therefore self-heal on the next visit instead of needing
-reconciliation.
+with the App JWT and cross-checked against the session by account id, an
+installation token is minted on the spot, the installation's repositories are
+matched against the InkDrafts marker (`findReusableGeneratedRepository`), and
+the workflow's latest `workflow_dispatch` run and latest Pages build are read
+once each (a listing that does not fit the five-page cap refuses as
+unavailable rather than rendering a partial list as "no site"). Uninstall,
+repository rename, and marker edits therefore self-heal on the next visit
+instead of needing reconciliation.
 
 Ownership is re-proved rather than stored: the provisioning job record
 expires on a rolling 24-hour TTL and has no user-to-job index, so it could not
@@ -410,9 +411,12 @@ read is distinguished from a successful read with zero rows.
 
 `POST /status/rerun` gates in order on Origin, session, a signed form token,
 the shared IP-burst window (`status_rerun` admission stage), discovery, a
-live-run convergence check, a per-account fixed window (`status:rerun:`,
-300s spacing, 10 per 24h, written before the dispatch so a crash
-overcounts), and the global mutation budget, then dispatches the same
+live-run convergence check (unfiltered by trigger, so a scheduled run
+mid-flight also converges; a run stuck non-completed past an hour stops
+gating), the global mutation budget, and a per-account fixed window
+(`status:rerun:`, 300s spacing, 10 per 24h, written before the dispatch so a
+crash overcounts, and after the budget so an infrastructure refusal never
+spends one of the account's slots), then dispatches the same
 `sync-notion.yml` workflow with `allow_bulk_delete: 'false'` hardcoded in
 `dispatchNotionSyncWorkflow`. Sync results render from the run conclusion
 (`success` is the only conclusion that can render as success) and say so on

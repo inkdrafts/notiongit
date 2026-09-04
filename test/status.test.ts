@@ -104,6 +104,7 @@ const REPOSITORY: GeneratedRepositoryIdentity = {
 
 const CREATED_AT = '2026-09-01T10:00:00Z';
 const UPDATED_AT = '2026-09-01T10:05:00Z';
+const NOW = Date.parse(CREATED_AT) + 60_000;
 
 function syncRun(overrides: Partial<NotionSyncRunIdentity> = {}): NotionSyncRunIdentity {
   return {
@@ -127,6 +128,7 @@ function okDiscovery(overrides: {
 } = {}): SiteDiscovery {
   return {
     ok: true,
+    accountLogin: 'alice',
     repository: overrides.repository ?? REPOSITORY,
     syncRun: overrides.syncRun === undefined ? syncRun() : overrides.syncRun,
     build: overrides.build === undefined ? BUILD_BUILT : overrides.build,
@@ -225,7 +227,7 @@ describe('admitStatusRerun', () => {
 
 describe('projectSiteStatus', () => {
   test('a discovered site renders the session arm with the conclusion-derived result', () => {
-    const view = projectSiteStatus(okDiscovery(), SESSION);
+    const view = projectSiteStatus(okDiscovery(), SESSION, NOW);
     expect(view).toEqual({
       kind: 'session',
       viewer: { login: 'alice' },
@@ -248,12 +250,13 @@ describe('projectSiteStatus', () => {
     const view = projectSiteStatus(
       okDiscovery({ repository: { ...REPOSITORY, name: 'alice-inkdrafts', fullName: 'alice/alice-inkdrafts' } }),
       SESSION,
+      NOW,
     );
     expect(view).toMatchObject({ kind: 'session', site: { site: { url: 'https://alice.github.io/alice-inkdrafts' } } });
   });
 
   test('a run still in flight is running and turns on the meta-refresh hint', () => {
-    const view = projectSiteStatus(okDiscovery({ syncRun: syncRun({ status: 'in_progress', conclusion: null }) }), SESSION);
+    const view = projectSiteStatus(okDiscovery({ syncRun: syncRun({ status: 'in_progress', conclusion: null }) }), SESSION, NOW);
     expect(view).toMatchObject({
       kind: 'session',
       site: {
@@ -284,7 +287,7 @@ describe('projectSiteStatus', () => {
   });
 
   test('absence after a successful read renders never_ran and never_built', () => {
-    const view = projectSiteStatus(okDiscovery({ syncRun: null, build: null }), SESSION);
+    const view = projectSiteStatus(okDiscovery({ syncRun: null, build: null }), SESSION, NOW);
     expect(view).toMatchObject({
       kind: 'session',
       site: { sync: { kind: 'never_ran' }, deploy: { kind: 'never_built' }, refreshAfterSeconds: null },
@@ -292,20 +295,20 @@ describe('projectSiteStatus', () => {
   });
 
   test('a building or errored latest build renders its own deploy arm', () => {
-    expect(projectSiteStatus(okDiscovery({ build: { buildId: 4, status: 'building', commitSha: 'new-sha' } }), SESSION))
+    expect(projectSiteStatus(okDiscovery({ build: { buildId: 4, status: 'building', commitSha: 'new-sha' } }), SESSION, NOW))
       .toMatchObject({ kind: 'session', site: { deploy: { kind: 'building' } } });
-    expect(projectSiteStatus(okDiscovery({ build: { buildId: 4, status: 'errored', commitSha: 'new-sha' } }), SESSION))
+    expect(projectSiteStatus(okDiscovery({ build: { buildId: 4, status: 'errored', commitSha: 'new-sha' } }), SESSION, NOW))
       .toMatchObject({ kind: 'session', site: { deploy: { kind: 'errored' } } });
   });
 
   test('every failed discovery maps to its named arm, unavailable keeping the retry hint', () => {
-    expect(projectSiteStatus({ ok: false, reason: 'no_site', retryAfterSeconds: null }, SESSION))
+    expect(projectSiteStatus({ ok: false, reason: 'no_site', retryAfterSeconds: null }, SESSION, NOW))
       .toEqual({ kind: 'no_site', viewer: { login: 'alice' } });
-    expect(projectSiteStatus({ ok: false, reason: 'installation_gone', retryAfterSeconds: null }, SESSION))
+    expect(projectSiteStatus({ ok: false, reason: 'installation_gone', retryAfterSeconds: null }, SESSION, NOW))
       .toEqual({ kind: 'installation_gone', viewer: { login: 'alice' } });
-    expect(projectSiteStatus({ ok: false, reason: 'installation_suspended', retryAfterSeconds: null }, SESSION))
+    expect(projectSiteStatus({ ok: false, reason: 'installation_suspended', retryAfterSeconds: null }, SESSION, NOW))
       .toEqual({ kind: 'installation_suspended', viewer: { login: 'alice' } });
-    expect(projectSiteStatus({ ok: false, reason: 'unavailable', retryAfterSeconds: 90 }, SESSION))
+    expect(projectSiteStatus({ ok: false, reason: 'unavailable', retryAfterSeconds: 90 }, SESSION, NOW))
       .toEqual({ kind: 'github_unavailable', retryAfterSeconds: 90 });
   });
 });
@@ -523,6 +526,17 @@ const COMPLETED_RUN = {
   event: 'workflow_dispatch',
 };
 
+/** An in-flight run young enough that waiting is still the right answer. */
+function inFlightRun(): Record<string, unknown> {
+  return {
+    ...COMPLETED_RUN,
+    status: 'in_progress',
+    conclusion: null,
+    created_at: new Date(Date.now() - 60_000).toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+}
+
 /** The discovery + dispatch routes of one healthy site. */
 function healthySiteHandler(request: Request): Response {
   const url = request.url;
@@ -648,7 +662,7 @@ describe('status routes', () => {
   test('a session cannot ride a foreign installation: discovery re-proofs the account', async () => {
     const kv = new MemoryKV();
     const env = await statusEnvWithAppKey(kv);
-    const forged: StatusSession = { ...VIEWER, login: 'bob' };
+    const forged: StatusSession = { ...VIEWER, accountId: 999 };
     const cookie = `${STATUS_SESSION_COOKIE}=${encodeURIComponent(await signStatusSession(forged, 'client-secret'))}`;
 
     await withScriptedFetch((request) => {
@@ -668,6 +682,65 @@ describe('status routes', () => {
       expect(response.status).toBe(200);
       expect(await response.text()).toContain('InkDrafts no longer has access');
       expect(requests).toHaveLength(1);
+    });
+  });
+
+  test('a login renamed after sign-in renders with the fresh account login instead of denying the owner', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const renamed: StatusSession = { ...VIEWER, login: 'bob' };
+    const cookie = `${STATUS_SESSION_COOKIE}=${encodeURIComponent(await signStatusSession(renamed, 'client-secret'))}`;
+
+    await withScriptedFetch(healthySiteHandler, async () => {
+      const response = await route(
+        new Request('https://example.com/status', { headers: { Cookie: cookie } }),
+        env,
+      );
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      expect(html).toContain('Signed in as alice');
+      expect(html).not.toContain('bob');
+    });
+  });
+
+  test('the callback prefers the installation owned by the signed-in account over an organization listing', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const payload = statusStatePayload(Math.floor(Date.now() / 1000));
+    const state = await signStatusState(payload, 'client-secret');
+
+    await withScriptedFetch((request) => {
+      if (request.method === 'POST' && request.url === 'https://github.com/login/oauth/access_token') {
+        return Response.json({ access_token: 'user-token', token_type: 'bearer' });
+      }
+      if (request.url === 'https://api.github.com/user') {
+        return Response.json({ id: 42, login: 'alice', type: 'User' });
+      }
+      if (request.url === 'https://api.github.com/user/installations') {
+        return Response.json({
+          installations: [
+            { id: 111, app_id: '4798518', account: { id: 9001 } },
+            { id: 987654, app_id: '4798518', account: { id: 42 } },
+          ],
+        });
+      }
+      throw new Error(`unexpected provider request: ${request.method} ${request.url}`);
+    }, async () => {
+      const response = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code`, {
+          headers: { Cookie: `${STATUS_STATE_COOKIE}=${payload.nonce}` },
+        }),
+        env,
+      );
+      expect(response.status).toBe(303);
+      const cookies = setCookieValues(response);
+      const session = cookies.find((cookie) => cookie.startsWith(`${STATUS_SESSION_COOKIE}=`))!;
+      const token = decodeURIComponent(session.split('=')[1].split(';')[0]);
+      const proved = await readStatusSession(
+        new Request('https://example.com/status', { headers: { Cookie: `${STATUS_SESSION_COOKIE}=${token}` } }),
+        'client-secret',
+      );
+      expect(proved).toMatchObject({ accountId: 42, installationId: 987654 });
     });
   });
 
@@ -816,7 +889,7 @@ describe('status routes', () => {
 
     await withScriptedFetch((request) => {
       if (request.url.includes('/actions/workflows/sync-notion.yml/runs')) {
-        return Response.json({ workflow_runs: [{ ...COMPLETED_RUN, status: 'in_progress', conclusion: null }] });
+        return Response.json({ workflow_runs: [inFlightRun()] });
       }
       return healthySiteHandler(request);
     }, async (requests) => {
@@ -942,6 +1015,98 @@ describe('status routes', () => {
     });
   });
 
+  test('a global-budget refusal does not spend one of the account\u2019s daily slots', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+    await kv.put('github:rate:global', JSON.stringify({
+      version: 1,
+      minuteBucket: Math.floor(Date.now() / 60_000),
+      minuteCount: 30,
+      hourBucket: Math.floor(Date.now() / 3_600_000),
+      hourCount: 240,
+    }), { expirationTtl: 7200 });
+    await withScriptedFetch(healthySiteHandler, async () => {
+      const response = await route(new Request('https://example.com/status/rerun', {
+        method: 'POST',
+        headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+        body: new URLSearchParams({ token }),
+      }), env);
+      expect(response.status).toBe(429);
+      expect(kv.value(statusRerunKey(42))).toBeUndefined();
+    });
+  });
+
+  test('an unreadable rerun window refuses with honest copy and 503 instead of a quota lie', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+    await kv.put(statusRerunKey(42), '{"version":1,"windowStartedAt":"x"}', { expirationTtl: 60 });
+    await withScriptedFetch(healthySiteHandler, async (requests) => {
+      const response = await route(new Request('https://example.com/status/rerun', {
+        method: 'POST',
+        headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+        body: new URLSearchParams({ token }),
+      }), env);
+      expect(response.status).toBe(503);
+      expect(await response.text()).toContain('could not check your sync limit');
+      expect(requests.find((request) => request.url.includes('/dispatches'))).toBeUndefined();
+    });
+  });
+
+  test('a run stuck non-completed past an hour stops gating the rerun and stops auto-refresh', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const token = await signRerunToken(VIEWER, 'client-secret');
+    const cookie = await sessionCookie();
+
+    await withScriptedFetch(healthySiteHandler, async () => {
+      const response = await route(new Request('https://example.com/status/rerun', {
+        method: 'POST',
+        headers: { Origin: 'https://example.com', Cookie: cookie },
+        body: new URLSearchParams({ token }),
+      }), env);
+      expect(response.status).toBe(303);
+      expect(response.headers.get('location')).toBe('https://example.com/status?notice=sync_triggered');
+      expect(kv.value(statusRerunKey(42))).toBeTruthy();
+    });
+
+    await withScriptedFetch((request) => {
+      if (request.url.includes('/actions/workflows/sync-notion.yml/runs')) {
+        return Response.json({ workflow_runs: [{ ...COMPLETED_RUN, status: 'in_progress', conclusion: null }] });
+      }
+      return healthySiteHandler(request);
+    }, async () => {
+      const page = await route(new Request('https://example.com/status', { headers: { Cookie: cookie } }), env);
+      const html = await page.text();
+      expect(html).toContain('A sync is running right now');
+      expect(html).not.toContain('http-equiv="refresh"');
+    });
+  });
+
+  test('provider-provided strings are escaped on their way into the page', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const cookie = await sessionCookie();
+    const hostile = '<img src=x onerror=alert(1)>';
+
+    await withScriptedFetch((request) => {
+      if (request.method === 'GET' && request.url === 'https://api.github.com/app/installations/987654') {
+        return Response.json({
+          account: { id: 42, login: hostile, type: 'User' },
+          suspended_at: null,
+          suspended_by: null,
+        });
+      }
+      return healthySiteHandler(request);
+    }, async () => {
+      const response = await route(new Request('https://example.com/status', { headers: { Cookie: cookie } }), env);
+      const html = await response.text();
+      expect(html).toContain('&lt;img src=x');
+      expect(html).not.toContain('<img src=x');
+    });
+  });
+
   test('GET /status with a session renders the derived page, leaks nothing, and refreshes only while running', async () => {
     const kv = new MemoryKV();
     const env = await statusEnvWithAppKey(kv);
@@ -962,12 +1127,13 @@ describe('status routes', () => {
       expect(html).not.toContain('http-equiv="refresh"');
       expect(html).not.toContain('987654');
       expect(html).not.toContain('installation-token');
+      expect(kv.puts).toBe(0);
       expect(requests.length).toBeGreaterThan(0);
     });
 
     await withScriptedFetch((request) => {
       if (request.url.includes('/actions/workflows/sync-notion.yml/runs')) {
-        return Response.json({ workflow_runs: [{ ...COMPLETED_RUN, status: 'in_progress', conclusion: null }] });
+        return Response.json({ workflow_runs: [inFlightRun()] });
       }
       return healthySiteHandler(request);
     }, async () => {
