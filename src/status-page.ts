@@ -53,8 +53,6 @@ function durationText(seconds: number): string {
   return `in ${seconds} seconds`;
 }
 
-// The design-token custom properties are duplicated from progress-page.ts on
-// purpose: one self-contained document per route, no shared stylesheet asset.
 const STYLES = `
   :root {
     --bg: #ffffff;
@@ -151,9 +149,6 @@ const NOTICES: { [N in NonNullable<StatusPageChrome['notice']>]: string } = {
   already_running: 'A sync is already running. This page reloads itself while it runs.',
 };
 
-/** The three revocations, each with its true effect: stopping syncs, ending
- * management access, and gating future sign-ins are independent, and none of
- * them takes the repository or the published site away. */
 const DISCONNECT_HTML = `
 <section class="card">
 <h2>Leaving InkDrafts</h2>
@@ -178,9 +173,6 @@ function syncHtml(sync: SyncOutcome): string {
   if (sync.kind === 'never_ran') return '<p>No hand-triggered sync has run yet. Your site also syncs on its schedule.</p>';
   const runLink = sync.runUrl === null ? '' : ` <a href="${escapeHtml(sync.runUrl)}">View the run on GitHub</a>.`;
   const when = (ms: number | null) => (ms === null ? '' : ` ${utcText(ms)}`);
-  // This panel reads the workflow the Sync-now button starts. Scheduled runs
-  // are not visible here; the fallback line says what the result is derived
-  // from and where the rest of the history lives.
   const fallback = '<p class="muted">Derived from the workflow run result; per-file counts and scheduled runs are on GitHub.</p>';
   switch (sync.kind) {
     case 'running':

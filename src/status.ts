@@ -8,8 +8,7 @@
  * the only retained state is the short-lived signed session cookie in the
  * browser plus the per-account rerun window. Sync and deploy results render
  * from the workflow run conclusion: the versioned run summary is emitted only
- * into in-run step outputs with no REST read-back, so `parseSafeSummary` here
- * is the tested boundary for a future summary channel, not a live path.
+ * into in-run step outputs with no REST read-back.
  */
 
 import {
@@ -90,12 +89,10 @@ const STATE_KIND = 'status-state';
 const FORM_KIND = 'status-form';
 
 /** Authorize-leg state. The `k` kind marks it so an install-state token can
- * never verify as a status payload and vice versa; `purpose` restates the leg
- * for symmetry with the install state's absent-means-install rule. */
+ * never verify as a status payload. */
 export interface StatusStatePayload {
   v: 1;
   k: typeof STATE_KIND;
-  purpose: 'status';
   nonce: string;
   exp: number;
 }
@@ -104,7 +101,6 @@ export function statusStatePayload(nowSeconds: number): StatusStatePayload {
   return {
     v: 1,
     k: STATE_KIND,
-    purpose: 'status',
     nonce: crypto.randomUUID(),
     exp: nowSeconds + STATUS_STATE_TTL_SECONDS,
   };
@@ -120,7 +116,6 @@ export function signStatusState(payload: StatusStatePayload, secret: string): Pr
 export async function isStatusCallbackState(encoded: string, secret: string): Promise<boolean> {
   return (await verifySignedPayload<StatusStatePayload>(encoded, secret, (payload) =>
     payload.k === STATE_KIND &&
-    payload.purpose === 'status' &&
     payload.v === 1 &&
     typeof payload.nonce === 'string')) !== null;
 }
@@ -132,7 +127,6 @@ export async function verifyStatusState(
 ): Promise<StatusStatePayload | null> {
   return verifySignedPayload<StatusStatePayload>(encoded, secret, (payload) =>
     payload.k === STATE_KIND &&
-    payload.purpose === 'status' &&
     payload.v === 1 &&
     typeof payload.nonce === 'string' &&
     !payloadExpired(payload.exp, nowSeconds));
@@ -197,18 +191,11 @@ function cookieValue(request: Request, name: string): string | null {
   return null;
 }
 
-/** Where a rendered sync result came from. Today the page can only derive
- * results from the workflow run conclusion; `parseSafeSummary` is the tested
- * boundary for a future summary channel, whose `no_op` result has no
- * representation in `SyncOutcome` — a conclusion alone cannot distinguish a
- * no-op from a content-bearing success, so the fallback never claims one. */
-export type SyncResultSource = 'conclusion_fallback';
-
 export type SyncOutcome =
   | { kind: 'never_ran' }
   | { kind: 'running'; startedAtMs: number | null; runUrl: string | null }
-  | { kind: 'succeeded'; source: SyncResultSource; finishedAtMs: number | null; runUrl: string | null }
-  | { kind: 'failed'; source: SyncResultSource; conclusion: string; finishedAtMs: number | null; runUrl: string | null };
+  | { kind: 'succeeded'; finishedAtMs: number | null; runUrl: string | null }
+  | { kind: 'failed'; conclusion: string; finishedAtMs: number | null; runUrl: string | null };
 
 export type DeployOutcome =
   | { kind: 'never_built' }
@@ -263,14 +250,13 @@ function epochMs(value: string): number | null {
 }
 
 /**
- * Parse-guard for the versioned run summary (notiongit-sync, schema v1).
- * Today no src caller exists: the summary is emitted only into step outputs
- * and the step summary, neither retrievable after the run, so this is the
- * documented boundary for the notiongit-sync follow-up that will publish it
- * somewhere readable. Non-JSON, non-object, or shape-violating payloads are
- * `malformed`; a documented shape carrying a different `schema_version` is
- * `unsupported_version`; within v1 an unknown `code` is accepted as-is and
- * the caller falls back on `result` alone.
+ * Parse-guard for the versioned run summary (notiongit-sync, schema v1). No
+ * src caller exists because GitHub exposes no read-back for step outputs or
+ * step summaries; the notiongit-sync summary-channel follow-up calls this
+ * once a readable channel exists. Non-JSON, non-object, or shape-violating
+ * payloads are `malformed`; a documented shape carrying a different
+ * `schema_version` is `unsupported_version`; within v1 an unknown `code` is
+ * accepted as-is and the caller falls back on `result` alone.
  */
 export type SafeSummaryResult = 'success' | 'no_op' | 'failure';
 
@@ -307,11 +293,10 @@ function syncOutcomeOf(run: NotionSyncRunIdentity): SyncOutcome {
     return { kind: 'running', startedAtMs: run.createdAtMs, runUrl };
   }
   if (run.conclusion === 'success') {
-    return { kind: 'succeeded', source: 'conclusion_fallback', finishedAtMs: run.updatedAtMs ?? run.createdAtMs, runUrl };
+    return { kind: 'succeeded', finishedAtMs: run.updatedAtMs ?? run.createdAtMs, runUrl };
   }
   return {
     kind: 'failed',
-    source: 'conclusion_fallback',
     conclusion: run.conclusion ?? 'unknown',
     finishedAtMs: run.updatedAtMs ?? run.createdAtMs,
     runUrl,
@@ -337,8 +322,7 @@ function siteUrl(login: string, repositoryName: string, fallback: string): strin
 }
 
 /** The pure projection: total, env-free, the unit that makes rendering
- * provable. The `succeeded` arm has exactly one construction site — the
- * `conclusion === 'success'` comparison in `syncOutcomeOf`. `nowMs` ages the
+ * provable. `nowMs` ages the
  * in-flight run: past `STATUS_RUN_STUCK_SECONDS` the meta-refresh hint is
  * dropped so an open tab stops polling, while the panel keeps saying the run
  * is in flight — only GitHub can prove otherwise. */
@@ -549,11 +533,6 @@ export async function admitStatusRerun(
   });
 }
 
-// ============================================================================
-// Handlers. Thin shells: session gate, discovery, projection, renderer.
-// All policy lives in the pieces above.
-// ============================================================================
-
 function statusHtml(document: string, status = 200, cookies: string[] = [], retryAfterSeconds: number | null = null): Response {
   const headers = new Headers({
     'content-type': 'text/html; charset=utf-8',
@@ -639,7 +618,7 @@ export async function statusHome(request: Request, env: Partial<StatusEnv>): Pro
 
 /**
  * The status leg of the shared GitHub OAuth callback, dispatched from
- * `finishGithubCallback` when the signed state proves purpose `status`.
+ * `finishGithubCallback` when the signed state proves its `status` kind.
  * Everything the session carries — account, login, installation — derives
  * from the identity GitHub just proved; nothing is trusted from the state
  * payload beyond its kind and nonce, so a session can never name another
@@ -677,12 +656,7 @@ export async function statusCallback(request: Request, env: Partial<StatusEnv>):
       { GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET },
       new URL('/auth/github/callback', request.url).toString(),
     );
-    // The token is scoped to this request. It is never logged, returned, or
-    // passed to KV; it leaves the Secret only at these provider-call unwraps.
     const authenticatedUser = await getAuthenticatedGithubUser(userToken.bearer());
-    // Prefer the installation the authenticated user owns: the listing also
-    // contains organization installations, in unspecified order, and the
-    // session must bind to the account GitHub just proved.
     const installationId = await findUserInstallation(userToken.bearer(), GITHUB_APP_ID, authenticatedUser.id);
     const session: StatusSession = {
       v: 1,

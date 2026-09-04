@@ -236,7 +236,6 @@ describe('projectSiteStatus', () => {
         site: { url: 'https://alice.github.io' },
         sync: {
           kind: 'succeeded',
-          source: 'conclusion_fallback',
           finishedAtMs: Date.parse(UPDATED_AT),
           runUrl: 'https://github.com/alice/alice.github.io/actions/runs/555',
         },
@@ -277,8 +276,7 @@ describe('projectSiteStatus', () => {
         site: {
           sync: {
             kind: 'failed',
-            source: 'conclusion_fallback',
-            conclusion: conclusion ?? 'unknown',
+              conclusion: conclusion ?? 'unknown',
             finishedAtMs: Date.parse(CREATED_AT),
           },
         },
@@ -385,10 +383,9 @@ describe('status signing', () => {
       .toBeNull();
   });
 
-  test('the authorize state carries its kind, purpose, and TTL', async () => {
+  test('the authorize state carries its kind and TTL', async () => {
     const payload = statusStatePayload(START_SECONDS);
     expect(payload.exp).toBe(START_SECONDS + STATUS_STATE_TTL_SECONDS);
-    expect(payload.purpose).toBe('status');
 
     const token = await signStatusState(payload, SECRET);
     expect(await verifyStatusState(token, SECRET, START_SECONDS)).toEqual(payload);
@@ -606,7 +603,7 @@ describe('status routes', () => {
 
     const nonce = decodeURIComponent(stateCookieHeader.split('=')[1].split(';')[0]);
     const payload = await verifyStatusState(location.searchParams.get('state')!, 'client-secret', Math.floor(Date.now() / 1000));
-    expect(payload).toMatchObject({ v: 1, purpose: 'status', nonce });
+    expect(payload).toMatchObject({ v: 1, nonce });
     expect(kv.puts).toBe(0);
   });
 
@@ -795,7 +792,7 @@ describe('status routes', () => {
     expect(kv.puts).toBe(0);
   });
 
-  test('the purpose dispatch routes each kind to its own finisher', async () => {
+  test('the kind dispatch routes each leg to its own finisher', async () => {
     const kv = new MemoryKV();
     const env = await statusEnvWithAppKey(kv);
 

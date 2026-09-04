@@ -412,7 +412,6 @@ export type {
   StatusStatePayload,
   StatusView,
   SyncOutcome,
-  SyncResultSource,
 } from './status';
 
 export {
@@ -550,9 +549,9 @@ export async function signGithubState(
 }
 
 /**
- * Absent `purpose` means install, so states signed before the status leg
- * shipped keep verifying across a deploy. Status-leg payloads carry their own
- * `k`/`purpose` marks and are refused here; the callback dispatches on the
+ * A payload with no `k` kind is an install state, so states signed before
+ * the status leg shipped keep verifying across a deploy. Status-leg payloads
+ * carry a `k` mark and are refused here; the callback dispatches on the
  * payload kind before this verifier runs.
  */
 async function verifyGithubState(
@@ -561,7 +560,6 @@ async function verifyGithubState(
 ): Promise<SignedStatePayload | null> {
   return verifySignedPayload<SignedStatePayload>(encodedState, secret, (payload) =>
     payload.k === undefined &&
-    payload.purpose !== 'status' &&
     payload.v === 1 &&
     typeof payload.jobId === 'string' &&
     typeof payload.nonce === 'string' &&

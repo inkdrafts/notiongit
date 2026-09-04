@@ -41,11 +41,7 @@ interface GithubAccessTokenResponse {
   error?: string;
 }
 
-interface GithubApiErrorShape {
-  status: number;
-}
-
-export class GithubApiError extends Error implements GithubApiErrorShape {
+export class GithubApiError extends Error {
   readonly status: number;
 
   constructor(status: number) {
