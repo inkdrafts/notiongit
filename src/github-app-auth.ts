@@ -4,13 +4,14 @@
  * Split out of `index.ts` so the provisioning queue consumer can mint a
  * fresh installation token for every step without an import cycle back
  * through the HTTP entrypoint. A minted token is returned to the caller for
- * immediate use and is never stored, logged, or included in an error: every
- * provisioning step — synchronous or queued — mints its own token from the
- * durable, non-secret installation id and discards it when the step
- * returns.
+ * immediate use as a self-redacting `Secret` and is never stored, logged, or
+ * included in an error: every provisioning step — synchronous or queued —
+ * mints its own token from the durable, non-secret installation id and
+ * discards it when the step returns.
  */
 
 import type { GithubFailureCode } from './failures';
+import { Secret } from './secret';
 
 export interface GithubAppAuthEnv {
   GITHUB_APP_ID: string;
@@ -142,7 +143,7 @@ export async function createGithubInstallationToken(
   env: GithubAppAuthEnv,
   installationId: number,
   fetcher: typeof fetch = fetch,
-): Promise<string> {
+): Promise<Secret<'github-installation'>> {
   if (!Number.isSafeInteger(installationId) || installationId <= 0) throw new Error('invalid installation id');
   const jwt = await createAppJwt(env);
   const response = await fetcher(`${GITHUB_API}/app/installations/${installationId}/access_tokens`, {
@@ -157,7 +158,7 @@ export async function createGithubInstallationToken(
     }
   }
   if (!response.ok || !body?.token) throw new GithubAppAuthError(response.status || 502);
-  return body.token;
+  return Secret.githubInstallation(body.token);
 }
 
 /** Read an installation with the App's own JWT — proves the installation belongs to this App. */

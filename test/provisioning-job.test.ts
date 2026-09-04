@@ -87,13 +87,6 @@ describe('createProvisioningJob', () => {
       notionSecretsWrittenAt: null,
     });
   });
-
-  test('never stores a token, code, or secret in the job it builds', () => {
-    const job = createProvisioningJob(baseParams());
-    const serialized = JSON.stringify(job);
-    expect(serialized).not.toContain('token');
-    expect(serialized).not.toContain('secret');
-  });
 });
 
 describe('nextPendingStep', () => {

@@ -30,10 +30,11 @@ import {
   type ProvisioningJobData,
   type ProvisioningStepName,
 } from './provisioning-job';
+import type { Secret } from './secret';
 
 export interface StepRunnerContext {
   jobs: KVNamespace;
-  installationToken: string;
+  installationToken: Secret<'github-installation'>;
   fetcher: typeof fetch;
   sleep: (milliseconds: number) => Promise<void>;
   now: () => number;
@@ -46,7 +47,7 @@ export type ProvisioningStepHandler = (
 
 async function runVerifyRepository(job: ProvisioningJob, ctx: StepRunnerContext): Promise<Partial<ProvisioningJobData>> {
   const usable = await awaitGeneratedRepositoryCommit(
-    `Bearer ${ctx.installationToken}`,
+    ctx.installationToken.bearer(),
     job.data.generatedRepository.fullName,
     { fetcher: ctx.fetcher, sleep: ctx.sleep },
   );
@@ -61,7 +62,7 @@ async function runVerifyRepository(job: ProvisioningJob, ctx: StepRunnerContext)
 
 async function runPatchConfig(job: ProvisioningJob, ctx: StepRunnerContext): Promise<Partial<ProvisioningJobData>> {
   await patchRepositoryConfig(
-    ctx.installationToken,
+    ctx.installationToken.raw,
     job.data.generatedRepository.fullName,
     job.data.repository,
     { fetcher: ctx.fetcher },
@@ -71,7 +72,7 @@ async function runPatchConfig(job: ProvisioningJob, ctx: StepRunnerContext): Pro
 
 async function runConfigurePages(job: ProvisioningJob, ctx: StepRunnerContext): Promise<Partial<ProvisioningJobData>> {
   const pages = await configureGithubPages(
-    ctx.installationToken,
+    ctx.installationToken.raw,
     job.data.generatedRepository.fullName,
     { fetcher: ctx.fetcher, sleep: ctx.sleep },
   );
@@ -91,7 +92,7 @@ async function runDispatchSync(job: ProvisioningJob, ctx: StepRunnerContext): Pr
     // and crashed before recording the correlated run. Resume by
     // correlating the persisted window instead of dispatching again.
     const correlated = await correlateDispatchedSyncRun(
-      ctx.installationToken,
+      ctx.installationToken.raw,
       fullName,
       new Set(marker.excludedRunIds),
       marker.dispatchedAtMs,
@@ -103,7 +104,7 @@ async function runDispatchSync(job: ProvisioningJob, ctx: StepRunnerContext): Pr
     };
   }
 
-  const excludedRunIds = await listWorkflowRunIds(ctx.installationToken, fullName, ctx.fetcher);
+  const excludedRunIds = await listWorkflowRunIds(ctx.installationToken.raw, fullName, ctx.fetcher);
   const dispatchedAtMs = ctx.now();
   // Persist the marker before dispatching. A crash after the POST succeeds
   // but before this function returns still resumes by correlating the same
@@ -122,9 +123,9 @@ async function runDispatchSync(job: ProvisioningJob, ctx: StepRunnerContext): Pr
     data: { ...job.data, syncDispatchMarker: { excludedRunIds: [...excludedRunIds], dispatchedAtMs } },
     updatedAt: ctx.now(),
   });
-  await dispatchNotionSyncWorkflow(ctx.installationToken, fullName, ctx.fetcher);
+  await dispatchNotionSyncWorkflow(ctx.installationToken.raw, fullName, ctx.fetcher);
   const correlated = await correlateDispatchedSyncRun(
-    ctx.installationToken,
+    ctx.installationToken.raw,
     fullName,
     excludedRunIds,
     dispatchedAtMs,
@@ -140,7 +141,7 @@ async function runAwaitSync(job: ProvisioningJob, ctx: StepRunnerContext): Promi
   const sync = job.data.sync;
   if (!sync) throw new Error('await_sync ran before dispatch_sync recorded a run');
   const run = await awaitNotionSyncRun(
-    ctx.installationToken,
+    ctx.installationToken.raw,
     job.data.generatedRepository.fullName,
     sync.runId,
     { fetcher: ctx.fetcher, sleep: ctx.sleep },
@@ -150,9 +151,9 @@ async function runAwaitSync(job: ProvisioningJob, ctx: StepRunnerContext): Promi
 
 async function runAwaitDeployBuild(job: ProvisioningJob, ctx: StepRunnerContext): Promise<Partial<ProvisioningJobData>> {
   const fullName = job.data.generatedRepository.fullName;
-  const commitSha = await getRepositoryMainHeadSha(ctx.installationToken, fullName, ctx.fetcher);
+  const commitSha = await getRepositoryMainHeadSha(ctx.installationToken.raw, fullName, ctx.fetcher);
   const build = await awaitPagesBuildForCommit(
-    ctx.installationToken,
+    ctx.installationToken.raw,
     fullName,
     commitSha,
     { fetcher: ctx.fetcher, sleep: ctx.sleep },

@@ -7,6 +7,7 @@ import {
   route,
   saveProvisioningJob,
   type Env,
+  type NotionOAuthContinuation,
 } from '../src/index';
 
 class MemoryKV {
@@ -133,11 +134,13 @@ describe('Notion OAuth', () => {
       template: { duplicated: true },
     });
     expect(responseBody).not.toContain('synthetic-access-token');
-    expect(continuation).toEqual({
-      jobId: 'job-123',
-      accessToken: 'synthetic-access-token',
-      duplicatedTemplateId: 'synthetic-duplicated-root-id',
-    });
+    // The continuation hands the token over as a self-redacting Secret; the
+    // value is only readable through the explicit raw unwrap.
+    const handed = continuation as NotionOAuthContinuation;
+    expect(handed.jobId).toBe('job-123');
+    expect(handed.accessToken.kind).toBe('notion-user-access');
+    expect(handed.accessToken.raw).toBe('synthetic-access-token');
+    expect(handed.duplicatedTemplateId).toBe('synthetic-duplicated-root-id');
     expect(requests).toHaveLength(1);
     expect(requests[0].url).toBe('https://api.notion.com/v1/oauth/token');
     expect(requests[0].headers.get('notion-version')).toBe('2022-06-28');

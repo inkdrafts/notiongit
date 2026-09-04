@@ -32,7 +32,7 @@ import {
   loadProvisioningJob,
   saveProvisioningJob,
 } from './provisioning-job';
-import { callbackFailure, FlowFailure } from './failures';
+import { callbackFailure, codedFailureCode, FlowFailure } from './failures';
 import {
   acquireProvisioningStart,
   consumeGlobalMutationBudget,
@@ -57,6 +57,8 @@ import {
   saveNotionTemplateResolution,
 } from './notion-template';
 import { LANDING_PAGE } from './landing-page';
+import { Secret } from './secret';
+import { reportError } from './safe-serialize';
 
 
 export {
@@ -586,7 +588,7 @@ async function exchangeGithubCode(
   code: string,
   env: Pick<Env, 'GITHUB_CLIENT_ID' | 'GITHUB_CLIENT_SECRET'>,
   redirectUri: string,
-): Promise<string> {
+): Promise<Secret<'github-user-access'>> {
   const body = new URLSearchParams({
     client_id: env.GITHUB_CLIENT_ID,
     client_secret: env.GITHUB_CLIENT_SECRET,
@@ -603,12 +605,12 @@ async function exchangeGithubCode(
   });
   const token = await readJson<GithubAccessTokenResponse>(response);
   if (!response.ok || !token?.access_token || token.error) throw new GithubApiError(response.status || 502);
-  return token.access_token;
+  return Secret.githubUserAccess(token.access_token);
 }
 
-async function getAuthenticatedGithubUser(accessToken: string): Promise<GithubIdentity> {
+async function getAuthenticatedGithubUser(authorization: string): Promise<GithubIdentity> {
   const user = await githubRequest<GithubUserResponse>('/user', {
-    headers: githubHeaders(`Bearer ${accessToken}`),
+    headers: githubHeaders(authorization),
   });
   if (!Number.isSafeInteger(user.id) || !user.login || (user.type !== 'User' && user.type !== 'Organization')) {
     throw new GithubApiError(502);
@@ -618,20 +620,20 @@ async function getAuthenticatedGithubUser(accessToken: string): Promise<GithubId
 }
 
 async function getUserInstallation(
-  accessToken: string,
+  authorization: string,
   installationId: number,
 ): Promise<GithubInstallationAccount> {
   return githubRequest<GithubInstallationAccount>(`/user/installations/${installationId}`, {
-    headers: githubHeaders(`Bearer ${accessToken}`),
+    headers: githubHeaders(authorization),
   });
 }
 
 async function findUserInstallation(
-  accessToken: string,
+  authorization: string,
   appId: string,
 ): Promise<number> {
   const response = await githubRequest<GithubInstallationsResponse>('/user/installations', {
-    headers: githubHeaders(`Bearer ${accessToken}`),
+    headers: githubHeaders(authorization),
   });
   const installation = response.installations?.find(
     (candidate) => Number(candidate.app_id) === Number(appId) && Number.isSafeInteger(candidate.id) && candidate.id! > 0,
@@ -699,7 +701,9 @@ function authError(error: unknown): Response {
   const body: Record<string, unknown> = { error: failure.code };
   if (failure.retryAfterSeconds !== null) body.retry_after_seconds = failure.retryAfterSeconds;
   // Deliberately do not expose provider response bodies, OAuth codes, tokens,
-  // private keys, or exception messages to the browser.
+  // private keys, or exception messages to the browser; the reportError
+  // serialization is redacted by construction (see `safe-serialize.ts`).
+  if (codedFailureCode(error) === null) reportError('github_callback_failed', error);
   return json(body, failure.status);
 }
 
@@ -771,10 +775,11 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
     let selectedInstallationId = installationId || record.installationId;
 
     if (code) {
-      const accessToken = await exchangeGithubCode(code, env as Pick<Env, 'GITHUB_CLIENT_ID' | 'GITHUB_CLIENT_SECRET'>, callbackUrl(request));
+      const userToken = await exchangeGithubCode(code, env as Pick<Env, 'GITHUB_CLIENT_ID' | 'GITHUB_CLIENT_SECRET'>, callbackUrl(request));
       // The token is scoped to this request. It is never logged, returned, or
-      // passed to KV. The GitHub code is likewise never persisted.
-      const authenticatedUser = await getAuthenticatedGithubUser(accessToken);
+      // passed to KV; it leaves the Secret only at these provider-call
+      // unwraps. The GitHub code is likewise never persisted.
+      const authenticatedUser = await getAuthenticatedGithubUser(userToken.bearer());
       if (authenticatedUser.accountType !== 'User') throw new FlowFailure('github_organization_installation_not_supported');
       const jobs = env.JOBS;
       const throttleConfig = provisioningThrottleConfig(env);
@@ -791,18 +796,18 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
         // this App's installation from the authenticated user's installations in
         // that case rather than trusting an unverified query parameter.
         if (!selectedInstallationId) {
-          selectedInstallationId = await findUserInstallation(accessToken, env.GITHUB_APP_ID as string);
+          selectedInstallationId = await findUserInstallation(userToken.bearer(), env.GITHUB_APP_ID as string);
         }
-        const userInstallation = await getUserInstallation(accessToken, selectedInstallationId);
+        const userInstallation = await getUserInstallation(userToken.bearer(), selectedInstallationId);
         identity = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
         // Generation happens while the short-lived OAuth token is in memory:
         // creating a repository from the template requires user-to-server
         // authentication. An earlier attempt's generated repository is reused
         // instead of duplicated. Only non-secret destination and repository
         // identity metadata is retained in the job record.
-        const ownedRepositories = await listOwnedGithubRepositories(accessToken);
+        const ownedRepositories = await listOwnedGithubRepositories(userToken.raw);
         ({ destination: repository, identity: generatedRepository } = await generateOrReuseRepository(
-          accessToken,
+          userToken.raw,
           identity.login,
           ownedRepositories,
           fetch,
@@ -909,7 +914,7 @@ export function continueNotionOnboarding(
         // authorization duplicates the template again, so the stored database
         // IDs can belong to the previous duplicate and would pair this token
         // with databases the user is no longer writing in.
-        const resolution = await resolveNotionTemplateDatabases(accessToken, duplicatedTemplateId, {
+        const resolution = await resolveNotionTemplateDatabases(accessToken.raw, duplicatedTemplateId, {
           fetcher: runtime.fetcher,
           sleep: runtime.sleep,
         });
@@ -920,11 +925,11 @@ export function continueNotionOnboarding(
           runtime.fetcher,
         );
         await writeGithubActionsSecrets(
-          installationToken,
+          installationToken.raw,
           {
             repositoryFullName: job.data.generatedRepository.fullName,
             secrets: {
-              NOTION_TOKEN: accessToken,
+              NOTION_TOKEN: accessToken.raw,
               NOTION_PAGES_DATABASE_ID: resolution.pagesDatabaseId,
               NOTION_POSTS_DATABASE_ID: resolution.postsDatabaseId,
             },
@@ -1062,12 +1067,13 @@ const worker: ExportedHandler<Env, ProvisioningMessage> = {
         const outcome = await processProvisioningMessage(jobId, env, {});
         if (outcome.outcome === 'retry') message.retry({ delaySeconds: outcome.delaySeconds });
         else message.ack();
-      } catch {
+      } catch (error) {
         // An unexpected failure means this job's KV record could not be
         // read or written. Retry it: Cloudflare's own backoff and
         // max_retries/dead-letter-queue act as the outer safety net for
         // this, rather than the application-level classification in
         // `processProvisioningMessage`.
+        reportError('provisioning_message_failed', error);
         message.retry();
       }
     }

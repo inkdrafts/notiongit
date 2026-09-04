@@ -10,7 +10,9 @@
 import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import type { GithubActionsSecretsErrorCode } from './actions-secrets';
 import type { NotionTemplateErrorCode } from './notion-template';
-import { callbackFailure } from './failures';
+import { callbackFailure, codedFailureCode } from './failures';
+import { Secret } from './secret';
+import { redactValue, reportError } from './safe-serialize';
 
 export const NOTION_AUTHORIZATION_URL = 'https://api.notion.com/v1/oauth/authorize';
 export const NOTION_TOKEN_URL = 'https://api.notion.com/v1/oauth/token';
@@ -58,7 +60,7 @@ interface NotionTokenResponse {
 /** The only data permitted to leave the callback's request-local scope. */
 export interface NotionOAuthContinuation {
   readonly jobId: string;
-  readonly accessToken: string;
+  readonly accessToken: Secret<'notion-user-access'>;
   readonly duplicatedTemplateId: string | null;
 }
 
@@ -341,7 +343,7 @@ async function exchangeNotionCode(
 
   return {
     jobId: '',
-    accessToken: token.access_token,
+    accessToken: Secret.notionUserAccess(token.access_token),
     duplicatedTemplateId: typeof token.duplicated_template_id === 'string'
       ? token.duplicated_template_id
       : null,
@@ -445,8 +447,11 @@ export async function finishNotionCallback(
       errorCode: failure.code,
     });
     const body: Record<string, unknown> = { error: failure.code };
-    // Only non-secret schema metadata the continuation attached on purpose.
-    if (failure.details) Object.assign(body, failure.details);
+    // Only non-secret schema metadata the continuation attached on purpose,
+    // redacted on the way out so a future details field cannot smuggle a
+    // credential into the browser.
+    if (failure.details) Object.assign(body, redactValue(failure.details));
+    if (codedFailureCode(error) === null) reportError('notion_callback_failed', error);
     return response(body, failure.status, clearCookieHeaders);
   }
 }

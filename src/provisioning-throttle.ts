@@ -95,7 +95,12 @@ function parsePositiveInteger(raw: string | undefined, name: string): number | u
   if (raw === undefined) return undefined;
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer`);
+    // The variable name rides as a field, not in the message: every Error
+    // message in src/ stays a constant string so platform logs stay
+    // credential-free even when serialized verbatim.
+    const failure = new Error('invalid provisioning throttle configuration value') as Error & { variable: string };
+    failure.variable = name;
+    throw failure;
   }
   return value;
 }

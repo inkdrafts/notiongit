@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { PROVISIONING_STEP_HANDLERS, type StepRunnerContext } from '../src/provisioning-steps';
 import { createProvisioningJob, type CreateProvisioningJobParams, type ProvisioningJob } from '../src/provisioning-job';
 import { GithubDeployError } from '../src/site-deployment';
+import { Secret } from '../src/secret';
 
 class MemoryKV {
   private values = new Map<string, string>();
@@ -50,7 +51,7 @@ function makeJob(overrides: Partial<CreateProvisioningJobParams> = {}, dataOverr
 function makeContext(fetcher: typeof fetch, overrides: Partial<StepRunnerContext> = {}): StepRunnerContext {
   return {
     jobs: new MemoryKV() as unknown as KVNamespace,
-    installationToken: 'installation-token',
+    installationToken: Secret.githubInstallation('installation-token'),
     fetcher,
     sleep: async () => {},
     now: () => 9_000,

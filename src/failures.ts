@@ -998,7 +998,7 @@ export interface ProvisioningErrorClassification {
   retryAfterSeconds: number | null;
 }
 
-function codedFailureCode(error: unknown): ProvisioningFailureCode | null {
+export function codedFailureCode(error: unknown): ProvisioningFailureCode | null {
   const candidate = error instanceof Error ? (error as { code?: unknown }).code : undefined;
   return isProvisioningFailureCode(candidate) ? candidate : null;
 }
