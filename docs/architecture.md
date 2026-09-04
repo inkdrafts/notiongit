@@ -203,7 +203,11 @@ exhaust Cloudflare's own retry budget. `wrangler.toml`'s
 platform's own backstop for a consumer that throws unexpectedly (a bug, a
 KV outage) or a message whose job record never materializes within the
 retry budget — the application's own per-job dead-lettering is the primary
-mechanism and is what a future progress UI or ops tooling should read. The
+mechanism and is what a future progress UI or ops tooling should read
+(the progress projection in `progress.ts` is exactly that reader today:
+`GET /progress` and `GET /progress/status` project the job record into
+browser-safe stage states and taxonomy copy, and the record is never
+mutated by a read). The
 consumer batch stays at one message: steps such as `await_sync` poll
 provider APIs inline for minutes, so a larger sequential batch could exceed
 the consumer's wall-clock limit and force redelivery of every message in it.
@@ -375,7 +379,8 @@ a URL that keeps failing after bounded retries is reported as its own
 outcome, `github_deploy_url_unreachable`, distinct from a build failure. The
 job reaches `status: "succeeded"` only after the public URL answers, and its
 record carries the non-secret run id, run URL, conclusion, commit sha,
-build id, and build status for a future progress UI.
+build id, and build status. The progress projection reads the job record,
+never the reverse: a `GET /progress` read is read-only by construction.
 
 ## Observability
 
