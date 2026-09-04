@@ -25,6 +25,7 @@ import { GithubPagesError } from './github-pages';
 import { GithubSyncError } from './notion-sync';
 import { GithubDeployError } from './site-deployment';
 import { GithubGenerateError } from './repository-generation';
+import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import { PROVISIONING_STEP_HANDLERS, type StepRunnerContext } from './provisioning-steps';
 import {
   isTerminalProvisioningStatus,
@@ -40,7 +41,7 @@ import {
   type ProvisioningStepName,
 } from './provisioning-job';
 
-export interface ProvisioningQueueEnv extends GithubAppAuthEnv {
+export interface ProvisioningQueueEnv extends GithubAppAuthEnv, ObservabilityEnv {
   JOBS: KVNamespace;
   PROVISIONING_QUEUE: Queue<{ jobId: string }>;
 }
@@ -118,11 +119,12 @@ export function classifyProvisioningError(error: unknown): ProvisioningErrorClas
 }
 
 async function recordStepFailure(
-  env: Pick<ProvisioningQueueEnv, 'JOBS'>,
+  env: Pick<ProvisioningQueueEnv, 'JOBS' | 'PROVISIONING_METRICS'>,
   job: ProvisioningJob,
   step: ProvisioningStepName,
   error: unknown,
   now: number,
+  stepStartedMs: number,
 ): Promise<ProvisioningMessageOutcome> {
   const classification = classifyProvisioningError(error);
   // The step handler may have persisted data directly to KV after this
@@ -153,7 +155,39 @@ async function recordStepFailure(
   };
   await saveProvisioningJob(env.JOBS, updated);
 
-  if (terminal) return { outcome: 'acked' };
+  emitProvisioningEvent(env, {
+    type: 'step_failed',
+    jobId: base.jobId,
+    ts: now,
+    step,
+    attempt: attempts,
+    errorCode: classification.code,
+    retryable: classification.retryable,
+    terminal,
+    durationMs: now - stepStartedMs,
+  });
+  if (classification.retryAfterSeconds !== null) {
+    emitProvisioningEvent(env, {
+      type: 'rate_limited',
+      jobId: base.jobId,
+      ts: now,
+      step,
+      errorCode: classification.code,
+      retryAfterSeconds: classification.retryAfterSeconds,
+    });
+  }
+
+  if (terminal) {
+    emitProvisioningEvent(env, {
+      type: 'job_dead_lettered',
+      jobId: base.jobId,
+      ts: now,
+      step,
+      errorCode: classification.code,
+      totalDurationMs: now - base.createdAt,
+    });
+    return { outcome: 'acked' };
+  }
   const delaySeconds = classification.retryAfterSeconds ?? provisioningRetryDelaySeconds(attempts);
   return { outcome: 'retry', delaySeconds };
 }
@@ -229,14 +263,31 @@ export async function processProvisioningMessage(
   if (!step) {
     const finishedMs = now();
     await saveProvisioningJob(env.JOBS, { ...locked, status: 'succeeded', lock: null, completedAt: finishedMs, updatedAt: finishedMs });
+    emitProvisioningEvent(env, {
+      type: 'job_succeeded',
+      jobId,
+      ts: finishedMs,
+      totalDurationMs: finishedMs - locked.createdAt,
+    });
     return { outcome: 'acked' };
   }
+
+  // Before the token mint, so a mint failure still pairs a `step_started` with
+  // a `step_failed` over the same interval every other failure path reports.
+  const stepStartedMs = now();
+  emitProvisioningEvent(env, {
+    type: 'step_started',
+    jobId,
+    ts: stepStartedMs,
+    step,
+    attempt: locked.steps[step].attempts + 1,
+  });
 
   let installationToken: string;
   try {
     installationToken = await createGithubInstallationToken(env, locked.installationId, fetcher);
   } catch (error) {
-    return recordStepFailure(env, locked, step, error, now());
+    return recordStepFailure(env, locked, step, error, now(), stepStartedMs);
   }
 
   const inProgressMs = now();
@@ -262,7 +313,7 @@ export async function processProvisioningMessage(
       updatedAt: completionMs,
     };
   } catch (error) {
-    return recordStepFailure(env, inProgress, step, error, now());
+    return recordStepFailure(env, inProgress, step, error, now(), stepStartedMs);
   }
 
   const remainingStep = nextPendingStep(stepSucceeded);
@@ -278,7 +329,26 @@ export async function processProvisioningMessage(
     // and resets the step to `pending`. That re-run is safe — six steps are
     // idempotent and `dispatch_sync`'s marker was persisted by the handler
     // itself, before its external call.
-    return recordStepFailure(env, inProgress, step, error, now());
+    return recordStepFailure(env, inProgress, step, error, now(), stepStartedMs);
+  }
+
+  // After the save, not before: a KV write failure routes to
+  // `recordStepFailure`, so one attempt never both succeeds and fails.
+  emitProvisioningEvent(env, {
+    type: 'step_succeeded',
+    jobId,
+    ts: stepSucceeded.updatedAt,
+    step,
+    attempt: stepSucceeded.steps[step].attempts,
+    durationMs: stepSucceeded.updatedAt - stepStartedMs,
+  });
+  if (!remainingStep) {
+    emitProvisioningEvent(env, {
+      type: 'job_succeeded',
+      jobId,
+      ts: finalJob.updatedAt,
+      totalDurationMs: finalJob.updatedAt - finalJob.createdAt,
+    });
   }
 
   if (remainingStep) {

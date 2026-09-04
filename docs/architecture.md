@@ -244,6 +244,28 @@ job reaches `status: "succeeded"` only after the public URL answers, and its
 record carries the non-secret run id, run URL, conclusion, commit sha,
 build id, and build status for a future progress UI.
 
+## Observability
+
+Every stage of the funnel — consent, enqueue, each step attempt, and the
+terminal job outcome — emits one typed event (`observability.ts`) correlated by
+the same random `jobId` that already keys the KV record and the queue message,
+so no second identifier and no user identity is needed to follow a job from
+consent to first deploy. Each event goes to two sinks: a structured
+`console.log` line, which Workers Logs ingests with no binding and which
+answers "what happened to this job", and the optional `PROVISIONING_METRICS`
+Analytics Engine dataset, which answers "how is the funnel doing" without
+scanning logs. Every event field is a closed error code, an enum, a boolean, or
+a number, and `OBSERVABILITY_EVENT_FIELDS` turns "no free-text field" into a
+typecheck rather than a convention — the canary tests in
+`test/observability.test.ts` push a token-bearing error through the real
+emission path and assert it reaches neither sink. Threshold alerting over the
+dataset (`observability-alerts.ts`) is wired into the `scheduled` handler and
+unit-tested, but `wrangler.toml` leaves its cron trigger commented out until
+the Analytics Engine SQL response shape is verified against a live dataset. The
+event schema, column map, dashboard queries, retention, access, and the triage
+runbook are in [`Observability`](observability.md); the two-sink decision is
+[ADR 0004](decisions/0004-observability.md).
+
 ## Deployment
 
 Run `bun run build` for the dry-run check. The manual Deploy workflow accepts a
