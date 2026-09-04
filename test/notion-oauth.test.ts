@@ -1,9 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  createProvisioningJob,
   NOTION_STATE_COOKIE,
   NOTION_STATE_PREFIX,
   route,
+  saveProvisioningJob,
   type Env,
 } from '../src/index';
 
@@ -21,6 +23,10 @@ class MemoryKV {
     this.values.set(key, value);
     this.puts.push({ key, value, ttl: options?.expirationTtl });
   }
+
+  statePut(): { key: string; value: string; ttl?: number } {
+    return this.puts.find((put) => put.key.startsWith(NOTION_STATE_PREFIX))!;
+  }
 }
 
 function env(kv = new MemoryKV()): Partial<Env> {
@@ -31,7 +37,32 @@ function env(kv = new MemoryKV()): Partial<Env> {
   };
 }
 
+/** Notion authorization only starts for a job the GitHub callback created. */
+async function saveJob(kv: MemoryKV): Promise<void> {
+  await saveProvisioningJob(kv as unknown as KVNamespace, createProvisioningJob({
+    jobId: 'job-123',
+    installationId: 123,
+    identity: { id: 42, login: 'alice', accountType: 'User' },
+    repository: { name: 'alice.github.io', url: 'https://alice.github.io', baseurl: '', kind: 'apex' },
+    generatedRepository: {
+      id: 1001,
+      fullName: 'alice/alice.github.io',
+      name: 'alice.github.io',
+      htmlUrl: 'https://github.com/alice/alice.github.io',
+      defaultBranch: 'main',
+      templateFullName: 'inkdrafts/notiongit-template',
+      templateHeadSha: 'template-head-sha',
+      templateHeadTreeSha: 'template-tree-sha',
+      headSha: null,
+      headTreeSha: null,
+      reused: false,
+    },
+    now: 1_000,
+  }));
+}
+
 async function start(kv = new MemoryKV()) {
+  await saveJob(kv);
   const response = await route(
     new Request('https://staging.example/connect/notion?job_id=job-123'),
     env(kv),
@@ -69,9 +100,10 @@ describe('Notion OAuth', () => {
     expect(location.searchParams.get('response_type')).toBe('code');
     expect(location.searchParams.get('state')).toContain('.');
     expect(cookie.startsWith(`${NOTION_STATE_COOKIE}=`)).toBe(true);
-    expect(kv.puts[0].key.startsWith(NOTION_STATE_PREFIX)).toBe(true);
-    expect(kv.puts[0].value).not.toContain('access_token');
-    expect(kv.puts[0].value).not.toContain('workspace');
+    const statePut = kv.statePut();
+    expect(statePut.key.startsWith(NOTION_STATE_PREFIX)).toBe(true);
+    expect(statePut.value).not.toContain('access_token');
+    expect(statePut.value).not.toContain('workspace');
   });
 
   test('exchanges the code server-side and passes a redacted continuation', async () => {
@@ -150,9 +182,10 @@ describe('Notion OAuth', () => {
 
   test('rejects an expired state record before calling Notion', async () => {
     const { location, cookie, kv } = await start();
-    const stored = JSON.parse(kv.puts[0].value) as Record<string, unknown>;
+    const statePut = kv.statePut();
+    const stored = JSON.parse(statePut.value) as Record<string, unknown>;
     stored.expiresAt = 1;
-    await kv.put(kv.puts[0].key, JSON.stringify(stored));
+    await kv.put(statePut.key, JSON.stringify(stored));
 
     const response = await route(
       callbackUrl(location, cookie, 'code=x'),

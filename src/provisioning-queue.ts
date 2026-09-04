@@ -254,6 +254,13 @@ export async function processProvisioningMessage(
     return { outcome: 'retry', delaySeconds: PROVISIONING_LOCK_RETRY_DELAY_SECONDS };
   }
   if (isTerminalProvisioningStatus(job.status)) return { outcome: 'acked' };
+  if (!job.data.notionSecretsWrittenAt) {
+    // Unreachable through the normal path: a job is only ever enqueued after
+    // the Notion callback has written the secrets. A message that arrives
+    // anyway (a hand-sent `{ jobId }`, a stale KV read) waits rather than
+    // running steps whose sync workflow would have no credentials.
+    return { outcome: 'retry', delaySeconds: PROVISIONING_LOCK_RETRY_DELAY_SECONDS };
+  }
 
   const locked = tryAcquireProvisioningLock(job, lockOwner(), now());
   if (!locked) return { outcome: 'retry', delaySeconds: PROVISIONING_LOCK_RETRY_DELAY_SECONDS };

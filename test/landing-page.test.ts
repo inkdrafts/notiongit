@@ -46,20 +46,20 @@ describe('landing page', () => {
     expect(LANDING_PAGE).toMatch(/own|yours/iu);
   });
 
-  test('shows the real three-stage flow', () => {
-    expect(LANDING_PAGE).toContain('<h3>Connect Notion</h3>');
+  test('shows the real three-stage flow, GitHub first', () => {
     expect(LANDING_PAGE).toContain('<h3>Connect GitHub</h3>');
+    expect(LANDING_PAGE).toContain('<h3>Connect Notion</h3>');
     expect(LANDING_PAGE).toContain('<h3>Your site goes live</h3>');
+    expect(LANDING_PAGE.indexOf('<h3>Connect GitHub</h3>')).toBeLessThan(LANDING_PAGE.indexOf('<h3>Connect Notion</h3>'));
   });
 
-  test('has exactly one primary CTA, into /connect/notion', () => {
+  test('has exactly one primary CTA, into /connect/github', () => {
     const ctaMatches = [...LANDING_PAGE.matchAll(/class="cta"[^>]*href="([^"]+)"/gu)];
     expect(ctaMatches).toHaveLength(1);
-    expect(ctaMatches[0]?.[1]).toBe('/connect/notion');
+    expect(ctaMatches[0]?.[1]).toBe('/connect/github');
   });
 
-  test('never links the unadvertised GitHub App install route', () => {
-    expect(LANDING_PAGE).not.toContain('/connect/github');
+  test('never links the unadvertised GitHub App install page directly', () => {
     expect(LANDING_PAGE).not.toContain('github.com/apps/inkdrafts');
   });
 
