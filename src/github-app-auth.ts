@@ -11,6 +11,7 @@
  */
 
 import type { GithubFailureCode } from './failures';
+import type { GithubRepositorySummary } from './repository-naming';
 import { Secret } from './secret';
 
 export interface GithubAppAuthEnv {
@@ -181,4 +182,38 @@ export async function getAppInstallation(
   const body = await readJson<GithubInstallationAccount>(response);
   if (body === null) throw new GithubAppAuthError(502);
   return body;
+}
+
+const INSTALLATION_REPOSITORIES_MAX_PAGES = 5;
+
+/**
+ * List the installation's repositories with the fields repository selection
+ * and reuse need, capped at five pages of 100 so one status render stays
+ * bounded. Parse boundary: only `GithubRepositorySummary` fields leave this
+ * module, and the token is never included in an error.
+ */
+export async function listInstallationRepositories(
+  installationToken: string,
+  fetcher: typeof fetch = fetch,
+): Promise<GithubRepositorySummary[]> {
+  const summaries: GithubRepositorySummary[] = [];
+  for (let page = 1; page <= INSTALLATION_REPOSITORIES_MAX_PAGES; page += 1) {
+    const response = await fetcher(`${GITHUB_API}/installation/repositories?per_page=100&page=${page}`, {
+      headers: githubHeaders(`Bearer ${installationToken}`),
+    });
+    if (response.status === 403 || response.status === 429) {
+      const retryAfter = retryAfterSeconds(response);
+      if (retryAfter !== null || response.status === 429) {
+        throw new GithubAppAuthError(429, retryAfter);
+      }
+    }
+    if (!response.ok) throw new GithubAppAuthError(response.status);
+    const body = await readJson<{ repositories?: GithubRepositorySummary[] }>(response);
+    if (!Array.isArray(body?.repositories)) throw new GithubAppAuthError(502);
+    for (const repository of body.repositories) {
+      if (repository && typeof repository.name === 'string') summaries.push(repository);
+    }
+    if (body.repositories.length < 100) return summaries;
+  }
+  return summaries;
 }

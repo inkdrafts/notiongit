@@ -106,6 +106,10 @@ function isTerminalBuildStatus(status: unknown): status is 'built' | 'errored' {
   return status === 'built' || status === 'errored';
 }
 
+function isPagesBuildStatus(status: unknown): status is GithubDeployStatus {
+  return status === 'built' || status === 'building' || status === 'errored';
+}
+
 /** Read the repository's current `main` HEAD sha, for correlating the Pages build to wait for. */
 export async function getRepositoryMainHeadSha(
   installationToken: string,
@@ -169,6 +173,32 @@ export async function awaitPagesBuildForCommit(
   }
 
   throw new GithubDeployError('github_deploy_timeout', 504);
+}
+
+/**
+ * One-shot read of the repository's latest Pages build, in whatever state it
+ * is. Null means GitHub answered and no build exists yet; a failed or
+ * unreadable read throws so the caller can distinguish "never built" from
+ * "cannot tell right now". Never returns the build's error message: that
+ * field can echo Jekyll content sourced from the user's Notion workspace.
+ */
+export async function latestPagesBuild(
+  installationToken: string,
+  repositoryFullName: string,
+  fetcher: typeof fetch = fetch,
+): Promise<GithubPagesBuildIdentity | null> {
+  const response = await fetcher(`${GITHUB_API}${buildsLatestPath(repositoryFullName)}`, {
+    headers: githubHeaders(installationToken),
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new GithubDeployError('github_deploy_unavailable', 502);
+  const body = await readJson<PagesBuildResponse>(response);
+  if (!body || !isPagesBuildStatus(body.status)) throw new GithubDeployError('github_deploy_unavailable', 502);
+  return {
+    buildId: buildIdFromUrl(body.url),
+    status: body.status,
+    commitSha: typeof body.commit === 'string' ? body.commit : null,
+  };
 }
 
 /**

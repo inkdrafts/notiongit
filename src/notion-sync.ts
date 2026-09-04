@@ -28,6 +28,11 @@ export interface NotionSyncRunIdentity {
   status: string;
   conclusion: string | null;
   headSha: string | null;
+  /** Epoch ms from the run's `created_at`; null when GitHub omits or garbles it. */
+  createdAtMs: number | null;
+  /** Epoch ms from the run's `updated_at`. For a completed run this is the
+   * closest thing GitHub exposes to a finish time. */
+  updatedAtMs: number | null;
 }
 
 export type GithubSyncErrorCode =
@@ -60,6 +65,7 @@ interface WorkflowRunResponse {
   conclusion?: unknown;
   head_sha?: unknown;
   created_at?: unknown;
+  updated_at?: unknown;
   event?: unknown;
 }
 
@@ -104,6 +110,12 @@ function isUsableRunShape(run: WorkflowRunResponse): boolean {
   return Number.isSafeInteger(run.id) && (run.id as number) > 0 && typeof run.status === 'string';
 }
 
+function epochMs(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function runIdentity(run: WorkflowRunResponse): NotionSyncRunIdentity {
   return {
     runId: run.id as number,
@@ -111,6 +123,8 @@ function runIdentity(run: WorkflowRunResponse): NotionSyncRunIdentity {
     status: run.status as string,
     conclusion: typeof run.conclusion === 'string' ? run.conclusion : null,
     headSha: typeof run.head_sha === 'string' ? run.head_sha : null,
+    createdAtMs: epochMs(run.created_at),
+    updatedAtMs: epochMs(run.updated_at),
   };
 }
 
@@ -135,6 +149,27 @@ export async function listWorkflowRunIds(
   const body = await readJson<{ workflow_runs?: WorkflowRunResponse[] }>(response);
   const runs = body?.workflow_runs ?? [];
   return new Set(runs.filter(isUsableRunShape).map((run) => run.id as number));
+}
+
+/**
+ * One-shot read of the most recent `workflow_dispatch` run, GitHub's
+ * newest-first order taken as-is. Null means the read succeeded and no run
+ * exists; a failed read throws so the caller can distinguish "never ran"
+ * from "cannot tell right now". Run outputs, step summaries, and logs are
+ * never read — GitHub exposes none of them after the run completes.
+ */
+export async function latestDispatchedSyncRun(
+  installationToken: string,
+  repositoryFullName: string,
+  fetcher: typeof fetch = fetch,
+): Promise<NotionSyncRunIdentity | null> {
+  const response = await fetcher(`${GITHUB_API}${runsPath(repositoryFullName)}/runs?event=workflow_dispatch&per_page=1`, {
+    headers: githubHeaders(installationToken),
+  });
+  if (!response.ok) throw new GithubSyncError('github_sync_unavailable', 502);
+  const body = await readJson<{ workflow_runs?: WorkflowRunResponse[] }>(response);
+  const run = (body?.workflow_runs ?? []).find(isUsableRunShape);
+  return run ? runIdentity(run) : null;
 }
 
 /** Trigger the template's documented sync workflow with safe default bulk-delete behavior. */

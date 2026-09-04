@@ -6,6 +6,7 @@ import {
   dispatchAndCorrelateNotionSync,
   dispatchNotionSyncWorkflow,
   GithubSyncError,
+  latestDispatchedSyncRun,
   listWorkflowRunIds,
   SYNC_WORKFLOW_FILE,
 } from '../src/notion-sync';
@@ -72,6 +73,45 @@ describe('listWorkflowRunIds', () => {
       return response(200, { workflow_runs: [run({ id: 1 }), run({ id: 2 })] });
     });
     expect(ids).toEqual(new Set([1, 2]));
+  });
+});
+
+describe('latestDispatchedSyncRun', () => {
+  const LATEST_URL = `https://api.github.com/repos/${REPOSITORY}/actions/workflows/${SYNC_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=1`;
+
+  test('returns the newest dispatched run with its timestamps', async () => {
+    const identity = await latestDispatchedSyncRun(INSTALLATION_TOKEN, REPOSITORY, async (input, init) => {
+      const request = new Request(input, init);
+      expect(request.url).toBe(LATEST_URL);
+      expect(request.headers.get('authorization')).toBe(`Bearer ${INSTALLATION_TOKEN}`);
+      return response(200, {
+        workflow_runs: [run({ created_at: '2026-09-01T10:00:00Z', updated_at: '2026-09-01T10:05:00Z' })],
+      });
+    });
+    expect(identity).toEqual({
+      runId: 555,
+      htmlUrl: 'https://github.com/alice/alice.github.io/actions/runs/555',
+      status: 'completed',
+      conclusion: 'success',
+      headSha: 'commit-sha',
+      createdAtMs: Date.parse('2026-09-01T10:00:00Z'),
+      updatedAtMs: Date.parse('2026-09-01T10:05:00Z'),
+    });
+  });
+
+  test('null means the read succeeded and no run exists', async () => {
+    await expect(latestDispatchedSyncRun(INSTALLATION_TOKEN, REPOSITORY, async () => response(200, { workflow_runs: [] })))
+      .resolves.toBeNull();
+  });
+
+  test('a failed read throws so never-ran stays distinguishable from cannot-tell', async () => {
+    await expect(latestDispatchedSyncRun(INSTALLATION_TOKEN, REPOSITORY, async () => response(500)))
+      .rejects.toMatchObject({ code: 'github_sync_unavailable', status: 502 });
+  });
+
+  test('skips an unusable run shape instead of returning it', async () => {
+    await expect(latestDispatchedSyncRun(INSTALLATION_TOKEN, REPOSITORY, async () =>
+      response(200, { workflow_runs: [{ id: 'nope' }] }))).resolves.toBeNull();
   });
 });
 
