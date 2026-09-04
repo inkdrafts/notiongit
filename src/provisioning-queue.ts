@@ -351,7 +351,14 @@ export async function processProvisioningMessage(
     ? { ...stepSucceeded, status: 'queued' }
     : { ...stepSucceeded, status: 'succeeded', completedAt: stepSucceeded.updatedAt };
   try {
-    await saveProvisioningJob(env.JOBS, finalJob);
+    if (remainingStep) {
+      await saveProvisioningJob(env.JOBS, finalJob);
+    } else {
+      // The job just reached its terminal status, so the terminal ⇒ release
+      // invariant applies: this save also frees the account's provisioning
+      // lease (and drops any wait breadcrumb).
+      await saveTerminalProvisioningJob(env, finalJob);
+    }
   } catch (error) {
     // Unlike the enqueue failure below, a KV write failure here means the
     // success was never persisted, so the step genuinely has to re-run:
