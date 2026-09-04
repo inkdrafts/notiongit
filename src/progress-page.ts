@@ -176,6 +176,19 @@ const STYLES = `
     margin: 0.5rem 0;
   }
   .cta:hover { text-decoration: none; filter: brightness(1.08); }
+  .muted { color: var(--muted); }
+  .panel h2 { font-size: 1.15rem; margin: 1.75rem 0 0.5rem; }
+  ul.link-list { list-style: none; margin: 0 0 1rem; padding: 0; display: grid; gap: 0.5rem; }
+  ul.link-list li {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+  }
+  .link-list .notion-missing { color: var(--muted); }
   [hidden] { display: none !important; }
 `;
 
@@ -213,6 +226,23 @@ const SCRIPT = `
     if (text !== undefined) element.textContent = text;
   };
 
+  // A null URL hides the anchor entirely (never an empty href) and shows the
+  // linkless fallback, matching what the server rendered for a null.
+  const setNotionLink = (id, url) => {
+    const link = document.getElementById(id);
+    const missing = document.getElementById(id + '-missing');
+    if (!link || !missing) return;
+    if (url === null) {
+      link.removeAttribute('href');
+      link.hidden = true;
+      missing.hidden = false;
+    } else {
+      link.setAttribute('href', url);
+      link.hidden = false;
+      missing.hidden = true;
+    }
+  };
+
   function render(next) {
     const progress = next.progress;
     for (const [name, panel] of panels) panel.hidden = name !== progress.status;
@@ -231,6 +261,9 @@ const SCRIPT = `
     if (progress.status === 'succeeded') {
       setLink('site-link', progress.site.url);
       setLink('repository-link', progress.repository.url, progress.repository.name);
+      setNotionLink('notion-root-link', progress.notionLinks.templateRootUrl);
+      setNotionLink('notion-pages-link', progress.notionLinks.pagesUrl);
+      setNotionLink('notion-posts-link', progress.notionLinks.postsUrl);
     }
     if (progress.status === 'failed') {
       setText('failed-message', progress.message);
@@ -292,6 +325,16 @@ function checklistRow(stage: ProgressStageView): string {
     `</li>`;
 }
 
+/** Shown where a captured link would have been; null never renders an anchor. */
+const NOTION_LINK_FALLBACK = 'We could not capture a link here. You can find this page in your Notion workspace.';
+
+function notionLinkRow(name: string, url: string | null, id: string): string {
+  const link = url === null ? '' : `<a id="${id}" href="${escapeHtml(url)}">Open in Notion</a>`;
+  const missing =
+    `<span id="${id}-missing" class="notion-missing"${url === null ? '' : ' hidden'}>${escapeHtml(NOTION_LINK_FALLBACK)}</span>`;
+  return `<li><span class="link-name">${escapeHtml(name)}</span>${link}${missing}</li>`;
+}
+
 function panelsHtml(progress: PublicProgress, jobId: string): string {
   const open = (status: PublicProgress['status']): string =>
     `<section class="panel" data-panel="${status}"${progress.status === status ? '' : ' hidden'}>`;
@@ -299,6 +342,11 @@ function panelsHtml(progress: PublicProgress, jobId: string): string {
   const activeNotice = progress.status === 'active' ? progress.notice : null;
   const restartUrl = progress.status === 'failed' ? progress.restartUrl : null;
   const connectNotionHref = `/connect/notion?job_id=${encodeURIComponent(jobId)}`;
+  // Outside the succeeded snapshot every dynamic value resolves to its null
+  // state, so a hidden panel never renders a live link.
+  const rootUrl = progress.status === 'succeeded' ? progress.notionLinks.templateRootUrl : null;
+  const pagesUrl = progress.status === 'succeeded' ? progress.notionLinks.pagesUrl : null;
+  const postsUrl = progress.status === 'succeeded' ? progress.notionLinks.postsUrl : null;
 
   return [
     `${open('active')}`,
@@ -318,7 +366,19 @@ function panelsHtml(progress: PublicProgress, jobId: string): string {
     `${open('succeeded')}`,
     '<p>Your site is published. It stays in sync with your Notion pages.</p>',
     `<p><a id="site-link" class="cta" href="${escapeHtml(progress.status === 'succeeded' ? progress.site.url : '')}">View your site</a></p>`,
+    '<p class="muted">We checked that your site was live right before publishing finished. If the link does not open yet, GitHub’s network may still be updating it. It is usually ready within a few minutes.</p>',
+    '<h2>Everyday writing happens in Notion</h2>',
+    '<ul class="link-list">',
+    notionLinkRow('Start from your home page', rootUrl, 'notion-root-link'),
+    notionLinkRow('Pages database', pagesUrl, 'notion-pages-link'),
+    notionLinkRow('Posts database', postsUrl, 'notion-posts-link'),
+    '</ul>',
+    '<p>Changes you make in Notion appear on your site automatically. Syncing runs about every 10 minutes.</p>',
+    '<p>To see sync and publish status, or to run a sync now, open <a href="/status">your dashboard</a>.</p>',
+    '<h2>Your site is a repository you own</h2>',
     `<p><a id="repository-link" href="${escapeHtml(progress.status === 'succeeded' ? progress.repository.url : '')}">${escapeHtml(progress.status === 'succeeded' ? progress.repository.name : '')}</a></p>`,
+    '<p>Writing happens in Notion, so you never need GitHub for your everyday work. The repository itself is yours to keep: advanced users can customize the Jekyll site, themes, and workflows directly, and your site keeps working even if InkDrafts disappears.</p>',
+    '<p>Want to use your own domain name? GitHub’s <a href="https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site">custom domain guide</a> shows how.</p>',
     '</section>',
 
     `${open('failed')}`,
@@ -346,6 +406,7 @@ export function progressPage(jobId: string, snapshot: ProgressSnapshot): string 
     ? ''
     : `<noscript><meta http-equiv="refresh" content="${refreshSeconds(progress)}"></noscript>`;
   const statusUrl = `/progress/status?job_id=${encodeURIComponent(jobId)}`;
+  const siteCheckUrl = `/progress/site-check?job_id=${encodeURIComponent(jobId)}`;
 
   return `<!doctype html>
 <html lang="en">
@@ -358,7 +419,7 @@ ${refresh}
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to content</a>
-<main id="main-content" data-status-url="${escapeHtml(statusUrl)}">
+<main id="main-content" data-status-url="${escapeHtml(statusUrl)}" data-site-check-url="${escapeHtml(siteCheckUrl)}">
 <h1 id="progress-heading">${escapeHtml(heading)}</h1>
 <p id="progress-live" role="status" aria-live="polite">${escapeHtml(liveText(progress))}</p>
 ${stagesOf(progress).length ? `<ol class="checklist" aria-label="Setup steps">
