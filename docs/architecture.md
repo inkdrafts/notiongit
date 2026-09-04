@@ -294,13 +294,33 @@ config parse by throwing, valid values are clamped):
 | `PROVISIONING_MUTATIONS_PER_MINUTE` | `30` | ≤ 60 | Global content-creating mutations per fixed minute window |
 | `PROVISIONING_MUTATIONS_PER_HOUR` | `240` | ≤ 400 | Global content-creating mutations per fixed hour window |
 | `PROVISIONING_LEASE_TTL_SECONDS` | `1800` | 60–86400 | Per-account lockout bound; also how long a wedged job blocks its account |
+| `PROVISIONING_CONTROL_MODE` | `active` | `active`, `pause`, or `kill` | Process-wide admission mode; the KV control record can make the mode stricter at the next fresh KV read |
+| `PROVISIONING_PAUSED_STAGES` | empty | Known admission stages | Pauses listed stages and lets queued jobs resume after the control is cleared |
+| `PROVISIONING_REJECTED_STAGES` | empty | Known admission stages | Rejects new work at listed stages; existing queue work remains paused until the control is cleared |
+| `PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_SECONDS` | `86400` | 60–2592000 | TTL for the per-account attempt record |
+| `PROVISIONING_ACCOUNT_ATTEMPT_LIMIT` | `3` | 1–10000 | Identified account attempts allowed in the window |
+| `PROVISIONING_REQUEST_BURST_WINDOW_SECONDS` | `60` | 60–3600 | TTL for the HMAC-keyed request burst record |
+| `PROVISIONING_REQUEST_BURST_LIMIT` | `10` | 1–10000 | Requests allowed per privacy-preserving network-prefix bucket |
+| `PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS` | `3600` | 60–2592000 | TTL for an identity denied by GitHub or marked suspended |
+| `PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS` | `604800` | 60–2592000 | TTL for admission decision records |
+
+Admission control details, activation commands, rollback, and incident steps are in [`docs/provisioning-admission-runbook.md`](provisioning-admission-runbook.md).
+
+Admission records use the same Workers KV consistency model as the existing
+throttle. Promise-chain locks serialize read-modify-write operations within one
+Worker isolate. KV propagation can delay a control update or allow bounded
+over-admission across isolates, so operators use the kill switch before
+investigating provider traffic and keep the existing mutation headroom. A
+control record with `expiresAt: null` is deliberate operator configuration; all
+per-request, per-account, denial, callback, and audit records have finite TTLs.
 
 **Wait/resume guarantee.** A refused gate pass is free: no token minted, no
 provider call, no attempt consumed, no lock held. The job is persisted
-`queued` and unlocked with a wait breadcrumb (`reason: 'global_throttled'`
-plus times — never identity or error text), and the continuation is handed
-to a *fresh* queue message carrying `delaySeconds` — the next window
-boundary plus margin for budget waits, jittered, floored at 1s. A fresh
+`queued` or `paused` and unlocked with a wait breadcrumb (`reason:
+'global_throttled'` or a stage-pause reason, plus times — never identity or
+error text), and the continuation is handed to a *fresh* queue message
+carrying `delaySeconds` — the next window boundary plus margin for budget
+waits, jittered, floored at 1s. A fresh
 message is a new delivery, so waiting can never exhaust the consumer's
 `max_retries = 6` platform budget and dead-letter a healthy job; the same
 transport carries a step failure that arrives with GitHub's own
