@@ -18,6 +18,13 @@ export const PROVISIONING_JOB_VERSION = 1;
 export const PROVISIONING_JOB_TTL_SECONDS = 24 * 60 * 60;
 export const PROVISIONING_JOB_PREFIX = 'github:onboarding-job:';
 export const PROVISIONING_STEP_MAX_ATTEMPTS = 5;
+/**
+ * Attempt ceiling for failures that carry GitHub's own Retry-After. Honoring
+ * the provider's pacing must not dead-letter the job through the regular
+ * five-attempt ceiling, so rate-limited attempts get their own, much larger
+ * bound before the job gives up.
+ */
+export const PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS = 24;
 export const PROVISIONING_LOCK_TTL_MS = 5 * 60 * 1000;
 export const PROVISIONING_LOCK_RETRY_DELAY_SECONDS = 30;
 /** Short backoff for redelivery after a step succeeded but handing the
@@ -61,6 +68,18 @@ export interface ProvisioningJobLock {
   owner: string;
   acquiredAt: number;
   expiresAt: number;
+}
+
+/**
+ * Non-secret breadcrumb that a delivery was throttled rather than failed:
+ * reason and time only — never identity, provider text, or a token. A wait
+ * is not an error, so `lastError` stays reserved for failures.
+ */
+export interface ProvisioningJobWait {
+  reason: 'global_throttled';
+  /** Epoch ms after which the next delivery should re-evaluate; null re-evaluates now. */
+  untilMs: number | null;
+  updatedAt: number;
 }
 
 export type ProvisioningJobStatus =
@@ -129,6 +148,10 @@ export interface ProvisioningJob {
   steps: Record<ProvisioningStepName, ProvisioningStepState>;
   data: ProvisioningJobData;
   lock: ProvisioningJobLock | null;
+  /** Set while the job is parked behind the global throttle; cleared when
+   * the step next books and on every terminal save, so a breadcrumb never
+   * outlives the stall it describes. Absent in pre-throttle records. */
+  wait: ProvisioningJobWait | null;
   createdAt: number;
   updatedAt: number;
   completedAt: number | null;
@@ -192,6 +215,7 @@ export function createProvisioningJob(params: CreateProvisioningJobParams): Prov
       notionSecretsWrittenAt: null,
     },
     lock: null,
+    wait: null,
     createdAt: params.now,
     updatedAt: params.now,
     completedAt: null,
@@ -201,7 +225,9 @@ export function createProvisioningJob(params: CreateProvisioningJobParams): Prov
 export async function loadProvisioningJob(kv: KVNamespace, jobId: string): Promise<ProvisioningJob | null> {
   const job = await kv.get<ProvisioningJob>(provisioningJobKey(jobId), 'json');
   if (!job || job.version !== PROVISIONING_JOB_VERSION) return null;
-  return job;
+  // Records written before the throttle existed carry no `wait`; the version
+  // stays 1 because the 24h TTL drains them without a migration.
+  return { ...job, wait: job.wait ?? null };
 }
 
 /** Persist a job with the same rolling TTL used everywhere else in this project — the

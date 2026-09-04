@@ -36,12 +36,20 @@ import {
   tryAcquireProvisioningLock,
   PROVISIONING_ENQUEUE_RETRY_DELAY_SECONDS,
   PROVISIONING_LOCK_RETRY_DELAY_SECONDS,
+  PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS,
   PROVISIONING_STEP_MAX_ATTEMPTS,
   type ProvisioningJob,
   type ProvisioningStepName,
 } from './provisioning-job';
+import {
+  gateProvisioningStep,
+  jitteredDelaySeconds,
+  provisioningThrottleConfig,
+  saveTerminalProvisioningJob,
+  type ProvisioningThrottleVars,
+} from './provisioning-throttle';
 
-export interface ProvisioningQueueEnv extends GithubAppAuthEnv, ObservabilityEnv {
+export interface ProvisioningQueueEnv extends GithubAppAuthEnv, ObservabilityEnv, ProvisioningThrottleVars {
   JOBS: KVNamespace;
   PROVISIONING_QUEUE: Queue<{ jobId: string }>;
 }
@@ -51,6 +59,9 @@ export interface ProvisioningRuntimeOptions {
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
   lockOwner?: () => string;
+  /** Injectable [0,1) random source for bounded backoff jitter; tests pin
+   * delays by injecting a constant. */
+  rng?: () => number;
 }
 
 export type ProvisioningMessageOutcome =
@@ -75,7 +86,11 @@ const RETRYABLE_SYNC_CODES = new Set([
 
 const RETRYABLE_PAGES_CODES = new Set(['github_pages_rate_limited', 'github_pages_unavailable']);
 
-const RETRYABLE_CONFIG_CODES = new Set(['github_config_conflict', 'github_config_unavailable']);
+const RETRYABLE_CONFIG_CODES = new Set([
+  'github_config_conflict',
+  'github_config_rate_limited',
+  'github_config_unavailable',
+]);
 
 const RETRYABLE_GENERATE_CODES = new Set([
   'github_generate_rate_limited',
@@ -92,7 +107,7 @@ const RETRYABLE_DEPLOY_CODES = new Set([
 /** Maps every provisioning error this queue can encounter to a retry decision. */
 export function classifyProvisioningError(error: unknown): ProvisioningErrorClassification {
   if (error instanceof GithubConfigError) {
-    return { code: error.code, retryable: RETRYABLE_CONFIG_CODES.has(error.code), retryAfterSeconds: null };
+    return { code: error.code, retryable: RETRYABLE_CONFIG_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
   }
   if (error instanceof GithubPagesError) {
     return { code: error.code, retryable: RETRYABLE_PAGES_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
@@ -110,7 +125,7 @@ export function classifyProvisioningError(error: unknown): ProvisioningErrorClas
     return { code: error.code, retryable: RETRYABLE_GENERATE_CODES.has(error.code), retryAfterSeconds: error.retryAfterSeconds };
   }
   if (error instanceof GithubAppAuthError) {
-    return { code: 'github_app_auth_failed', retryable: error.status >= 500 || error.status === 429, retryAfterSeconds: null };
+    return { code: 'github_app_auth_failed', retryable: error.status >= 500 || error.status === 429, retryAfterSeconds: error.retryAfterSeconds };
   }
   // An unrecognized error (a network throw, a bug) is treated as transient.
   // The per-step attempt ceiling still bounds it to a handful of tries
@@ -119,14 +134,16 @@ export function classifyProvisioningError(error: unknown): ProvisioningErrorClas
 }
 
 async function recordStepFailure(
-  env: Pick<ProvisioningQueueEnv, 'JOBS' | 'PROVISIONING_METRICS'>,
+  env: Pick<ProvisioningQueueEnv, 'JOBS' | 'PROVISIONING_QUEUE' | 'PROVISIONING_METRICS'>,
   job: ProvisioningJob,
   step: ProvisioningStepName,
   error: unknown,
   now: number,
+  rng: () => number,
   stepStartedMs: number,
 ): Promise<ProvisioningMessageOutcome> {
   const classification = classifyProvisioningError(error);
+  const { retryAfterSeconds } = classification;
   // The step handler may have persisted data directly to KV after this
   // attempt's snapshot was taken — the sync dispatch marker is written this
   // way exactly so it survives an ambiguous dispatch failure. Re-read the
@@ -135,7 +152,8 @@ async function recordStepFailure(
   const persisted = await loadProvisioningJob(env.JOBS, job.jobId);
   const base = persisted ?? job;
   const attempts = base.steps[step].attempts + 1;
-  const terminal = !classification.retryable || attempts >= PROVISIONING_STEP_MAX_ATTEMPTS;
+  const terminal = !classification.retryable
+    || attempts >= (retryAfterSeconds !== null ? PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS : PROVISIONING_STEP_MAX_ATTEMPTS);
 
   const updated: ProvisioningJob = {
     ...base,
@@ -153,8 +171,11 @@ async function recordStepFailure(
     updatedAt: now,
     completedAt: terminal ? now : null,
   };
-  await saveProvisioningJob(env.JOBS, updated);
-
+  if (terminal) {
+    await saveTerminalProvisioningJob(env, updated);
+  } else {
+    await saveProvisioningJob(env.JOBS, updated);
+  }
   emitProvisioningEvent(env, {
     type: 'step_failed',
     jobId: base.jobId,
@@ -166,17 +187,16 @@ async function recordStepFailure(
     terminal,
     durationMs: now - stepStartedMs,
   });
-  if (classification.retryAfterSeconds !== null) {
+  if (retryAfterSeconds !== null) {
     emitProvisioningEvent(env, {
       type: 'rate_limited',
       jobId: base.jobId,
       ts: now,
       step,
       errorCode: classification.code,
-      retryAfterSeconds: classification.retryAfterSeconds,
+      retryAfterSeconds,
     });
   }
-
   if (terminal) {
     emitProvisioningEvent(env, {
       type: 'job_dead_lettered',
@@ -188,8 +208,19 @@ async function recordStepFailure(
     });
     return { outcome: 'acked' };
   }
-  const delaySeconds = classification.retryAfterSeconds ?? provisioningRetryDelaySeconds(attempts);
-  return { outcome: 'retry', delaySeconds };
+  if (retryAfterSeconds !== null) {
+    // Rate-limited failures ride the fresh-message transport, like gate
+    // waits: message.retry() would let the platform's max_retries=6
+    // dead-letter a healthy job after six genuine GitHub rate limits.
+    const delaySeconds = jitteredDelaySeconds(retryAfterSeconds, rng, 0.05);
+    try {
+      await env.PROVISIONING_QUEUE.send({ jobId: job.jobId }, { delaySeconds });
+      return { outcome: 'acked' };
+    } catch {
+      return { outcome: 'retry', delaySeconds };
+    }
+  }
+  return { outcome: 'retry', delaySeconds: jitteredDelaySeconds(provisioningRetryDelaySeconds(attempts), rng) };
 }
 
 /**
@@ -242,6 +273,7 @@ export async function processProvisioningMessage(
     sleep = defaultSleep,
     now = () => Date.now(),
     lockOwner = () => crypto.randomUUID(),
+    rng = Math.random,
   } = runtime;
 
   const job = await loadProvisioningJob(env.JOBS, jobId);
@@ -269,7 +301,7 @@ export async function processProvisioningMessage(
   const step = nextPendingStep(locked);
   if (!step) {
     const finishedMs = now();
-    await saveProvisioningJob(env.JOBS, { ...locked, status: 'succeeded', lock: null, completedAt: finishedMs, updatedAt: finishedMs });
+    await saveTerminalProvisioningJob(env, { ...locked, status: 'succeeded', lock: null, completedAt: finishedMs, updatedAt: finishedMs });
     emitProvisioningEvent(env, {
       type: 'job_succeeded',
       jobId,
@@ -277,6 +309,43 @@ export async function processProvisioningMessage(
       totalDurationMs: finishedMs - locked.createdAt,
     });
     return { outcome: 'acked' };
+  }
+
+  const gate = await gateProvisioningStep(env.JOBS, locked, step, provisioningThrottleConfig(env), now(), rng);
+  if (gate.action === 'superseded') {
+    const supersededMs = now();
+    await saveTerminalProvisioningJob(env, {
+      ...locked,
+      status: 'failed',
+      steps: {
+        ...locked.steps,
+        [step]: {
+          ...locked.steps[step],
+          status: 'failed',
+          updatedAt: supersededMs,
+          lastError: { code: 'github_provisioning_superseded', retryable: false },
+        },
+      },
+      lock: null,
+      updatedAt: supersededMs,
+      completedAt: supersededMs,
+    });
+    return { outcome: 'acked' };
+  }
+  if (gate.action === 'wait') {
+    const waitMs = now();
+    await saveProvisioningJob(env.JOBS, {
+      ...locked,
+      status: 'queued',
+      lock: null,
+      wait: { reason: gate.reason, untilMs: waitMs + gate.delaySeconds * 1000, updatedAt: waitMs },
+    });
+    try {
+      await env.PROVISIONING_QUEUE.send({ jobId }, { delaySeconds: gate.delaySeconds });
+      return { outcome: 'acked' };
+    } catch {
+      return { outcome: 'retry', delaySeconds: gate.delaySeconds };
+    }
   }
 
   // Before the token mint, so a mint failure still pairs a `step_started` with
@@ -294,12 +363,13 @@ export async function processProvisioningMessage(
   try {
     installationToken = await createGithubInstallationToken(env, locked.installationId, fetcher);
   } catch (error) {
-    return recordStepFailure(env, locked, step, error, now(), stepStartedMs);
+    return recordStepFailure(env, locked, step, error, now(), rng, stepStartedMs);
   }
 
   const inProgressMs = now();
   const inProgress: ProvisioningJob = {
     ...locked,
+    wait: null,
     steps: { ...locked.steps, [step]: { ...locked.steps[step], status: 'in_progress', updatedAt: inProgressMs } },
   };
   await saveProvisioningJob(env.JOBS, inProgress);
@@ -320,7 +390,7 @@ export async function processProvisioningMessage(
       updatedAt: completionMs,
     };
   } catch (error) {
-    return recordStepFailure(env, inProgress, step, error, now(), stepStartedMs);
+    return recordStepFailure(env, inProgress, step, error, now(), rng, stepStartedMs);
   }
 
   const remainingStep = nextPendingStep(stepSucceeded);
@@ -328,7 +398,14 @@ export async function processProvisioningMessage(
     ? { ...stepSucceeded, status: 'queued' }
     : { ...stepSucceeded, status: 'succeeded', completedAt: stepSucceeded.updatedAt };
   try {
-    await saveProvisioningJob(env.JOBS, finalJob);
+    if (remainingStep) {
+      await saveProvisioningJob(env.JOBS, finalJob);
+    } else {
+      // The job just reached its terminal status, so the terminal ⇒ release
+      // invariant applies: this save also frees the account's provisioning
+      // lease (and drops any wait breadcrumb).
+      await saveTerminalProvisioningJob(env, finalJob);
+    }
   } catch (error) {
     // Unlike the enqueue failure below, a KV write failure here means the
     // success was never persisted, so the step genuinely has to re-run:
@@ -336,7 +413,7 @@ export async function processProvisioningMessage(
     // and resets the step to `pending`. That re-run is safe — six steps are
     // idempotent and `dispatch_sync`'s marker was persisted by the handler
     // itself, before its external call.
-    return recordStepFailure(env, inProgress, step, error, now(), stepStartedMs);
+    return recordStepFailure(env, inProgress, step, error, now(), rng, stepStartedMs);
   }
 
   // After the save, not before: a KV write failure routes to

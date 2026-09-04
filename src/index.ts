@@ -16,6 +16,7 @@ import {
   generateOrReuseRepository,
   GithubGenerateError,
   type GeneratedRepositoryIdentity,
+  type GenerateOrReuseOptions,
 } from './repository-generation';
 import {
   GithubActionsSecretsError,
@@ -32,6 +33,14 @@ import {
   loadProvisioningJob,
   saveProvisioningJob,
 } from './provisioning-job';
+import {
+  acquireProvisioningStart,
+  consumeGlobalMutationBudget,
+  ProvisioningGateRefusedError,
+  provisioningThrottleConfig,
+  releaseProvisioningLeaseIfOwned,
+  type ProvisioningThrottleVars,
+} from './provisioning-throttle';
 import { processProvisioningMessage } from './provisioning-queue';
 import { emitProvisioningEvent } from './observability';
 import { runObservabilityAlertCheck } from './observability-alerts';
@@ -80,6 +89,7 @@ export {
 export type {
   GeneratedRepositoryIdentity,
   GeneratedRepositoryPollOptions,
+  GenerateOrReuseOptions,
   GithubGenerateErrorCode,
 } from './repository-generation';
 
@@ -237,6 +247,38 @@ export type {
 } from './provisioning-queue';
 
 export {
+  ACCOUNT_LEASE_PREFIX,
+  accountLeaseKey,
+  acquireProvisioningStart,
+  consumeGlobalMutationBudget,
+  gateProvisioningStep,
+  GLOBAL_RATE_KEY,
+  isBudgetedMutationStep,
+  jitteredDelaySeconds,
+  MAX_RACING_ISOLATES,
+  PROVISIONING_LEASE_TTL_DEFAULT_SECONDS,
+  PROVISIONING_LEASE_TTL_MAX_SECONDS,
+  PROVISIONING_LEASE_TTL_MIN_SECONDS,
+  PROVISIONING_MUTATIONS_PER_HOUR_CEILING,
+  PROVISIONING_MUTATIONS_PER_HOUR_DEFAULT,
+  PROVISIONING_MUTATIONS_PER_MINUTE_CEILING,
+  PROVISIONING_MUTATIONS_PER_MINUTE_DEFAULT,
+  provisioningThrottleConfig,
+  ProvisioningGateRefusedError,
+  releaseProvisioningLeaseIfOwned,
+  saveTerminalProvisioningJob,
+} from './provisioning-throttle';
+export type {
+  AccountLease,
+  BudgetDecision,
+  GlobalRateState,
+  ProvisioningThrottleConfig,
+  ProvisioningThrottleVars,
+  StartGateDecision,
+  StepGateDecision,
+} from './provisioning-throttle';
+
+export {
   beginNotionAuthorization,
   exchangeNotionAuthorizationCode,
   finishNotionCallback,
@@ -297,7 +339,7 @@ export type {
 
 export { LANDING_PAGE } from './landing-page';
 
-export interface Env {
+export interface Env extends ProvisioningThrottleVars {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
   JOBS: KVNamespace;
   /** Work queue for resumable provisioning jobs. */
@@ -345,10 +387,10 @@ const HTML_HEADERS = {
   'cache-control': 'no-store',
 };
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: JSON_HEADERS,
+    headers: { ...JSON_HEADERS, ...headers },
   });
 }
 
@@ -651,6 +693,15 @@ function authError(error: unknown): Response {
     if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
     return json(body, error.status);
   }
+  if (error instanceof ProvisioningGateRefusedError) {
+    // A refused start is not a failure of the flow: the account already has
+    // its one provisioning in flight, or the app-wide mutation budget is
+    // spent. Both answers carry the same Retry-After contract GitHub uses.
+    return json({
+      error: error.reason === 'account_busy' ? 'github_provisioning_already_active' : 'github_rate_limited',
+      retry_after_seconds: error.retryAfterSeconds,
+    }, error.status, { 'retry-after': String(error.retryAfterSeconds) });
+  }
   if (error instanceof GithubActionsSecretsError) {
     return json({ error: error.code }, error.status);
   }
@@ -735,27 +786,83 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       // passed to KV. The GitHub code is likewise never persisted.
       const authenticatedUser = await getAuthenticatedGithubUser(accessToken);
       if (authenticatedUser.accountType !== 'User') throw new Error('github_organization_installation_not_supported');
-      // GitHub normally includes installation_id during OAuth-on-install, but
-      // the OAuth callback contract also permits code-only callbacks. Discover
-      // this App's installation from the authenticated user's installations in
-      // that case rather than trusting an unverified query parameter.
-      if (!selectedInstallationId) {
-        selectedInstallationId = await findUserInstallation(accessToken, env.GITHUB_APP_ID as string);
+      const jobs = env.JOBS;
+      const throttleConfig = provisioningThrottleConfig(env);
+      const start = await acquireProvisioningStart(jobs, { accountId: authenticatedUser.id, jobId: record.jobId }, throttleConfig, Date.now());
+      if (!start.granted) throw new ProvisioningGateRefusedError(start);
+      // L5: the lease belongs to this request until the job record is durably
+      // saved; from then on the job owns it and its first queue gate pass
+      // renews it. If anything below fails, release it before returning, so a
+      // crashed request never locks the account out for a full TTL.
+      let leaseHandedOff = false;
+      try {
+        // GitHub normally includes installation_id during OAuth-on-install, but
+        // the OAuth callback contract also permits code-only callbacks. Discover
+        // this App's installation from the authenticated user's installations in
+        // that case rather than trusting an unverified query parameter.
+        if (!selectedInstallationId) {
+          selectedInstallationId = await findUserInstallation(accessToken, env.GITHUB_APP_ID as string);
+        }
+        const userInstallation = await getUserInstallation(accessToken, selectedInstallationId);
+        identity = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
+        // Generation happens while the short-lived OAuth token is in memory:
+        // creating a repository from the template requires user-to-server
+        // authentication. An earlier attempt's generated repository is reused
+        // instead of duplicated. Only non-secret destination and repository
+        // identity metadata is retained in the job record.
+        const ownedRepositories = await listOwnedGithubRepositories(accessToken);
+        ({ destination: repository, identity: generatedRepository } = await generateOrReuseRepository(
+          accessToken,
+          identity.login,
+          ownedRepositories,
+          fetch,
+          {
+            beforeCreate: async () => {
+              const budget = await consumeGlobalMutationBudget(jobs, throttleConfig, Date.now(), Math.random);
+              if (!budget.admitted) {
+                throw new ProvisioningGateRefusedError({
+                  granted: false,
+                  reason: budget.reason,
+                  retryAfterSeconds: budget.delaySeconds,
+                });
+              }
+            },
+          },
+        ));
+        if (!identity || !repository || !generatedRepository) return json({ error: 'github_identity_missing' }, 400);
+
+        // Everything after this point — verifying the generated repository is
+        // readable, patching its config, enabling Pages, dispatching and
+        // awaiting the Notion sync, and awaiting the resulting deploy — no
+        // longer needs the short-lived OAuth token in memory: each step mints
+        // its own installation token from `selectedInstallationId`, a durable,
+        // non-secret identifier. So it moves off this request and onto the
+        // durable provisioning queue, which can retry any step independently
+        // and survives this Worker restarting mid-pipeline. The queue is not
+        // told about the job here: the Notion callback enqueues it once the
+        // repository's Actions secrets exist (see `continueNotionOnboarding`).
+        const job = createProvisioningJob({
+          jobId: record.jobId,
+          installationId: selectedInstallationId,
+          identity,
+          repository,
+          generatedRepository,
+          now: Date.now(),
+        });
+        await saveProvisioningJob(env.JOBS, job);
+        await env.JOBS.put(
+          stateKey(payload.nonce),
+          JSON.stringify({ ...record, phase: 'consumed', installationId: selectedInstallationId, identity }),
+          { expirationTtl: STATE_REPLAY_TTL_SECONDS },
+        );
+        leaseHandedOff = true;
+
+        const notionAuthorization = new URL('/connect/notion', request.url);
+        notionAuthorization.searchParams.set('job_id', job.jobId);
+        return Response.redirect(notionAuthorization.toString(), 302);
+      } finally {
+        if (!leaseHandedOff) await releaseProvisioningLeaseIfOwned(jobs, authenticatedUser.id, record.jobId);
       }
-      const userInstallation = await getUserInstallation(accessToken, selectedInstallationId);
-      const installationIdentityForUser = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
-      identity = installationIdentityForUser;
-      // Generation happens while the short-lived OAuth token is in memory:
-      // creating a repository from the template requires user-to-server
-      // authentication. An earlier attempt's generated repository is reused
-      // instead of duplicated. Only non-secret destination and repository
-      // identity metadata is retained in the job record.
-      const ownedRepositories = await listOwnedGithubRepositories(accessToken);
-      ({ destination: repository, identity: generatedRepository } = await generateOrReuseRepository(
-        accessToken,
-        identity.login,
-        ownedRepositories,
-      ));
     } else {
       // This supports a setup callback arriving before the OAuth callback. The
       // App JWT proves that the installation belongs to this App; the later
@@ -771,36 +878,6 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       await env.JOBS.put(stateKey(payload.nonce), JSON.stringify(nextRecord), { expirationTtl: STATE_REPLAY_TTL_SECONDS });
       return json({ status: 'awaiting_authorization', job_id: record.jobId }, 202);
     }
-
-    if (!identity || !repository || !generatedRepository) return json({ error: 'github_identity_missing' }, 400);
-
-    // Everything after this point — verifying the generated repository is
-    // readable, patching its config, enabling Pages, dispatching and
-    // awaiting the Notion sync, and awaiting the resulting deploy — no
-    // longer needs the short-lived OAuth token in memory: each step mints
-    // its own installation token from `selectedInstallationId`, a durable,
-    // non-secret identifier. So it moves off this request and onto the
-    // durable provisioning queue, which can retry any step independently
-    // and survives this Worker restarting mid-pipeline. The queue is not
-    // told about the job here: the Notion callback enqueues it once the
-    // repository's Actions secrets exist (see `continueNotionOnboarding`).
-    const job = createProvisioningJob({
-      jobId: record.jobId,
-      installationId: selectedInstallationId,
-      identity,
-      repository,
-      generatedRepository,
-      now: Date.now(),
-    });
-    await saveProvisioningJob(env.JOBS, job);
-    await env.JOBS.put(
-      stateKey(payload.nonce),
-      JSON.stringify({ ...record, phase: 'consumed', installationId: selectedInstallationId, identity }),
-      { expirationTtl: STATE_REPLAY_TTL_SECONDS },
-    );
-    const notionAuthorization = new URL('/connect/notion', request.url);
-    notionAuthorization.searchParams.set('job_id', job.jobId);
-    return Response.redirect(notionAuthorization.toString(), 302);
   } catch (error) {
     return authError(error);
   }

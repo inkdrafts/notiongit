@@ -371,4 +371,84 @@ describe('generateOrReuseRepository', () => {
     await expect(generateOrReuseRepository(USER_TOKEN, 'alice', [], fetcher))
       .rejects.toBeInstanceOf(GithubGenerateError);
   });
+
+  test('beforeCreate runs immediately before each generate POST and never on the reuse path', async () => {
+    const events: string[] = [];
+    const { fetcher } = scriptedFetch([
+      {
+        match: (request) => request.url.endsWith('/commits/main'),
+        respond: () => {
+          events.push('template-head');
+          return jsonResponse(200, { sha: 'template-sha', commit: { tree: { sha: 'template-tree-sha' } } });
+        },
+      },
+      {
+        match: (request) => request.method === 'POST',
+        respond: () => {
+          events.push('post');
+          return jsonResponse(201, summary({ name: 'alice.github.io' }));
+        },
+      },
+    ]);
+
+    await generateOrReuseRepository(USER_TOKEN, 'alice', [], fetcher, {
+      beforeCreate: async () => { events.push('beforeCreate'); },
+    });
+    expect(events.filter((event) => event !== 'template-head')).toEqual(['beforeCreate', 'post']);
+
+    const reused = await generateOrReuseRepository(
+      USER_TOKEN,
+      'alice',
+      [summary({ name: 'alice-inkdrafts' })],
+      fetcher,
+      { beforeCreate: async () => { events.push('beforeCreate-reuse'); } },
+    );
+    expect(reused.identity.reused).toBe(true);
+    expect(events).not.toContain('beforeCreate-reuse');
+  });
+
+  test('a collision-advanced candidate pays beforeCreate again before its own POST', async () => {
+    const events: string[] = [];
+    const { fetcher } = scriptedFetch([
+      {
+        match: (request) => request.url.endsWith('/commits/main'),
+        respond: () => jsonResponse(200, { sha: 'template-sha', commit: { tree: { sha: 'template-tree-sha' } } }),
+      },
+      {
+        match: (request) => request.method === 'POST' && (request.body as { name?: string }).name === 'alice.github.io',
+        respond: () => {
+          events.push('post:alice.github.io');
+          return jsonResponse(422, { message: 'name already exists on this account' });
+        },
+      },
+      {
+        match: (request) => request.method === 'GET',
+        respond: () => jsonResponse(200, summary({ name: 'occupied', description: 'unrelated' })),
+      },
+      {
+        match: (request) => request.method === 'POST',
+        respond: () => {
+          events.push('post:alice-inkdrafts');
+          return jsonResponse(201, summary({ name: 'alice-inkdrafts' }));
+        },
+      },
+    ]);
+
+    const { destination } = await generateOrReuseRepository(USER_TOKEN, 'alice', [], fetcher, {
+      beforeCreate: async () => { events.push('beforeCreate'); },
+    });
+    expect(destination.name).toBe('alice-inkdrafts');
+    expect(events).toEqual(['beforeCreate', 'post:alice.github.io', 'beforeCreate', 'post:alice-inkdrafts']);
+  });
+
+  test('a beforeCreate refusal propagates without issuing any generate POST', async () => {
+    const { fetcher, requests } = scriptedFetch([]);
+
+    await expect(generateOrReuseRepository(USER_TOKEN, 'alice', [], fetcher, {
+      beforeCreate: async () => { throw new Error('budget refused'); },
+    })).rejects.toThrow('budget refused');
+    // The template-head read precedes the create loop; the refusal must stop
+    // every content-creating call.
+    expect(requests.every((request) => request.method !== 'POST')).toBe(true);
+  });
 });

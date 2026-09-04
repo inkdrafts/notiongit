@@ -229,6 +229,92 @@ adjacent to an in-flight operation — is written with the same
 jobs and their transient state are removed on KV's own schedule rather than
 needing a separate sweep.
 
+## Provisioning throttle and per-account quota
+
+All provisioning mutations — everything that creates or changes content on
+GitHub — pass through two gates owned by `provisioning-throttle.ts`, guarding
+GitHub's app-wide secondary rate limits (~80 mutations per minute, ~500 per
+hour) with the existing `JOBS` KV namespace and no Durable Object.
+
+**What gates where.** The synchronous onboarding callback gates twice: at
+its very start, as soon as the authenticated account id exists and before
+any further token spend (`acquireProvisioningStart`), and once per real
+generate POST via `generateOrReuseRepository`'s `beforeCreate` hook, which
+consumes the global budget immediately before each POST fires
+(`consumeGlobalMutationBudget`). The queue consumer gates every step before
+minting its installation token (`gateProvisioningStep`): every pass renews
+the account lease — so a job that spends minutes inside one inline poll
+never outlives its lease — but only the content-creating steps
+`patch_config`, `configure_pages`, and `dispatch_sync` consume global
+budget. Reads and polls (`verify_repository`, `await_sync`,
+`await_deploy_build`, `verify_deploy`) are free. Reuse never spends budget:
+a callback that adopts an existing repository fires no generate POST, and
+re-running an idempotent step that turns out to need no change still paid
+only its gate check.
+
+**The lease is the per-account quota.** `github:account-lease:<account id>`
+names the one job allowed to provision for a GitHub account while it lives
+(`leaseTtlSeconds`, renewed at every queue step, released the moment the job
+reaches a terminal status). Capacity one is the honest quota for this
+product: every attempt converges on the same reuse-biased destination
+repository, so admitting spaced-out concurrent provisionings for one account
+would buy nothing except duplicate GitHub work — and the lease doubles as
+the anti-replay quota, turning a replayed or duplicated callback into a 409
+`github_provisioning_already_active` instead of a second round of mutations.
+A wedged job (one that stopped renewing) recovers through the TTL alone: the
+next *sync-path* contender finds the lease expired — or live but naming a
+job record that is missing or terminal — and breaks it. A queue-side job
+that finds a foreign live lease is instead superseded: it terminal-fails
+with `github_provisioning_superseded` and never steals the lease.
+
+**Global budget semantics.** `github:rate:global` holds both fixed-window
+counters (minute and hour) in one key, written only by
+`consumeGlobalMutationBudget`, and only for real content-creating calls —
+the sync generate and the three queue mutations. The increment is written
+before the external call fires, so a crash in between over-counts, the
+conservative direction; there is no decrement or refund path anywhere. The
+read-modify-write is serialized per key inside an isolate by a promise-chain
+mutex, which makes admission exact within one isolate — and deterministic
+in the tests. Across isolates KV is eventually consistent: each racing
+isolate can commit at most one admission per window that the others never
+saw, so the honest worst case is `budget + 32 − 1` per window at 32 racing
+isolates. The defaults (30/240) stay under GitHub's ceilings even at that
+bound (61/min, 271/hour); the ceilings exist so misconfiguration cannot do
+worse. A counter that arrives unparseable fails closed — refusing a
+mutation that might have been admitted only delays provisioning, and the
+state's two-hour TTL bounds the outage.
+
+**Operator variables** (wrangler `[vars]`, all environments; a
+present-but-invalid value — non-integer, NaN, ≤ 0 — fails the deploy's
+config parse by throwing, valid values are clamped):
+
+| Variable | Default | Clamp | Meaning |
+| --- | --- | --- | --- |
+| `PROVISIONING_MUTATIONS_PER_MINUTE` | `30` | ≤ 60 | Global content-creating mutations per fixed minute window |
+| `PROVISIONING_MUTATIONS_PER_HOUR` | `240` | ≤ 400 | Global content-creating mutations per fixed hour window |
+| `PROVISIONING_LEASE_TTL_SECONDS` | `1800` | 60–86400 | Per-account lockout bound; also how long a wedged job blocks its account |
+
+**Wait/resume guarantee.** A refused gate pass is free: no token minted, no
+provider call, no attempt consumed, no lock held. The job is persisted
+`queued` and unlocked with a wait breadcrumb (`reason: 'global_throttled'`
+plus times — never identity or error text), and the continuation is handed
+to a *fresh* queue message carrying `delaySeconds` — the next window
+boundary plus margin for budget waits, jittered, floored at 1s. A fresh
+message is a new delivery, so waiting can never exhaust the consumer's
+`max_retries = 6` platform budget and dead-letter a healthy job; the same
+transport carries a step failure that arrives with GitHub's own
+`Retry-After`, at the provider's own pacing (± 5% jitter), under its own
+much larger ceiling (`PROVISIONING_RATE_LIMIT_MAX_ATTEMPTS` = 24) so that
+honoring GitHub's pacing cannot dead-letter the job through the regular
+five-attempt ceiling. The breadcrumb clears the moment the step next books
+and on every terminal save, so a record never shows a stall that has ended.
+`test/provisioning-load.test.ts` drives the synthetic version of this
+end-to-end: several accounts × several jobs through both gates over a
+budget far smaller than the workload, asserting every job reaches a
+terminal status, every window's observed mutations stay within the
+configured budgets, every wait or redelivery carries a delay of at least
+one second, and nothing dead-letters with a throttle code.
+
 ## GitHub Pages provisioning
 
 The `configure_pages` queue step calls the Pages API with `build_type:
