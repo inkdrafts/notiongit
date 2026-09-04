@@ -329,6 +329,17 @@ export async function awaitGeneratedRepositoryCommit(
   throw new GithubGenerateError('github_generate_timeout', 504);
 }
 
+export interface GenerateOrReuseOptions {
+  /**
+   * Invoked immediately before EACH actual `POST /generate` (inside the
+   * collision-retry loop — every candidate POST is a real content-creating
+   * call). Throw to refuse; the refusal propagates without further GitHub
+   * calls. Reuse paths never invoke it: adopting an existing repository
+   * spends zero content-creation budget.
+   */
+  beforeCreate?: () => Promise<void>;
+}
+
 /**
  * Reuse an earlier InkDrafts-generated repository when one exists, otherwise
  * create one from the template with deterministic retry-on-collision.
@@ -338,6 +349,7 @@ export async function generateOrReuseRepository(
   login: string,
   ownedRepositories: GithubRepositorySummary[],
   fetcher: typeof fetch = fetch,
+  options: GenerateOrReuseOptions = {},
 ): Promise<{ destination: RepositoryDestination; identity: GeneratedRepositoryIdentity }> {
   const reusable = findReusableGeneratedRepository(ownedRepositories, login);
   if (reusable) {
@@ -358,6 +370,7 @@ export async function generateOrReuseRepository(
       ownedNames,
       async (candidate) => {
         try {
+          await options.beforeCreate?.();
           return await generateRepositoryFromTemplate(accessToken, candidate, fetcher);
         } catch (error) {
           if (isGithubRepositoryNameCollision(error)) {

@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  accountLeaseKey,
   createProvisioningJob,
   createRepositoryWithRetry,
   GENERATED_REPOSITORY_DESCRIPTION,
   GithubRepositoryNameCollisionError,
+  GLOBAL_RATE_KEY,
   isValidGithubRepositoryName,
   route,
   saveProvisioningJob,
@@ -12,6 +14,7 @@ import {
   selectGithubRepositoryDestination,
   selectRepositoryDestination,
   type Env,
+  type GlobalRateState,
   type ProvisioningJob,
   type ProvisioningMessage,
 } from '../src/index';
@@ -129,6 +132,11 @@ class MemoryKV {
   async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
     this.values.set(key, value);
     if (options?.expirationTtl !== undefined) this.ttls.set(key, options.expirationTtl);
+  }
+
+  async delete(key: string): Promise<void> {
+    this.values.delete(key);
+    this.ttls.delete(key);
   }
 
   entries(): string[] {
@@ -611,6 +619,189 @@ describe('GitHub App install and authorize flow', () => {
     expect(await kv.get('github:onboarding-job:job-123')).toBeNull();
     expect(kv.entries().join('\n')).not.toContain('user-token');
     expect(queue.sent).toEqual([]);
+  });
+
+  test('refuses the callback with 429 when the global mutation budget is spent, before any list or generate call', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    const { state } = await getInstallState(env);
+    const exhausted: GlobalRateState = {
+      version: 1,
+      minuteBucket: Math.floor(Date.now() / 60_000),
+      hourBucket: Math.floor(Date.now() / 3_600_000),
+      minuteCount: 30,
+      hourCount: 100,
+    };
+    await kv.put(GLOBAL_RATE_KEY, JSON.stringify(exhausted), { expirationTtl: 7200 });
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const request = new Request(input, init);
+      requests.push(`${request.method} ${request.url}`);
+      if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+      if (request.url === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
+      throw new Error(`unexpected URL: ${request.url}`);
+    }) as typeof fetch;
+
+    try {
+      const response = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(response.status).toBe(429);
+      const body = await response.json() as Record<string, unknown>;
+      expect(body.error).toBe('github_rate_limited');
+      expect(body.retry_after_seconds as number).toBeGreaterThanOrEqual(1);
+      expect(body.retry_after_seconds as number).toBeLessThanOrEqual(60);
+      expect(response.headers.get('retry-after')).toBe(String(body.retry_after_seconds));
+
+      // Only the code exchange and the identity read ran; nothing was
+      // written — not a job record, not a lease, not a consumed state.
+      expect(requests).toEqual([
+        'POST https://github.com/login/oauth/access_token',
+        'GET https://api.github.com/user',
+      ]);
+      expect(queue.sent).toEqual([]);
+      const persisted = kv.entries().join('\n');
+      expect(persisted).not.toContain('github:onboarding-job:job-123');
+      expect(persisted).not.toContain('github:account-lease:42');
+      expect(persisted).not.toContain('user-token');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('a second onboarding for an account whose provisioning is live is refused as already active', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    // A second onboarding session binds a different job id; give it the same
+    // validated Notion template so the refusal is the lease's doing.
+    const resolution = await kv.get('notion:template-resolution:job-123', 'json');
+    await kv.put(
+      'notion:template-resolution:job-456',
+      JSON.stringify({ ...(resolution as Record<string, unknown>), jobId: 'job-456' }),
+      { expirationTtl: 24 * 60 * 60 },
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+      if (request.url === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
+      if (request.url === 'https://api.github.com/user/installations/123') return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+      if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/generate') return Response.json(generatedRepositoryBody('alice.github.io'), { status: 201 });
+      throw new Error(`unexpected URL: ${request.url}`);
+    }) as typeof fetch;
+
+    const stateFor = async (jobId: string): Promise<string> => {
+      const begin = await route(new Request(`https://example.com/connect/github?job_id=${jobId}`), env);
+      expect(begin.status).toBe(302);
+      return new URL(begin.headers.get('location')!).searchParams.get('state')!;
+    };
+
+    try {
+      const first = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(await stateFor('job-123'))}&code=one-time-code&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(first.status).toBe(202);
+      expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-123' });
+
+      const second = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(await stateFor('job-456'))}&code=one-time-code&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(second.status).toBe(409);
+      const body = await second.json() as Record<string, unknown>;
+      expect(body.error).toBe('github_provisioning_already_active');
+      expect(body.retry_after_seconds as number).toBeGreaterThanOrEqual(1);
+      expect(second.headers.get('retry-after')).toBe(String(body.retry_after_seconds));
+      // The live job keeps the account's single slot and no second job was
+      // created or enqueued for it.
+      expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-123' });
+      expect(await kv.get('github:onboarding-job:job-456')).toBeNull();
+      expect(queue.sent).toEqual([{ jobId: 'job-123' }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('a generation failure releases the account lease before the error surfaces', async () => {
+    const { response, kv } = await runProvisioningCallback({
+      generate: [{ status: 500 }],
+    });
+
+    expect(response.status).toBe(502);
+    expect(await kv.get(accountLeaseKey(42))).toBeNull();
+  });
+
+  test('a different account provisions independently of a lease held by another account', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    // Account 42 has a live lease naming a queued job — an onboarding in flight.
+    const job = createProvisioningJob({
+      jobId: 'job-123',
+      installationId: 123,
+      identity: { id: 42, login: 'alice', accountType: 'User' },
+      repository: { name: 'alice.github.io', url: 'https://alice.github.io', baseurl: '', kind: 'apex' },
+      generatedRepository: {
+        id: 1001,
+        fullName: 'alice/alice.github.io',
+        name: 'alice.github.io',
+        htmlUrl: 'https://github.com/alice/alice.github.io',
+        defaultBranch: 'main',
+        templateFullName: 'inkdrafts/notiongit-template',
+        templateHeadSha: null,
+        templateHeadTreeSha: null,
+        headSha: null,
+        headTreeSha: null,
+        reused: false,
+      },
+      now: Date.now(),
+    });
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, job);
+    await kv.put(accountLeaseKey(42), JSON.stringify({ version: 1, jobId: 'job-123', expiresAt: Date.now() + 600_000 }), { expirationTtl: 1800 });
+    // Bob's onboarding session binds its own job id; give it the same
+    // validated Notion template so it gets past the preflight.
+    const resolution = await kv.get('notion:template-resolution:job-123', 'json');
+    await kv.put(
+      'notion:template-resolution:job-789',
+      JSON.stringify({ ...(resolution as Record<string, unknown>), jobId: 'job-789' }),
+      { expirationTtl: 24 * 60 * 60 },
+    );
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
+      if (request.url === 'https://api.github.com/user') return Response.json({ id: 43, login: 'bob', type: 'User' });
+      if (request.url === 'https://api.github.com/user/installations/123') return Response.json({ account: { id: 43, login: 'bob', type: 'User' }, suspended_at: null });
+      if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
+      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/generate') return Response.json(generatedRepositoryBody('bob.github.io'), { status: 201 });
+      throw new Error(`unexpected URL: ${request.url}`);
+    }) as typeof fetch;
+
+    try {
+      const begin = await route(new Request('https://example.com/connect/github?job_id=job-789'), env);
+      const state = new URL(begin.headers.get('location')!).searchParams.get('state')!;
+      const response = await route(
+        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
+        env,
+      );
+      expect(response.status).toBe(202);
+      expect(await response.json()).toMatchObject({ github: { id: 43, login: 'bob' } });
+      // Bob got his own lease; Alice's in-flight provisioning kept hers.
+      expect(JSON.parse(await kv.get(accountLeaseKey(43)) as string)).toMatchObject({ jobId: 'job-789' });
+      expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-123' });
+      expect(queue.sent).toEqual([{ jobId: 'job-789' }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test.each([

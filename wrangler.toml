@@ -11,6 +11,12 @@ libsodium-raw = "./spikes/libsodium-workers/node_modules/libsodium/dist/modules-
 [vars]
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
+# Provisioning throttle. GitHub's app-wide secondary limits are ~80
+# mutations/min and ~500/hour; provisioningThrottleConfig clamps these to
+# ceilings inside those bounds whatever an operator sets here.
+PROVISIONING_MUTATIONS_PER_MINUTE = "30"
+PROVISIONING_MUTATIONS_PER_HOUR = "240"
+PROVISIONING_LEASE_TTL_SECONDS = "1800"
 
 # Same live namespace as [env.production] below — this repo's top-level
 # config and env.production share the Worker name "notiongit". Local
@@ -51,6 +57,10 @@ workers_dev = true
 [env.staging.vars]
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
+# Same provisioning throttle settings and clamps as the top-level [vars].
+PROVISIONING_MUTATIONS_PER_MINUTE = "30"
+PROVISIONING_MUTATIONS_PER_HOUR = "240"
+PROVISIONING_LEASE_TTL_SECONDS = "1800"
 
 [[env.staging.kv_namespaces]]
 binding = "JOBS"
@@ -74,6 +84,10 @@ workers_dev = true
 [env.production.vars]
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
+# Same provisioning throttle settings and clamps as the top-level [vars].
+PROVISIONING_MUTATIONS_PER_MINUTE = "30"
+PROVISIONING_MUTATIONS_PER_HOUR = "240"
+PROVISIONING_LEASE_TTL_SECONDS = "1800"
 
 [[env.production.kv_namespaces]]
 binding = "JOBS"
