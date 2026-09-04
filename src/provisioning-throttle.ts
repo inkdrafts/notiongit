@@ -75,6 +75,7 @@ export const PROVISIONING_ADMISSION_STAGES = [
   'queue_await_sync',
   'queue_await_deploy_build',
   'queue_verify_deploy',
+  'status_rerun',
 ] as const;
 
 export type ProvisioningAdmissionStage = (typeof PROVISIONING_ADMISSION_STAGES)[number];
@@ -528,7 +529,7 @@ const keyLocks = new Map<string, Promise<unknown>>();
  * The residual race is cross-isolate only (KV eventual consistency) and is
  * bounded by budget headroom, never claimed away.
  */
-function withKeyLock<T>(key: string, work: () => Promise<T>): Promise<T> {
+export function withKeyLock<T>(key: string, work: () => Promise<T>): Promise<T> {
   // A rejected predecessor must not poison the chain: work runs either way.
   const previous = keyLocks.get(key) ?? Promise.resolve();
   const result = previous.then(work, work);
@@ -766,8 +767,8 @@ export async function admitProvisioningRequest(
   config: ProvisioningAdmissionConfig,
   params: { request: Request; jobId: string; hmacSecret: string },
   nowMs: number,
+  stage: ProvisioningAdmissionStage = 'github_connect',
 ): Promise<ProvisioningAdmissionDecision> {
-  const stage = 'github_connect';
   const control = await controlDecision(env.JOBS, config, stage, nowMs);
   if (control.action !== 'allow') return recordAdmissionDecision(env, config, control, params, nowMs);
 

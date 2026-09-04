@@ -382,6 +382,48 @@ record carries the non-secret run id, run URL, conclusion, commit sha,
 build id, and build status. The progress projection reads the job record,
 never the reverse: a `GET /progress` read is read-only by construction.
 
+## Post-install status page
+
+After provisioning, `GET /status` is the owner's surface for the last sync and
+publish result, a manual re-run, and disconnect guidance. It is built on a
+derived-state model: the worker keeps no durable account-to-site binding, so
+every render re-derives the site from GitHub — the installation is re-read
+with the App JWT and cross-checked against the session by account id, an
+installation token is minted on the spot, the installation's repositories are
+matched against the InkDrafts marker (`findReusableGeneratedRepository`), and
+the workflow's latest `workflow_dispatch` run and latest Pages build are read
+once each (a listing that does not fit the five-page cap refuses as
+unavailable rather than rendering a partial list as "no site"). Uninstall,
+repository rename, and marker edits therefore self-heal on the next visit
+instead of needing reconciliation.
+
+Ownership is re-proved rather than stored: the provisioning job record
+expires on a rolling 24-hour TTL and has no user-to-job index, so it could not
+identify a returning owner even if it were allowed to — job records are never
+an input to status. A signed, hard-expiring session cookie (`__Host-`,
+identity fields only, no secrets) is issued by a pure OAuth authorize leg that
+dispatches off the existing GitHub callback by the signed state's purpose,
+and the user access token dies inside that callback request. The projection
+(`projectSiteStatus`) is a pure function from the GitHub reads to a closed
+page-state union, so every failure mode — no site, revoked installation,
+suspended installation, GitHub unreachable — has a named page, and a failed
+read is distinguished from a successful read with zero rows.
+
+`POST /status/rerun` gates in order on Origin, session, a signed form token,
+the shared IP-burst window (`status_rerun` admission stage), discovery, a
+live-run convergence check (unfiltered by trigger, so a scheduled run
+mid-flight also converges; a run stuck non-completed past an hour stops
+gating), the global mutation budget, and a per-account fixed window
+(`status:rerun:`, 300s spacing, 10 per 24h, written before the dispatch so a
+crash overcounts, and after the budget so an infrastructure refusal never
+spends one of the account's slots), then dispatches the same
+`sync-notion.yml` workflow with `allow_bulk_delete: 'false'` hardcoded in
+`dispatchNotionSyncWorkflow`. Sync results render from the run conclusion
+(`success` is the only conclusion that can render as success) and say so on
+the page: the versioned run summary is emitted only into in-run step outputs
+with no REST read-back, so the worker never parses one today;
+`parseSafeSummary` is the tested parse guard for a future summary channel.
+
 ## Observability
 
 Every stage of the funnel — consent, enqueue, each step attempt, and the

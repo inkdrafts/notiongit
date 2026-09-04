@@ -11,6 +11,7 @@
  */
 
 import type { GithubFailureCode } from './failures';
+import type { GithubRepositorySummary } from './repository-naming';
 import { Secret } from './secret';
 
 export interface GithubAppAuthEnv {
@@ -181,4 +182,47 @@ export async function getAppInstallation(
   const body = await readJson<GithubInstallationAccount>(response);
   if (body === null) throw new GithubAppAuthError(502);
   return body;
+}
+
+const INSTALLATION_REPOSITORIES_MAX_PAGES = 5;
+
+/**
+ * List the installation's repositories with the fields repository selection
+ * and reuse need, capped at five pages of 100 so one status render stays
+ * bounded. A listing that will not fit inside the cap refuses instead of
+ * returning a prefix: a truncated list would render "no site found" for an
+ * installation whose marker repository sits beyond the cap, and a partial
+ * success is exactly the mislead the status projection refuses to make.
+ * Parse boundary: only `GithubRepositorySummary` fields leave this module,
+ * and the token is never included in an error.
+ */
+export async function listInstallationRepositories(
+  installationToken: string,
+  fetcher: typeof fetch = fetch,
+): Promise<GithubRepositorySummary[]> {
+  const summaries: GithubRepositorySummary[] = [];
+  let totalCount: number | null = null;
+  for (let page = 1; page <= INSTALLATION_REPOSITORIES_MAX_PAGES; page += 1) {
+    const response = await fetcher(`${GITHUB_API}/installation/repositories?per_page=100&page=${page}`, {
+      headers: githubHeaders(`Bearer ${installationToken}`),
+    });
+    if (response.status === 403 || response.status === 429) {
+      const retryAfter = retryAfterSeconds(response);
+      if (retryAfter !== null || response.status === 429) {
+        throw new GithubAppAuthError(429, retryAfter);
+      }
+    }
+    if (!response.ok) throw new GithubAppAuthError(response.status);
+    const body = await readJson<{ total_count?: unknown; repositories?: GithubRepositorySummary[] }>(response);
+    if (!Array.isArray(body?.repositories)) throw new GithubAppAuthError(502);
+    if (typeof body.total_count === 'number' && Number.isSafeInteger(body.total_count)) {
+      totalCount = body.total_count;
+    }
+    for (const repository of body.repositories) {
+      if (repository && typeof repository.name === 'string') summaries.push(repository);
+    }
+    if (body.repositories.length < 100) return summaries;
+  }
+  if (totalCount !== null && summaries.length < totalCount) throw new GithubAppAuthError(502);
+  return summaries;
 }

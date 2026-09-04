@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   awaitPagesBuildForCommit,
   getRepositoryMainHeadSha,
+  latestPagesBuild,
   verifyPublicSiteReachable,
   GithubDeployError,
 } from '../src/site-deployment';
@@ -79,6 +80,41 @@ describe('awaitPagesBuildForCommit', () => {
     }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(GithubDeployError);
     expect(JSON.stringify(error)).not.toContain('leaked-notion-title');
+  });
+});
+
+describe('latestPagesBuild', () => {
+  test('returns the latest build in whatever state it is', async () => {
+    const build = await latestPagesBuild(INSTALLATION_TOKEN, REPOSITORY, async (input, init) => {
+      const request = new Request(input, init);
+      expect(request.url).toBe(BUILDS_URL);
+      expect(request.headers.get('authorization')).toBe(`Bearer ${INSTALLATION_TOKEN}`);
+      return response(200, { url: '.../builds/7', status: 'building', commit: 'head-sha' });
+    });
+    expect(build).toEqual({ buildId: 7, status: 'building', commitSha: 'head-sha' });
+  });
+
+  test('null means the read succeeded and no build exists yet', async () => {
+    const build = await latestPagesBuild(INSTALLATION_TOKEN, REPOSITORY, async () => response(404));
+    expect(build).toBeNull();
+  });
+
+  test('a failed read throws so never-built stays distinguishable from cannot-tell', async () => {
+    await expect(latestPagesBuild(INSTALLATION_TOKEN, REPOSITORY, async () => response(500)))
+      .rejects.toMatchObject({ code: 'github_deploy_unavailable', status: 502 });
+    await expect(latestPagesBuild(INSTALLATION_TOKEN, REPOSITORY, async () => response(200, { status: 7 })))
+      .rejects.toMatchObject({ code: 'github_deploy_unavailable' });
+  });
+
+  test('never returns the build error message', async () => {
+    const build = await latestPagesBuild(INSTALLATION_TOKEN, REPOSITORY, async () => response(200, {
+      url: '.../builds/1',
+      status: 'errored',
+      commit: 'head-sha',
+      error: { message: 'Liquid error in _posts/leaked-notion-title.md' },
+    }));
+    expect(build).toEqual({ buildId: 1, status: 'errored', commitSha: 'head-sha' });
+    expect(JSON.stringify(build)).not.toContain('leaked-notion-title');
   });
 });
 
