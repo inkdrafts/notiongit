@@ -744,8 +744,17 @@ export async function statusRerun(request: Request, env: Partial<StatusEnv>): Pr
 
   const rerunWindow = await admitStatusRerun(JOBS, session.accountId, Date.now());
   if (!rerunWindow.admitted) {
-    const code = rerunWindow.reason === 'daily_cap' ? 'github_request_burst_limited' : 'github_rate_limited';
-    return refusedResponse(code, 429, rerunWindow.retryAfterSeconds);
+    // Status-specific copy: this window is the status page's own quota, not a
+    // provider or provisioning limit, so the registry copy would misname it.
+    const copy = rerunWindow.reason === 'spacing'
+      ? { title: 'That was quick', body: 'You just started a sync. Give it a few minutes before starting another.' }
+      : { title: 'That is all the syncs for today', body: 'This site has used its manual syncs for today. The scheduled sync still runs as usual.' };
+    return statusHtml(
+      statusRefusalPage({ ...copy, retryAfterSeconds: rerunWindow.retryAfterSeconds }),
+      429,
+      [],
+      rerunWindow.retryAfterSeconds,
+    );
   }
   const budget = await consumeGlobalMutationBudget(JOBS, provisioningThrottleConfig(env), Date.now(), Math.random);
   if (!budget.admitted) {
