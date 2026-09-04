@@ -60,6 +60,23 @@ installation token from the job's durable, non-secret `installationId`,
 passes it to exactly one step handler as a `Secret`, and discards it when the
 handler returns. No token of any kind is part of durable state.
 
+**Status surface.** `GET /status` serves an entry page, or — after a sign-in —
+re-derives the site from GitHub on every render. Signing in is a pure OAuth
+authorize leg (`/status?connect=1`): the worker signs a status-purpose state,
+sets the `__Host-status-state` nonce cookie, and redirects to GitHub. The
+shared `GET /auth/github/callback` dispatches on the state's signed purpose;
+the status finisher verifies the state and the cookie nonce together (the
+cleared cookie is the replay defense), exchanges the code, proves identity and
+the user's installation of the App fresh from GitHub, sets the
+`__Host-status-session` cookie — identity fields only, signed with the client
+secret — and redirects to `/status`. The user token and code die inside that
+request; the status read path performs zero KV writes. `POST /status/rerun`
+requires the session cookie, an Origin match, a signed form token, and the
+shared admission/budget gates, then dispatches the site's own sync workflow
+(`allow_bulk_delete: 'false'` hardcoded) after consuming the per-account
+window in §3. There is no durable account-to-site binding: uninstall, rename,
+and marker edits self-heal on the next render.
+
 ## 3. Retained state
 
 Every KV record the Worker writes, with every field. The only delete call in
@@ -80,6 +97,16 @@ reaches a terminal status (below); everything else is removal by TTL.
 | `provisioning:admission:burst:{digest}` | HMAC digest, window timestamps, count, and last job id | `PROVISIONING_REQUEST_BURST_WINDOW_SECONDS` | Request burst control; the raw network address never leaves the digest function |
 | `provisioning:admission:denial:{accountId}` | Account id, denial reason, and timestamps | `PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS` | Temporary hold after a suspended or provider-denied identity |
 | `provisioning:admission:audit:{jobId}:{stage}:{reason}` | Job id, optional account id or request digest, stage, decision, reason, and timestamps | `PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS` | One deduplicated operator audit per job, stage, and reason |
+| `status:rerun:{accountId}` | Rerun window: `version` (1), `windowStartedAt`, `lastRerunAt`, `count` | Remaining window seconds, 24h max | Manual sync re-run on the status page; written before the dispatch so a crash overcounts. Numeric account id only |
+
+The status surface also sets three browser cookies; none of them is retained
+server-side.
+
+| Cookie | Value | Lifetime | Purpose |
+| --- | --- | --- | --- |
+| `__Host-notion-oauth-state` | State nonce | 600s, cleared at the callback | Notion OAuth CSRF (see §2) |
+| `__Host-status-state` | Status authorize-leg nonce | 600s, cleared at the callback | Double-submit CSRF and replay defense; the signed state rides the redirect URL |
+| `__Host-status-session` | HMAC-signed `{v, k, accountId, login, installationId, exp}` | 28800s (8h) | Status sign-in; carries no secret — the signing key stays server-side |
 
 Queue payloads are exactly `{ jobId }` — the record in KV is the sole source
 of truth, so a message carries nothing else.
@@ -178,8 +205,9 @@ Run `bun test test/token-hygiene.test.ts`.
   casts acceptable; a second writer would need a parse boundary.
 - **State signing key reuse.** The OAuth client secrets double as state HMAC
   keys, so rotating `GITHUB_CLIENT_SECRET` invalidates every in-flight GitHub
-  state (and likewise for Notion). Rotation is safe when nothing is in
-  flight; a dedicated signing secret is the fix if that coupling ever hurts.
+  state and every status session cookie (and likewise for Notion). Rotation
+  is safe when nothing is in flight; status users just sign in again. A
+  dedicated signing secret is the fix if that coupling ever hurts.
 - **Infrastructure and deployment surfaces.** Cloudflare's queue, KV, and
   Workers internals, `wrangler`/dashboard secret storage, and CI secrets are
   trusted platforms outside this document's scope.
