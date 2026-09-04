@@ -5,12 +5,14 @@
  * scripts, images): the whole response is one self-contained document, which
  * keeps the accessibility/no-JS and performance-budget requirements trivially
  * true rather than something to verify separately. The only interactive
- * element is a plain link into `/connect/notion` — Notion-first onboarding is
- * intentional (see `docs/decisions/0002-notion-onboarding.md`).
+ * element is a plain link into `/connect/github` — GitHub-first onboarding is
+ * intentional: the Notion callback needs a repository to write the sync
+ * workflow's secrets into (issue #46).
  *
- * Deliberately does not link `/connect/github` or the App install page: the
- * GitHub App is public but stays unadvertised from inkdrafts.com until the M5
- * launch issue (`docs/github-app-runbook.md` "Registration status").
+ * Deliberately does not link the App install page directly: the GitHub App is
+ * public but stays unadvertised from inkdrafts.com until the M5 launch issue
+ * (`docs/github-app-runbook.md` "Registration status"), so the CTA goes
+ * through `/connect/github`, which mints signed state first.
  */
 
 const SITE_URL = 'https://inkdrafts.com/';
@@ -252,8 +254,8 @@ export const LANDING_PAGE = `<!doctype html>
         it in sync belong to your GitHub account from the moment they're
         created — your site keeps working even if InkDrafts disappears.
       </p>
-      <a class="cta" href="/connect/notion">Connect Notion to get started</a>
-      <p class="cta-note">Free GitHub Pages hosting. You'll connect GitHub in the next step.</p>
+      <a class="cta" href="/connect/github">Connect GitHub to get started</a>
+      <p class="cta-note">Free GitHub Pages hosting. You'll connect Notion in the next step.</p>
     </div>
   </section>
 
@@ -291,19 +293,20 @@ export const LANDING_PAGE = `<!doctype html>
       <h2 id="how-heading">How it works</h2>
       <ol class="steps">
         <li>
-          <h3>Connect Notion</h3>
-          <p>
-            Authorize InkDrafts to read the Notion template you duplicated, so
-            it can find your Pages and Posts databases. It only requests read
-            access and never edits your Notion content.
-          </p>
-        </li>
-        <li>
           <h3>Connect GitHub</h3>
           <p>
             Install the InkDrafts GitHub App to create a repository in your
-            account, enable free GitHub Pages hosting, and store the
-            encrypted secrets your repository's own sync Action needs.
+            account and enable free GitHub Pages hosting. The repository is
+            yours from the moment it is created.
+          </p>
+        </li>
+        <li>
+          <h3>Connect Notion</h3>
+          <p>
+            Authorize InkDrafts to read the Notion template you duplicated, so
+            it can find your Pages and Posts databases and store the encrypted
+            secrets your repository's own sync Action needs. It only requests
+            read access and never edits your Notion content.
           </p>
         </li>
         <li>

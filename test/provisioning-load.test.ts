@@ -317,7 +317,14 @@ describe('provisioning throttle under load', () => {
             generatedRepository: generatedIdentity,
             now: now(),
           });
-          await saveProvisioningJob(kv as unknown as KVNamespace, job);
+          // The start event compresses both callbacks: the GitHub callback
+          // creates the job, and the Notion callback writes the Actions
+          // secrets before handing the job to the queue. The consumer refuses
+          // to advance a job whose secrets are not yet durable.
+          await saveProvisioningJob(kv as unknown as KVNamespace, {
+            ...job,
+            data: { ...job.data, notionSecretsWrittenAt: now() },
+          });
         } catch (error) {
           if (error instanceof ProvisioningGateRefusedError) {
             // The callback's finally: nothing was enqueued, so the lease is

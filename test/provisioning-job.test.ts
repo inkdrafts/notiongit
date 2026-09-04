@@ -65,11 +65,11 @@ function baseParams(overrides: Partial<CreateProvisioningJobParams> = {}): Creat
 }
 
 describe('createProvisioningJob', () => {
-  test('starts every step pending with a queued, unlocked job', () => {
+  test('starts every step pending with an unlocked job waiting on Notion', () => {
     const job = createProvisioningJob(baseParams());
 
     expect(job.version).toBe(PROVISIONING_JOB_VERSION);
-    expect(job.status).toBe('queued');
+    expect(job.status).toBe('awaiting_notion');
     expect(job.lock).toBeNull();
     expect(job.completedAt).toBeNull();
     expect(job.createdAt).toBe(1_000);
@@ -84,6 +84,7 @@ describe('createProvisioningJob', () => {
       sync: null,
       syncDispatchMarker: null,
       deployment: null,
+      notionSecretsWrittenAt: null,
     });
   });
 
@@ -122,6 +123,7 @@ describe('nextPendingStep', () => {
 
 describe('isTerminalProvisioningStatus', () => {
   test.each([
+    ['awaiting_notion', false],
     ['queued', false],
     ['running', false],
     ['succeeded', true],

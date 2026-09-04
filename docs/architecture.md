@@ -61,6 +61,14 @@ credential rotation procedure are maintained in the
 
 ## Notion authorization continuation
 
+Notion authorization is the second half of onboarding: `GET /connect/notion`
+only starts for a `jobId` that `/auth/github/callback` already created a
+`ProvisioningJob` for, and answers `409 provisioning_job_missing` otherwise, so
+an old bookmark cannot walk a user through consent for a job with no repository
+to configure. GitHub-first ordering, and writing the Notion secrets from this
+second authorization rather than the queue, is
+[ADR 0005](decisions/0005-notion-secret-handoff.md).
+
 `GET /connect/notion` creates a ten-minute HMAC-signed state containing only a
 job reference and nonce. The nonce is replay-tracked in `JOBS` and copied into
 an HttpOnly, Secure, SameSite cookie so a callback from a different browser
@@ -94,12 +102,30 @@ non-duplicated authorization, an unreadable or empty root, and exhausted
  resolution record (`notion:template-resolution:<job id>`, same 24-hour TTL as
  every other record): normalized Pages/Posts database IDs plus each database's
  non-secret schema summary (property types and select/multi-select option
- names). `/connect/github` requires that record and revalidates it before
- issuing any GitHub authorization or provisioning call. No token, page title,
- or row content ever reaches it. The HTTP response contains only the job ID
- and whether template duplication occurred; failures return their distinct
- error code with non-secret details (missing roles, scanned count, or schema
- validation issues).
+ names). No token, page title, or row content ever reaches it.
+
+The continuation then spends the token a second time, in the same request: it
+mints an installation token from the job's `installationId` and writes
+`NOTION_TOKEN`, `NOTION_PAGES_DATABASE_ID`, and `NOTION_POSTS_DATABASE_ID` into
+the generated repository's Actions secrets (`actions-secrets.ts`). This is the
+only place the Notion token exists, so it is the only place those secrets can
+be written. The databases are resolved fresh on every authorization rather than
+read back from the resolution record: re-authorizing duplicates the template
+again, so a stored resolution can name databases the user is no longer writing
+in. Only once all three secrets are durably written does the job get a
+`notionSecretsWrittenAt` timestamp (a timestamp, never the values) and reach
+`PROVISIONING_QUEUE`. A secret write that fails partway leaves the job
+`awaiting_notion` with that field still null; the OAuth code is single-use, so
+recovery is a fresh `/connect/notion?job_id=...` authorization, which re-runs
+the whole write. A queue handoff that fails after the secrets are written also
+leaves the job `awaiting_notion` and answers `502 provisioning_handoff_failed`
+with a retry URL — re-authorizing then skips straight back to the handoff
+instead of rewriting anything.
+
+The HTTP response contains the job ID, whether template duplication occurred,
+and the non-secret repository and site URLs; failures return their distinct
+error code with non-secret details (missing roles, scanned count, or schema
+validation issues).
 
 ## Durable provisioning job queue
 
@@ -112,14 +138,14 @@ token, resolving identity, and generating (or reusing) the destination
 repository — GitHub requires user-to-server authentication for
 generate-from-template, so this step needs the OAuth token in memory and
 cannot be deferred. Once generation succeeds, the callback persists a
-`ProvisioningJob` record (`provisioning-job.ts`), enqueues `{ jobId }` to
-`PROVISIONING_QUEUE`, and responds `202` with only the identity and
-repository data known so far — the OAuth token and code are already out of
-scope by the time the response is written and are never queued or stored.
-If the enqueue itself fails, the job record is marked `dead_letter` with a
-`provisioning_enqueue_failed` step error before the request surfaces a 502,
-so durable state never shows a `queued` job that no message will ever
-process; restarting the flow creates a fresh job.
+`ProvisioningJob` record (`provisioning-job.ts`) with status `awaiting_notion`
+and redirects the browser to `/connect/notion?job_id=...` — the OAuth token and
+code are already out of scope by the time the response is written and are never
+queued or stored. The queue is not told about the job here. The Notion callback
+enqueues it, and only after writing the repository's three Actions secrets (see
+"Notion authorization continuation" above), so no step can run against a
+repository whose sync workflow would find no credentials. A job that a user
+abandons between the two authorizations simply expires with its record's TTL.
 
 Everything after generation — verifying the generated repository is
 readable, patching `_config.yml`, enabling Pages, dispatching and awaiting
@@ -329,6 +355,28 @@ outcome, `github_deploy_url_unreachable`, distinct from a build failure. The
 job reaches `status: "succeeded"` only after the public URL answers, and its
 record carries the non-secret run id, run URL, conclusion, commit sha,
 build id, and build status for a future progress UI.
+
+## Observability
+
+Every stage of the funnel — consent, enqueue, each step attempt, and the
+terminal job outcome — emits one typed event (`observability.ts`) correlated by
+the same random `jobId` that already keys the KV record and the queue message,
+so no second identifier and no user identity is needed to follow a job from
+consent to first deploy. Each event goes to two sinks: a structured
+`console.log` line, which Workers Logs ingests with no binding and which
+answers "what happened to this job", and the optional `PROVISIONING_METRICS`
+Analytics Engine dataset, which answers "how is the funnel doing" without
+scanning logs. Every event field is a closed error code, an enum, a boolean, or
+a number, and `OBSERVABILITY_EVENT_FIELDS` turns "no free-text field" into a
+typecheck rather than a convention — the canary tests in
+`test/observability.test.ts` push a token-bearing error through the real
+emission path and assert it reaches neither sink. Threshold alerting over the
+dataset (`observability-alerts.ts`) is wired into the `scheduled` handler and
+unit-tested, but `wrangler.toml` leaves its cron trigger commented out until
+the Analytics Engine SQL response shape is verified against a live dataset. The
+event schema, column map, dashboard queries, retention, access, and the triage
+runbook are in [`Observability`](observability.md); the two-sink decision is
+[ADR 0004](decisions/0004-observability.md).
 
 ## Deployment
 

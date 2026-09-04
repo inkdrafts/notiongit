@@ -1,16 +1,19 @@
 import { describe, expect, test } from 'bun:test';
+import sodium from 'libsodium-wrappers';
 
 import {
   accountLeaseKey,
+  continueNotionOnboarding,
   createProvisioningJob,
   createRepositoryWithRetry,
   GENERATED_REPOSITORY_DESCRIPTION,
   GithubRepositoryNameCollisionError,
   GLOBAL_RATE_KEY,
   isValidGithubRepositoryName,
+  loadNotionTemplateResolution,
+  NotionOAuthError,
   route,
   saveProvisioningJob,
-  saveNotionTemplateResolution,
   selectGithubRepositoryDestination,
   selectRepositoryDestination,
   type Env,
@@ -151,8 +154,10 @@ class MemoryKV {
 /** Captures every message sent to the provisioning queue, in order. */
 class MemoryQueue<T> {
   readonly sent: T[] = [];
+  failSends = false;
 
   async send(message: T): Promise<void> {
+    if (this.failSends) throw new Error('queue unavailable');
     this.sent.push(message);
   }
 
@@ -186,9 +191,8 @@ function generateThrowawayPrivateKey(): Promise<string> {
 async function githubEnv(
   kv = new MemoryKV(),
   queue = new MemoryQueue<ProvisioningMessage>(),
-  withValidatedTemplate = true,
 ): Promise<Partial<Env>> {
-  const env = {
+  return {
     JOBS: kv as unknown as KVNamespace,
     PROVISIONING_QUEUE: queue as unknown as Queue<ProvisioningMessage>,
     GITHUB_APP_ID: '4798518',
@@ -196,33 +200,9 @@ async function githubEnv(
     GITHUB_APP_PRIVATE_KEY: await generateThrowawayPrivateKey(),
     GITHUB_CLIENT_ID: 'client-id',
     GITHUB_CLIENT_SECRET: 'client-secret',
-    NOTION_CLIENT_ID: 'not-used',
-    NOTION_CLIENT_SECRET: 'not-used',
+    NOTION_CLIENT_ID: 'notion-client-id',
+    NOTION_CLIENT_SECRET: 'notion-client-secret',
   };
-  if (withValidatedTemplate) await saveNotionTemplateResolution(env.JOBS, {
-    version: 1,
-    jobId: 'job-123',
-    resolution: {
-      pagesDatabaseId: '11111111-1111-4111-8111-111111111111',
-      postsDatabaseId: '22222222-2222-4222-8222-222222222222',
-      templateSchemaVersion: 1,
-      scannedDatabaseCount: 2,
-      pagesSchema: {
-        databaseId: '11111111-1111-4111-8111-111111111111',
-        propertyTypes: {
-          Slug: 'rich_text', Type: 'select', 'Nav Order': 'number', 'Show in Nav': 'checkbox', Status: 'select',
-        },
-        optionNames: { Type: ['home', 'blog-list', 'blog', 'markdown'], Status: ['Draft', 'Published'] },
-      },
-      postsSchema: {
-        databaseId: '22222222-2222-4222-8222-222222222222',
-        propertyTypes: { Slug: 'rich_text', 'Publish Date': 'date', Tags: 'multi_select', Status: 'select' },
-        optionNames: { Status: ['Draft', 'Published'] },
-      },
-      resolvedAt: Date.now(),
-    },
-  });
-  return env;
 }
 
 async function getInstallState(env: Partial<Env>): Promise<{ state: string; jobId: string }> {
@@ -269,46 +249,6 @@ describe('HTTP foundation', () => {
 });
 
 describe('GitHub App install and authorize flow', () => {
-  test('blocks GitHub connection until Notion schema validation has completed', async () => {
-    const env = await githubEnv(new MemoryKV(), new MemoryQueue<ProvisioningMessage>(), false);
-
-    const response = await route(new Request('https://example.com/connect/github?job_id=job-123'), env);
-
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({
-      error: 'notion_template_not_validated',
-      message: 'Connect Notion and complete the Pages and Posts database check before connecting GitHub.',
-    });
-  });
-
-  test('rechecks the validated schema before exchanging the GitHub code', async () => {
-    const kv = new MemoryKV();
-    const env = await githubEnv(kv);
-    const { state } = await getInstallState(env);
-    await kv.put('notion:template-resolution:job-123', JSON.stringify({ version: 1, jobId: 'job-123' }));
-    const originalFetch = globalThis.fetch;
-    let providerCalls = 0;
-    globalThis.fetch = (async () => {
-      providerCalls += 1;
-      throw new Error('GitHub must not be contacted');
-    }) as typeof fetch;
-
-    try {
-      const response = await route(
-        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code`),
-        env,
-      );
-      expect(response.status).toBe(400);
-      expect(await response.json()).toEqual({
-        error: 'notion_template_not_validated',
-        message: 'Connect Notion and complete the Pages and Posts database check before connecting GitHub.',
-      });
-      expect(providerCalls).toBe(0);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
   test('creates a signed, expiring install URL bound to the onboarding job', async () => {
     const kv = new MemoryKV();
     const env = await githubEnv(kv);
@@ -319,7 +259,7 @@ describe('GitHub App install and authorize flow', () => {
     expect(kv.entries().join('\n')).not.toContain('client-secret');
   });
 
-  test('generates the repository from the template, queues the rest of provisioning, and records only non-secret identity', async () => {
+  test('generates the repository from the template, sends the browser on to Notion, and records only non-secret identity', async () => {
     const kv = new MemoryKV();
     const queue = new MemoryQueue<ProvisioningMessage>();
     const env = await githubEnv(kv, queue);
@@ -372,22 +312,8 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
         env,
       );
-      expect(callback.status).toBe(202);
-      expect(await callback.json()).toEqual({
-        ok: true,
-        status: 'provisioning',
-        job_id: 'job-123',
-        installation_id: 123,
-        github: { id: 42, login: 'alice' },
-        repository: {
-          name: 'alice.github.io',
-          url: 'https://alice.github.io',
-          baseurl: '',
-          id: 1001,
-          html_url: 'https://github.com/alice/alice.github.io',
-          default_branch: 'main',
-        },
-      });
+      expect(callback.status).toBe(302);
+      expect(callback.headers.get('location')).toBe('https://example.com/connect/notion?job_id=job-123');
       expect(generateBodies).toEqual([{
         name: 'alice.github.io',
         description: 'Notion-powered site published with InkDrafts',
@@ -395,13 +321,13 @@ describe('GitHub App install and authorize flow', () => {
         include_all_branches: false,
       }]);
 
-      // The rest of provisioning (Pages, config, sync, deploy) is now the
-      // durable queue's job, not this request's — see the "provisioning
-      // queue" describe block for those steps.
-      expect(queue.sent).toEqual([{ jobId: 'job-123' }]);
+      // Nothing is queued yet: the Notion callback writes the repository's
+      // Actions secrets and only then hands the job to the queue.
+      expect(queue.sent).toEqual([]);
 
       const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
-      expect(stored?.status).toBe('queued');
+      expect(stored?.status).toBe('awaiting_notion');
+      expect(stored?.data.notionSecretsWrittenAt).toBeNull();
       expect(stored?.data.pages).toBeNull();
       expect(stored?.data.sync).toBeNull();
       expect(stored?.data.deployment).toBeNull();
@@ -426,68 +352,6 @@ describe('GitHub App install and authorize flow', () => {
       expect(replay.status).toBe(400);
       expect(await replay.json()).toEqual({ error: 'github_state_replayed' });
       expect(requests).toHaveLength(6);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  test('records an enqueue failure on the job instead of leaving it queued forever', async () => {
-    class FailingQueue {
-      readonly sent: unknown[] = [];
-      async send(): Promise<void> {
-        throw new Error('queue unavailable');
-      }
-      async sendBatch(): Promise<void> {
-        throw new Error('MemoryQueue.sendBatch is not used by this project');
-      }
-    }
-    const kv = new MemoryKV();
-    const queue = new FailingQueue();
-    const env = await githubEnv(kv, queue as unknown as MemoryQueue<ProvisioningMessage>);
-    const { state } = await getInstallState(env);
-    const originalFetch = globalThis.fetch;
-
-    globalThis.fetch = (async (input, init) => {
-      const request = new Request(input, init);
-      if (request.url === 'https://github.com/login/oauth/access_token') {
-        return Response.json({ access_token: 'user-token', token_type: 'bearer' });
-      }
-      if (request.url === 'https://api.github.com/user') {
-        return Response.json({ id: 42, login: 'alice', type: 'User' });
-      }
-      if (request.url === 'https://api.github.com/user/installations/123') {
-        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
-      }
-      if (request.url.startsWith('https://api.github.com/user/repos?')) {
-        return Response.json([]);
-      }
-      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') {
-        return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
-      }
-      if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/generate') {
-        return Response.json(generatedRepositoryBody('alice.github.io'), { status: 201 });
-      }
-      throw new Error(`unexpected URL: ${request.url}`);
-    }) as typeof fetch;
-
-    try {
-      const callback = await route(
-        new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
-        env,
-      );
-      expect(callback.status).toBe(502);
-      expect(await callback.json()).toEqual({ error: 'github_authorization_unavailable' });
-
-      // The durable record must not sit `queued` with no message and no
-      // trace of why: the enqueue failure is marked on the job itself.
-      const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
-      expect(stored?.status).toBe('dead_letter');
-      expect(stored?.completedAt).not.toBeNull();
-      expect(stored?.steps.verify_repository.status).toBe('failed');
-      expect(stored?.steps.verify_repository.lastError).toEqual({
-        code: 'provisioning_enqueue_failed',
-        retryable: false,
-      });
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -545,9 +409,10 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&setup_action=install`),
         env,
       );
-      expect(callback.status).toBe(202);
+      expect(callback.status).toBe(302);
+      expect(callback.headers.get('location')).toBe('https://example.com/connect/notion?job_id=job-123');
       expect(calls).toBe(7);
-      expect(queue.sent).toEqual([{ jobId: 'job-123' }]);
+      expect(queue.sent).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -558,9 +423,7 @@ describe('GitHub App install and authorize flow', () => {
       owned: [generatedRepositoryBody('alice.github.io')],
     });
 
-    expect(response.status).toBe(202);
-    const body = await response.json() as Record<string, any>;
-    expect(body.repository).toMatchObject({ name: 'alice.github.io', id: 1001 });
+    expect(response.status).toBe(302);
     expect(requests.some((request) => request.url.endsWith('/generate'))).toBe(false);
     expect(requests.some((request) => request.url.includes('notiongit-template/commits'))).toBe(false);
 
@@ -574,17 +437,16 @@ describe('GitHub App install and authorize flow', () => {
       colliding: [{ status: 200, body: generatedRepositoryBody('alice.github.io') }],
     });
 
-    expect(response.status).toBe(202);
+    expect(response.status).toBe(302);
     expect(generateNames).toEqual(['alice.github.io']);
-    const body = await response.json() as Record<string, any>;
-    expect(body.repository).toMatchObject({ name: 'alice.github.io' });
 
     const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
+    expect(stored?.data.repository).toMatchObject({ name: 'alice.github.io' });
     expect(stored?.data.generatedRepository).toMatchObject({ reused: true });
   });
 
   test('advances to the next deterministic name when a foreign repository holds the first', async () => {
-    const { response, generateNames } = await runProvisioningCallback({
+    const { response, generateNames, kv } = await runProvisioningCallback({
       generate: [{ status: 422 }, { status: 201 }],
       colliding: [{
         status: 200,
@@ -600,10 +462,10 @@ describe('GitHub App install and authorize flow', () => {
       }],
     });
 
-    expect(response.status).toBe(202);
+    expect(response.status).toBe(302);
     expect(generateNames).toEqual(['alice.github.io', 'alice-inkdrafts']);
-    const body = await response.json() as Record<string, any>;
-    expect(body.repository).toMatchObject({
+    const stored = await kv.get<ProvisioningJob>('github:onboarding-job:job-123', 'json');
+    expect(stored?.data.repository).toMatchObject({
       name: 'alice-inkdrafts',
       url: 'https://alice.github.io/alice-inkdrafts',
     });
@@ -707,7 +569,8 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(await stateFor('job-123'))}&code=one-time-code&installation_id=123&setup_action=install`),
         env,
       );
-      expect(first.status).toBe(202);
+      expect(first.status).toBe(302);
+      expect(new URL(first.headers.get('location')!).searchParams.get('job_id')).toBe('job-123');
       expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-123' });
 
       const second = await route(
@@ -723,7 +586,8 @@ describe('GitHub App install and authorize flow', () => {
       // created or enqueued for it.
       expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-123' });
       expect(await kv.get('github:onboarding-job:job-456')).toBeNull();
-      expect(queue.sent).toEqual([{ jobId: 'job-123' }]);
+      // The GitHub callback never enqueues; the Notion callback does.
+      expect(queue.sent).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -793,12 +657,13 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123&setup_action=install`),
         env,
       );
-      expect(response.status).toBe(202);
-      expect(await response.json()).toMatchObject({ github: { id: 43, login: 'bob' } });
+      expect(response.status).toBe(302);
+      expect(new URL(response.headers.get('location')!).searchParams.get('job_id')).toBe('job-789');
       // Bob got his own lease; Alice's in-flight provisioning kept hers.
       expect(JSON.parse(await kv.get(accountLeaseKey(43)) as string)).toMatchObject({ jobId: 'job-789' });
       expect(JSON.parse(await kv.get(accountLeaseKey(42)) as string)).toMatchObject({ jobId: 'job-123' });
-      expect(queue.sent).toEqual([{ jobId: 'job-789' }]);
+      // The GitHub callback never enqueues; the Notion callback does.
+      expect(queue.sent).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -985,7 +850,11 @@ describe('provisioning queue consumer', () => {
       },
       now: Date.now(),
     });
-    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, job);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, {
+      ...job,
+      status: 'queued',
+      data: { ...job.data, notionSecretsWrittenAt: Date.now() },
+    });
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (input) => {
@@ -1029,5 +898,463 @@ describe('provisioning queue consumer', () => {
     );
     expect(message.acked).toBe(false);
     expect(message.retried).toEqual({});
+  });
+});
+
+const JOB_ID = 'job-123';
+const NOTION_ACCESS_TOKEN = 'synthetic-notion-access-token';
+const INSTALLATION_TOKEN = 'synthetic-installation-token';
+const NOTION_ROOT = '55555555-5555-4555-8555-555555555555';
+const SECOND_NOTION_ROOT = '66666666-6666-4666-8666-666666666666';
+const PAGES_DB = '11111111-1111-4111-8111-111111111111';
+const POSTS_DB = '22222222-2222-4222-8222-222222222222';
+const SECOND_PAGES_DB = '33333333-3333-4333-8333-333333333333';
+const SECOND_POSTS_DB = '44444444-4444-4444-8444-444444444444';
+/** The Actions public key fixture from `test/actions-secrets.test.ts`: the
+ * sealed-box counterpart of the seed-derived keypair the assertions open. */
+const ACTIONS_PUBLIC_KEY = 'RwHQhIhFH1RaQJ+1iuPlhYHKQKw/fxFGmM1x3qxzygE=';
+
+const NOTION_TOKEN_RESPONSE = {
+  access_token: NOTION_ACCESS_TOKEN,
+  token_type: 'bearer',
+  bot_id: 'synthetic-bot-id',
+  workspace_id: 'synthetic-workspace-id',
+  duplicated_template_id: NOTION_ROOT,
+};
+
+function pagesProperties(): Record<string, unknown> {
+  return {
+    Title: { type: 'title' },
+    Slug: { type: 'rich_text' },
+    Type: {
+      type: 'select',
+      select: { options: [{ name: 'home' }, { name: 'blog-list' }, { name: 'blog' }, { name: 'markdown' }] },
+    },
+    'Nav Order': { type: 'number' },
+    'Show in Nav': { type: 'checkbox' },
+    Status: { type: 'select', select: { options: [{ name: 'Draft' }, { name: 'Published' }] } },
+  };
+}
+
+function postsProperties(): Record<string, unknown> {
+  return {
+    Title: { type: 'title' },
+    Slug: { type: 'rich_text' },
+    Status: { type: 'select', select: { options: [{ name: 'Draft' }, { name: 'Published' }] } },
+    'Publish Date': { type: 'date' },
+    Tags: { type: 'multi_select', multi_select: { options: [{ name: 'guide' }] } },
+  };
+}
+
+interface OnboardingFakeOptions {
+  /** Duplicated root id to the two database ids it resolves to. */
+  roots?: Record<string, { pages: string; posts: string }>;
+  /** Replaces the response for one secret PUT, by 1-based write order. */
+  onSecretPut?: (name: string, attempt: number) => Response | null;
+}
+
+/**
+ * Answers every provider call the onboarding continuation makes: the Notion
+ * template walk, the installation-token mint, and the three Actions secret
+ * writes. An unexpected request fails loudly.
+ */
+function onboardingFake(options: OnboardingFakeOptions = {}) {
+  const roots = options.roots ?? { [NOTION_ROOT]: { pages: PAGES_DB, posts: POSTS_DB } };
+  const pageDatabaseIds = new Set(Object.values(roots).map((entry) => entry.pages));
+  const calls: string[] = [];
+  const secretWrites: Array<{ name: string; encryptedValue: string }> = [];
+  let secretPuts = 0;
+
+  const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    const segments = url.pathname.split('/');
+    calls.push(`${request.method} ${url.origin}${url.pathname}`);
+
+    if (url.origin === 'https://api.notion.com' && segments[2] === 'blocks') {
+      const root = roots[segments[3]];
+      if (!root) throw new Error(`unexpected duplicated root: ${segments[3]}`);
+      return Response.json({
+        object: 'list',
+        results: [
+          { object: 'block', id: root.pages, type: 'child_database', child_database: {} },
+          { object: 'block', id: root.posts, type: 'child_database', child_database: {} },
+        ],
+        has_more: false,
+        next_cursor: null,
+      });
+    }
+    if (url.origin === 'https://api.notion.com' && segments[2] === 'databases') {
+      const databaseId = segments[3];
+      return Response.json({
+        object: 'database',
+        id: databaseId,
+        title: [{ type: 'text', text: { content: 'A title the user may have renamed' } }],
+        properties: pageDatabaseIds.has(databaseId) ? pagesProperties() : postsProperties(),
+      });
+    }
+    if (url.href === 'https://api.github.com/app/installations/123/access_tokens') {
+      return Response.json({ token: INSTALLATION_TOKEN });
+    }
+    if (url.pathname === '/repos/alice/alice.github.io/actions/secrets/public-key') {
+      return Response.json({ key_id: 'actions-key-1', key: ACTIONS_PUBLIC_KEY });
+    }
+    if (request.method === 'PUT' && url.pathname.startsWith('/repos/alice/alice.github.io/actions/secrets/')) {
+      const name = segments[segments.length - 1];
+      secretPuts += 1;
+      const override = options.onSecretPut?.(name, secretPuts);
+      if (override) return override;
+      const body = await request.json() as { encrypted_value: string };
+      secretWrites.push({ name, encryptedValue: body.encrypted_value });
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`unexpected URL: ${request.url}`);
+  }) as typeof fetch;
+
+  return { fetcher, calls, secretWrites };
+}
+
+async function decryptSecretWrites(
+  writes: Array<{ name: string; encryptedValue: string }>,
+): Promise<Record<string, string>> {
+  await sodium.ready;
+  const keypair = sodium.crypto_box_seed_keypair(Uint8Array.from({ length: 32 }, (_, index) => index));
+  return Object.fromEntries(writes.map(({ name, encryptedValue }) => [
+    name,
+    sodium.to_string(sodium.crypto_box_seal_open(
+      sodium.from_base64(encryptedValue, sodium.base64_variants.ORIGINAL),
+      keypair.publicKey,
+      keypair.privateKey,
+    )),
+  ]));
+}
+
+/** The record `finishGithubCallback` leaves behind, before Notion authorization. */
+function awaitingNotionJob(): ProvisioningJob {
+  return createProvisioningJob({
+    jobId: JOB_ID,
+    installationId: 123,
+    identity: { id: 42, login: 'alice', accountType: 'User' },
+    repository: { name: 'alice.github.io', url: 'https://alice.github.io', baseurl: '', kind: 'apex' },
+    generatedRepository: {
+      id: 1001,
+      fullName: 'alice/alice.github.io',
+      name: 'alice.github.io',
+      htmlUrl: 'https://github.com/alice/alice.github.io',
+      defaultBranch: 'main',
+      templateFullName: 'inkdrafts/notiongit-template',
+      templateHeadSha: 'template-head-sha',
+      templateHeadTreeSha: 'template-tree-sha',
+      headSha: null,
+      headTreeSha: null,
+      reused: false,
+    },
+    now: 1_000,
+  });
+}
+
+function runContinuation(
+  env: Partial<Env>,
+  fetcher: typeof fetch,
+  duplicatedTemplateId: string | null = NOTION_ROOT,
+): Promise<Record<string, unknown> | void> {
+  return Promise.resolve(continueNotionOnboarding(env, { fetcher, sleep: async () => {} })({
+    jobId: JOB_ID,
+    accessToken: NOTION_ACCESS_TOKEN,
+    duplicatedTemplateId,
+  }));
+}
+
+async function caught(promise: Promise<unknown>): Promise<unknown> {
+  return promise.catch((error: unknown) => error);
+}
+
+async function startNotionAuthorization(env: Partial<Env>): Promise<{ state: string; cookie: string }> {
+  const response = await route(new Request(`https://example.com/connect/notion?job_id=${JOB_ID}`), env);
+  expect(response.status).toBe(302);
+  const location = new URL(response.headers.get('location')!);
+  return { state: location.searchParams.get('state')!, cookie: response.headers.get('set-cookie')!.split(';', 1)[0] };
+}
+
+function notionCallbackRequest(state: string, cookie: string): Request {
+  return new Request(
+    `https://example.com/auth/notion/callback?state=${encodeURIComponent(state)}&code=synthetic-code`,
+    { headers: { Cookie: cookie } },
+  );
+}
+
+describe('Notion authorization entry', () => {
+  test('refuses to start without a job id, and without a job to match it', async () => {
+    const env = await githubEnv();
+
+    const missing = await route(new Request('https://example.com/connect/notion'), env);
+    expect(missing.status).toBe(409);
+    expect(await missing.json()).toEqual({
+      error: 'provisioning_job_missing',
+      message: 'Connect GitHub first.',
+      connect_url: '/connect/github',
+    });
+
+    const unknown = await route(new Request('https://example.com/connect/notion?job_id=job-nope'), env);
+    expect(unknown.status).toBe(409);
+    expect(await unknown.json()).toMatchObject({ error: 'provisioning_job_missing' });
+  });
+
+  test('redirects to Notion for a job the GitHub callback created', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+
+    const response = await route(new Request(`https://example.com/connect/notion?job_id=${JOB_ID}`), env);
+
+    expect(response.status).toBe(302);
+    expect(new URL(response.headers.get('location')!).origin).toBe('https://api.notion.com');
+  });
+});
+
+describe('Notion onboarding continuation', () => {
+  test('writes the three Actions secrets, then hands the job to the queue', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const fake = onboardingFake();
+
+    const details = await runContinuation(env, fake.fetcher);
+
+    expect(await decryptSecretWrites(fake.secretWrites)).toEqual({
+      NOTION_TOKEN: NOTION_ACCESS_TOKEN,
+      NOTION_PAGES_DATABASE_ID: PAGES_DB,
+      NOTION_POSTS_DATABASE_ID: POSTS_DB,
+    });
+    expect(queue.sent).toEqual([{ jobId: JOB_ID }]);
+    expect(details).toEqual({
+      repository: { name: 'alice.github.io', html_url: 'https://github.com/alice/alice.github.io' },
+      site: { url: 'https://alice.github.io' },
+    });
+
+    const stored = await kv.get<ProvisioningJob>(`github:onboarding-job:${JOB_ID}`, 'json');
+    expect(stored?.status).toBe('queued');
+    expect(stored?.data.notionSecretsWrittenAt).toBeGreaterThan(0);
+    expect(await loadNotionTemplateResolution(env.JOBS as unknown as KVNamespace, JOB_ID))
+      .toMatchObject({ resolution: { pagesDatabaseId: PAGES_DB, postsDatabaseId: POSTS_DB } });
+
+    // Neither token reaches durable state, the job record included.
+    const persisted = kv.entries().join('\n');
+    expect(persisted).not.toContain(NOTION_ACCESS_TOKEN);
+    expect(persisted).not.toContain(INSTALLATION_TOKEN);
+  });
+
+  test('fails a manual-page authorization with a distinct, actionable error', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const fake = onboardingFake();
+
+    const error = await caught(runContinuation(env, fake.fetcher, null));
+
+    expect(error).toBeInstanceOf(NotionOAuthError);
+    expect((error as NotionOAuthError).code).toBe('notion_template_not_duplicated');
+    expect((error as NotionOAuthError).status).toBe(400);
+    expect(fake.calls).toEqual([]);
+    expect(queue.sent).toEqual([]);
+  });
+
+  test('refuses a callback for a job that no longer exists', async () => {
+    const env = await githubEnv();
+    const fake = onboardingFake();
+
+    const error = await caught(runContinuation(env, fake.fetcher));
+
+    expect((error as NotionOAuthError).code).toBe('provisioning_job_missing');
+    expect((error as NotionOAuthError).status).toBe(409);
+    expect(fake.calls).toEqual([]);
+  });
+
+  test('a partial secret write leaves the job awaiting Notion, and re-authorizing writes all three', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const failing = onboardingFake({
+      onSecretPut: (_name, attempt) => (attempt === 2 ? new Response(null, { status: 500 }) : null),
+    });
+
+    const error = await caught(runContinuation(env, failing.fetcher));
+
+    expect(error).toBeInstanceOf(NotionOAuthError);
+    expect((error as NotionOAuthError).code).toBe('github_actions_secret_write_failed');
+    expect(failing.secretWrites).toHaveLength(1);
+    expect(queue.sent).toEqual([]);
+    const afterFailure = await kv.get<ProvisioningJob>(`github:onboarding-job:${JOB_ID}`, 'json');
+    expect(afterFailure?.status).toBe('awaiting_notion');
+    expect(afterFailure?.data.notionSecretsWrittenAt).toBeNull();
+
+    // The single-use code is spent, so recovery is a fresh authorization for
+    // the same job — which re-runs the whole write, every name included.
+    const healthy = onboardingFake();
+    await runContinuation(env, healthy.fetcher);
+
+    expect(await decryptSecretWrites(healthy.secretWrites)).toEqual({
+      NOTION_TOKEN: NOTION_ACCESS_TOKEN,
+      NOTION_PAGES_DATABASE_ID: PAGES_DB,
+      NOTION_POSTS_DATABASE_ID: POSTS_DB,
+    });
+    expect(queue.sent).toEqual([{ jobId: JOB_ID }]);
+  });
+
+  test('re-resolves the template instead of reusing the previous authorization\'s database ids', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const roots = {
+      [NOTION_ROOT]: { pages: PAGES_DB, posts: POSTS_DB },
+      [SECOND_NOTION_ROOT]: { pages: SECOND_PAGES_DB, posts: SECOND_POSTS_DB },
+    };
+    const firstAttempt = onboardingFake({ roots, onSecretPut: () => new Response(null, { status: 500 }) });
+    await caught(runContinuation(env, firstAttempt.fetcher, NOTION_ROOT));
+
+    // The second authorization duplicated the template again, so the stored
+    // resolution names databases the user is no longer writing in.
+    const secondAttempt = onboardingFake({ roots });
+    await runContinuation(env, secondAttempt.fetcher, SECOND_NOTION_ROOT);
+
+    expect(await decryptSecretWrites(secondAttempt.secretWrites)).toEqual({
+      NOTION_TOKEN: NOTION_ACCESS_TOKEN,
+      NOTION_PAGES_DATABASE_ID: SECOND_PAGES_DB,
+      NOTION_POSTS_DATABASE_ID: SECOND_POSTS_DB,
+    });
+  });
+
+  test('a duplicate callback for an already-queued job writes and sends nothing', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    const base = awaitingNotionJob();
+    const queued: ProvisioningJob = {
+      ...base,
+      status: 'queued',
+      data: { ...base.data, notionSecretsWrittenAt: 2_000 },
+    };
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, queued);
+    const fake = onboardingFake();
+
+    expect(await runContinuation(env, fake.fetcher)).toBeUndefined();
+    expect(fake.calls).toEqual([]);
+    expect(queue.sent).toEqual([]);
+    expect(await kv.get<ProvisioningJob>(`github:onboarding-job:${JOB_ID}`, 'json')).toEqual(queued);
+  });
+
+  test('a queue handoff failure keeps the job recoverable instead of reporting success', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    queue.failSends = true;
+    const fake = onboardingFake();
+
+    const error = await caught(runContinuation(env, fake.fetcher));
+
+    expect(error).toBeInstanceOf(NotionOAuthError);
+    expect((error as NotionOAuthError).code).toBe('provisioning_handoff_failed');
+    expect((error as NotionOAuthError).status).toBe(502);
+    expect((error as NotionOAuthError).details).toEqual({ retry_url: `/connect/notion?job_id=${JOB_ID}` });
+    const stalled = await kv.get<ProvisioningJob>(`github:onboarding-job:${JOB_ID}`, 'json');
+    expect(stalled?.status).toBe('awaiting_notion');
+    expect(stalled?.data.notionSecretsWrittenAt).toBeGreaterThan(0);
+
+    // Re-authorizing goes straight back to the handoff: the secrets are
+    // already durable, so nothing is resolved or written a second time.
+    queue.failSends = false;
+    const retry = onboardingFake();
+    await runContinuation(env, retry.fetcher);
+
+    expect(retry.calls).toEqual([]);
+    expect(queue.sent).toEqual([{ jobId: JOB_ID }]);
+    expect((await kv.get<ProvisioningJob>(`github:onboarding-job:${JOB_ID}`, 'json'))?.status).toBe('queued');
+  });
+
+  test('the callback reports a handoff failure rather than a false success', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const { state, cookie } = await startNotionAuthorization(env);
+    queue.failSends = true;
+    const fake = onboardingFake();
+
+    const response = await route(notionCallbackRequest(state, cookie), env, {
+      fetcher: async () => Response.json(NOTION_TOKEN_RESPONSE),
+      continueOnboarding: continueNotionOnboarding(env, { fetcher: fake.fetcher, sleep: async () => {} }),
+    });
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      error: 'provisioning_handoff_failed',
+      retry_url: `/connect/notion?job_id=${JOB_ID}`,
+    });
+  });
+
+  test('surfaces resolution failures through the callback response with non-secret details', async () => {
+    const kv = new MemoryKV();
+    const env = await githubEnv(kv);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const emptyRoot = (async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.startsWith('/v1/blocks/')) {
+        return Response.json({ object: 'list', results: [], has_more: false, next_cursor: null });
+      }
+      throw new Error(`unexpected URL: ${url.href}`);
+    }) as typeof fetch;
+    const { state, cookie } = await startNotionAuthorization(env);
+
+    const response = await route(notionCallbackRequest(state, cookie), env, {
+      fetcher: async () => Response.json(NOTION_TOKEN_RESPONSE),
+      continueOnboarding: continueNotionOnboarding(env, { fetcher: emptyRoot, sleep: async () => {} }),
+    });
+
+    const bodyText = await response.text();
+    expect(response.status).toBe(502);
+    expect(JSON.parse(bodyText)).toEqual({ error: 'notion_template_root_empty' });
+    expect(bodyText).not.toContain(NOTION_ACCESS_TOKEN);
+  });
+
+  test('worker.fetch wires the production continuation end-to-end', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const fake = onboardingFake();
+    const workerFetch = worker.fetch as unknown as (request: Request, env: unknown) => Promise<Response>;
+    const { state, cookie } = await startNotionAuthorization(env);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === 'https://api.notion.com/v1/oauth/token') return Response.json(NOTION_TOKEN_RESPONSE);
+      return fake.fetcher(input, init);
+    }) as typeof fetch;
+
+    try {
+      const callback = await workerFetch(notionCallbackRequest(state, cookie), env);
+
+      expect(callback.status).toBe(202);
+      const bodyText = await callback.clone().text();
+      expect(await callback.json()).toEqual({
+        ok: true,
+        status: 'notion_authorized',
+        job_id: JOB_ID,
+        template: { duplicated: true },
+        repository: { name: 'alice.github.io', html_url: 'https://github.com/alice/alice.github.io' },
+        site: { url: 'https://alice.github.io' },
+      });
+      expect(bodyText).not.toContain(NOTION_ACCESS_TOKEN);
+      expect(bodyText).not.toContain(INSTALLATION_TOKEN);
+      expect(queue.sent).toEqual([{ jobId: JOB_ID }]);
+      expect(kv.entries().join('\n')).not.toContain(NOTION_ACCESS_TOKEN);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

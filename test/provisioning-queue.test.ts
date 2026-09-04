@@ -96,7 +96,13 @@ function makeJob(overrides: Partial<CreateProvisioningJobParams> = {}, dataOverr
     now: 1_000,
     ...overrides,
   });
-  return { ...job, data: { ...job.data, ...dataOverrides } };
+  // The queue only ever sees a job the Notion callback already finished with:
+  // secrets written, status flipped off `awaiting_notion`.
+  return {
+    ...job,
+    status: 'queued',
+    data: { ...job.data, notionSecretsWrittenAt: 900, ...dataOverrides },
+  };
 }
 
 /** A job already through `verify_repository` and `patch_config`, ready for `configure_pages`. */
@@ -338,6 +344,20 @@ describe('processProvisioningMessage', () => {
     expect(outcome).toEqual({ outcome: 'acked' });
     const job = await loadProvisioningJob(env.JOBS, 'job-1');
     expect(job).toEqual(finished);
+  });
+
+  test('waits instead of running a job whose Notion secrets were never written', async () => {
+    const kv = new MemoryKV();
+    const env = await testEnv(kv);
+    const awaitingNotion: ProvisioningJob = {
+      ...makeJob({}, { notionSecretsWrittenAt: null }),
+      status: 'awaiting_notion',
+    };
+    await saveProvisioningJob(env.JOBS, awaitingNotion);
+
+    const outcome = await processProvisioningMessage('job-1', env, { fetcher: unreachableFetch() });
+    expect(outcome).toEqual({ outcome: 'retry', delaySeconds: PROVISIONING_LOCK_RETRY_DELAY_SECONDS });
+    expect(await loadProvisioningJob(env.JOBS, 'job-1')).toEqual(awaitingNotion);
   });
 
   test('a job dead-lettered by a prior attempt is left untouched on redelivery', async () => {
