@@ -937,6 +937,12 @@ const PAGES_DB = '11111111-1111-4111-8111-111111111111';
 const POSTS_DB = '22222222-2222-4222-8222-222222222222';
 const SECOND_PAGES_DB = '33333333-3333-4333-8333-333333333333';
 const SECOND_POSTS_DB = '44444444-4444-4444-8444-444444444444';
+/** Canonical URLs the fake's Notion API hands back. Their embedded slugs are
+ * deliberately unrelated to the database IDs, so any id-shaped leak — for
+ * instance a link synthesized from a bare ID — trips the leak assertions. */
+const PAGES_DB_URL = 'https://www.notion.so/alice-site/Pages-aaa111bb222ccc333ddd444eee555fff1';
+const POSTS_DB_URL = 'https://www.notion.so/alice-site/Posts-bbb222ccc333ddd444eee555fff111aaa2';
+const ROOT_PAGE_URL = 'https://www.notion.so/alice-site/My-Site-Home';
 /** The Actions public key fixture from `test/actions-secrets.test.ts`: the
  * sealed-box counterpart of the seed-derived keypair the assertions open. */
 const ACTIONS_PUBLIC_KEY = 'RwHQhIhFH1RaQJ+1iuPlhYHKQKw/fxFGmM1x3qxzygE=';
@@ -1011,13 +1017,18 @@ function onboardingFake(options: OnboardingFakeOptions = {}) {
         next_cursor: null,
       });
     }
+    if (url.origin === 'https://api.notion.com' && segments[2] === 'pages') {
+      return Response.json({ object: 'page', id: segments[3], url: ROOT_PAGE_URL });
+    }
     if (url.origin === 'https://api.notion.com' && segments[2] === 'databases') {
       const databaseId = segments[3];
+      const isPages = pageDatabaseIds.has(databaseId);
       return Response.json({
         object: 'database',
         id: databaseId,
+        url: isPages ? PAGES_DB_URL : POSTS_DB_URL,
         title: [{ type: 'text', text: { content: 'A title the user may have renamed' } }],
-        properties: pageDatabaseIds.has(databaseId) ? pagesProperties() : postsProperties(),
+        properties: isPages ? pagesProperties() : postsProperties(),
       });
     }
     if (url.href === 'https://api.github.com/app/installations/123/access_tokens') {
@@ -1167,6 +1178,48 @@ describe('Notion onboarding continuation', () => {
     const persisted = kv.entries().join('\n');
     expect(persisted).not.toContain(NOTION_ACCESS_TOKEN);
     expect(persisted).not.toContain(INSTALLATION_TOKEN);
+  });
+
+  test('hands the job record the canonical Notion URLs and never the database IDs', async () => {
+    const kv = new MemoryKV();
+    const queue = new MemoryQueue<ProvisioningMessage>();
+    const env = await githubEnv(kv, queue);
+    await saveProvisioningJob(env.JOBS as unknown as KVNamespace, awaitingNotionJob());
+    const fake = onboardingFake();
+
+    await runContinuation(env, fake.fetcher);
+
+    const stored = await kv.get<ProvisioningJob>(`github:onboarding-job:${JOB_ID}`, 'json');
+    expect(stored?.data.notionLinks).toEqual({
+      pagesUrl: PAGES_DB_URL,
+      postsUrl: POSTS_DB_URL,
+      templateRootUrl: ROOT_PAGE_URL,
+    });
+
+    // The job record carries the API-returned canonical URLs; a link
+    // synthesized from a bare ID would embed one below and fail.
+    const jobRecord = await kv.get(`github:onboarding-job:${JOB_ID}`);
+    for (const id of [PAGES_DB, POSTS_DB]) {
+      expect(jobRecord).not.toContain(id);
+      expect(jobRecord).not.toContain(id.replaceAll('-', ''));
+    }
+    expect(jobRecord).toContain(PAGES_DB_URL);
+    expect(jobRecord).toContain(POSTS_DB_URL);
+    expect(jobRecord).toContain(ROOT_PAGE_URL);
+
+    // Rendered output never carries the raw IDs either.
+    const page = await route(new Request(`https://example.com/progress?job_id=${JOB_ID}`), env);
+    const rendered = await page.text();
+    for (const id of [PAGES_DB, POSTS_DB]) {
+      expect(rendered).not.toContain(id);
+      expect(rendered).not.toContain(id.replaceAll('-', ''));
+    }
+
+    // The IDs remain in the server-side resolution record, where the sync
+    // secrets workflow is the only consumer.
+    const resolutionRecord = JSON.stringify(await kv.get('notion:template-resolution:job-123', 'json'));
+    expect(resolutionRecord).toContain(PAGES_DB);
+    expect(resolutionRecord).toContain(POSTS_DB);
   });
 
   test('fails a manual-page authorization with a distinct, actionable error', async () => {

@@ -84,6 +84,7 @@ describe('createProvisioningJob', () => {
       sync: null,
       syncDispatchMarker: null,
       deployment: null,
+      notionLinks: null,
       notionSecretsWrittenAt: null,
     });
   });
@@ -210,5 +211,30 @@ describe('KV persistence', () => {
     const loaded = await loadProvisioningJob(kv as unknown as KVNamespace, job.jobId);
     expect(loaded?.steps.configure_pages.lastError).toEqual({ code: 'provisioning_step_failed', retryable: false });
     expect(loaded?.steps.verify_repository.lastError).toBeNull();
+  });
+
+  test('round-trips the canonical Notion links on the job record', async () => {
+    const kv = new MemoryKV();
+    const job = createProvisioningJob(baseParams());
+    job.data.notionLinks = {
+      pagesUrl: 'https://www.notion.so/alice/Pages-11111111111141118111111111111111',
+      postsUrl: 'https://www.notion.so/alice/Posts-22222222222242228222222222222222',
+      templateRootUrl: 'https://www.notion.so/alice/My-Site-55555555555545558555555555555555',
+    };
+    await saveProvisioningJob(kv as unknown as KVNamespace, job);
+
+    const loaded = await loadProvisioningJob(kv as unknown as KVNamespace, job.jobId);
+    expect(loaded?.data.notionLinks).toEqual(job.data.notionLinks);
+  });
+
+  test('defaults notionLinks to null for a record written before URL capture', async () => {
+    const kv = new MemoryKV();
+    const job = createProvisioningJob(baseParams());
+    const stored = JSON.parse(JSON.stringify(job)) as Record<string, unknown>;
+    delete (stored.data as Record<string, unknown>).notionLinks;
+    await kv.put(provisioningJobKey(job.jobId), JSON.stringify(stored));
+
+    const loaded = await loadProvisioningJob(kv as unknown as KVNamespace, job.jobId);
+    expect(loaded?.data.notionLinks).toBeNull();
   });
 });

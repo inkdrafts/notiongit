@@ -31,6 +31,7 @@ import {
   createProvisioningJob,
   loadProvisioningJob,
   saveProvisioningJob,
+  type NotionTemplateLinks,
 } from './provisioning-job';
 import { callbackFailure, codedFailureCode, FlowFailure } from './failures';
 import {
@@ -219,6 +220,7 @@ export {
 export type {
   CreateProvisioningJobParams,
   NotionSyncProgress,
+  NotionTemplateLinks,
   ProvisioningJob,
   ProvisioningJobData,
   ProvisioningJobIdentity,
@@ -424,6 +426,7 @@ export {
   NOTION_TEMPLATE_SCHEMA_VERSION,
   PAGES_FINGERPRINT,
   PAGES_SCHEMA_CONTRACT,
+  parseNotionCanonicalUrl,
   POSTS_FINGERPRINT,
   POSTS_SCHEMA_CONTRACT,
   resolveNotionTemplateDatabases,
@@ -904,6 +907,7 @@ export function continueNotionOnboarding(
 
     let ready = job;
     if (!ready.data.notionSecretsWrittenAt) {
+      let notionLinks: NotionTemplateLinks | null = null;
       try {
         if (!duplicatedTemplateId) throw new NotionTemplateError('notion_template_not_duplicated', 400);
         // Resolved fresh every time, never from the stored record: a second
@@ -914,6 +918,13 @@ export function continueNotionOnboarding(
           fetcher: runtime.fetcher,
           sleep: runtime.sleep,
         });
+        // Only the API-returned canonical URLs travel with the job record —
+        // never the database IDs, which remain server-side sync credentials.
+        notionLinks = {
+          pagesUrl: resolution.pagesUrl,
+          postsUrl: resolution.postsUrl,
+          templateRootUrl: resolution.templateRootUrl,
+        };
         await saveNotionTemplateResolution(env.JOBS, { version: 1, jobId, resolution });
         const beforeSecrets = await admitProvisioningStage(env as Env, provisioningAdmissionConfig(env), {
           stage: 'notion_secrets',
@@ -948,7 +959,11 @@ export function continueNotionOnboarding(
         throw error;
       }
       const writtenAt = Date.now();
-      ready = { ...job, data: { ...job.data, notionSecretsWrittenAt: writtenAt }, updatedAt: writtenAt };
+      ready = {
+        ...job,
+        data: { ...job.data, notionLinks, notionSecretsWrittenAt: writtenAt },
+        updatedAt: writtenAt,
+      };
       await saveProvisioningJob(env.JOBS, ready);
     }
 
