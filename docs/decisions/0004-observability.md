@@ -130,8 +130,8 @@ the merge.
   `notiongit_staging_provisioning_events` need no manual creation. Until traffic
   writes to them they hold nothing, which is a working state, not a broken one:
   the log sink carries every event regardless.
-- **Set the two alert secrets** once the datasets exist and the response shape is
-  verified: `wrangler secret put CF_ANALYTICS_API_TOKEN` and
+- **Set the two alert secrets** once the datasets hold data and the response
+  shape is verified: `wrangler secret put CF_ANALYTICS_API_TOKEN` and
   `wrangler secret put OBSERVABILITY_ALERT_WEBHOOK_URL`, per environment. The
   analytics token needs Account Analytics read permission only; it is not a
   deploy token. `CLOUDFLARE_ACCOUNT_ID` is already a non-secret `[vars]` entry.
@@ -160,6 +160,7 @@ the merge.
 ## References
 
 - [`docs/observability.md`](../observability.md)
+- [Workers Analytics Engine: get started](https://developers.cloudflare.com/analytics/analytics-engine/get-started/)
 - [Workers Analytics Engine limits](https://developers.cloudflare.com/analytics/analytics-engine/limits/)
 - [Workers Analytics Engine SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/)
 - [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
