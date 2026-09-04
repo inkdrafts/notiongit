@@ -62,6 +62,13 @@ job's durable installation id (see
 step returns. See [`docs/architecture.md`](docs/architecture.md) for the full
 job schema, locking, retry/dead-letter behavior, and sequence.
 
+Provisioning admission controls protect the public setup flow from bursts,
+replayed callbacks, repeated account attempts, and provider-denied identities.
+Operators can pause or stop new provisioning with the global kill switch or a
+stage circuit breaker. See [`docs/provisioning-admission-runbook.md`](docs/provisioning-admission-runbook.md)
+for activation, audit, rollback, and incident steps. These controls do not
+change repositories or Actions workflows that are already deployed.
+
 The sync dispatch and deploy-verification provider calls are implemented in
 [`src/notion-sync.ts`](src/notion-sync.ts) and
 [`src/site-deployment.ts`](src/site-deployment.ts). `workflow_dispatch` never

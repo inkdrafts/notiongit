@@ -34,10 +34,18 @@ import {
 } from './provisioning-job';
 import { callbackFailure, codedFailureCode, FlowFailure } from './failures';
 import {
+  admitProvisioningAccount,
+  admitProvisioningCallback,
+  admitProvisioningRequest,
+  admitProvisioningStage,
   acquireProvisioningStart,
+  admissionFailureCode,
   consumeGlobalMutationBudget,
+  ProvisioningAdmissionRefusedError,
   ProvisioningGateRefusedError,
+  provisioningAdmissionConfig,
   provisioningThrottleConfig,
+  recordProvisioningIdentityDenial,
   releaseProvisioningLeaseIfOwned,
   type ProvisioningThrottleVars,
 } from './provisioning-throttle';
@@ -49,6 +57,7 @@ import {
   finishNotionCallback,
   NotionOAuthError,
   type NotionOAuthContinuationHandler,
+  type NotionOAuthErrorCode,
   type NotionOAuthRouteOptions,
 } from './notion-oauth';
 import {
@@ -59,8 +68,6 @@ import {
 import { LANDING_PAGE } from './landing-page';
 import { Secret } from './secret';
 import { reportError } from './safe-serialize';
-
-
 export {
   createRepositoryWithRetry,
   GithubRepositoryApiError,
@@ -250,6 +257,11 @@ export type {
 
 export {
   ACCOUNT_LEASE_PREFIX,
+  admitProvisioningAccount,
+  admitProvisioningCallback,
+  admitProvisioningRequest,
+  admitProvisioningStage,
+  admissionFailureCode,
   accountLeaseKey,
   acquireProvisioningStart,
   consumeGlobalMutationBudget,
@@ -258,6 +270,15 @@ export {
   isBudgetedMutationStep,
   jitteredDelaySeconds,
   MAX_RACING_ISOLATES,
+  PROVISIONING_ADMISSION_STAGES,
+  PROVISIONING_ADMISSION_AUDIT_TTL_DEFAULT_SECONDS,
+  PROVISIONING_ACCOUNT_ATTEMPT_LIMIT_DEFAULT,
+  PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_DEFAULT_SECONDS,
+  PROVISIONING_CONTROL_KEY,
+  PROVISIONING_CONTROL_RECHECK_SECONDS,
+  PROVISIONING_DENIED_IDENTITY_COOLDOWN_DEFAULT_SECONDS,
+  PROVISIONING_REQUEST_BURST_LIMIT_DEFAULT,
+  PROVISIONING_REQUEST_BURST_WINDOW_DEFAULT_SECONDS,
   PROVISIONING_LEASE_TTL_DEFAULT_SECONDS,
   PROVISIONING_LEASE_TTL_MAX_SECONDS,
   PROVISIONING_LEASE_TTL_MIN_SECONDS,
@@ -267,6 +288,8 @@ export {
   PROVISIONING_MUTATIONS_PER_MINUTE_DEFAULT,
   provisioningThrottleConfig,
   ProvisioningGateRefusedError,
+  provisioningAdmissionConfig,
+  recordProvisioningIdentityDenial,
   releaseProvisioningLeaseIfOwned,
   saveTerminalProvisioningJob,
 } from './provisioning-throttle';
@@ -276,6 +299,18 @@ export type {
   GlobalRateState,
   ProvisioningThrottleConfig,
   ProvisioningThrottleVars,
+  ProvisioningAdmissionConfig,
+  ProvisioningAccountAdmissionRecord,
+  ProvisioningAdmissionAuditRecord,
+  ProvisioningCallbackClaimRecord,
+  ProvisioningAdmissionDecision,
+  ProvisioningAdmissionEnv,
+  ProvisioningAdmissionReason,
+  ProvisioningAdmissionStage,
+  ProvisioningAdmissionVars,
+  ProvisioningControl,
+  ProvisioningIdentityDenialRecord,
+  ProvisioningRequestBurstRecord,
   StartGateDecision,
   StepGateDecision,
 } from './provisioning-throttle';
@@ -340,7 +375,6 @@ export type {
 } from './notion-template';
 
 export { LANDING_PAGE } from './landing-page';
-
 export interface Env extends ProvisioningThrottleVars {
   /** Durable provisioning-job records. Values are JSON and have a short TTL. */
   JOBS: KVNamespace;
@@ -394,6 +428,19 @@ function json(data: unknown, status = 200, headers: Record<string, string> = {})
     status,
     headers: { ...JSON_HEADERS, ...headers },
   });
+}
+
+function admissionResponse(decision: Exclude<Awaited<ReturnType<typeof admitProvisioningRequest>>, { action: 'allow' }>): Response {
+  const code = admissionFailureCode(decision.reason);
+  const status = decision.reason === 'callback_replay' ? 400
+    : decision.reason === 'account_attempt_limit' || decision.reason === 'request_burst' ? 429
+      : decision.reason === 'identity_denied' ? 423 : 503;
+  const body: Record<string, unknown> = { error: code };
+  if (decision.action === 'reject' && decision.retryAfterSeconds !== null) body.retry_after_seconds = decision.retryAfterSeconds;
+  const headers: Record<string, string> = decision.action === 'reject' && decision.retryAfterSeconds !== null
+    ? { 'retry-after': String(decision.retryAfterSeconds) }
+    : {};
+  return json(body, status, headers);
 }
 
 function html(document: string, status = 200): Response {
@@ -673,6 +720,14 @@ function assertUsablePersonalInstallation(
 }
 
 function authError(error: unknown): Response {
+  if (error instanceof ProvisioningAdmissionRefusedError) {
+    const status = error.code === 'github_account_attempt_limited' ? 429
+      : error.code === 'github_identity_temporarily_denied' ? 423
+        : error.code === 'github_state_replayed' ? 400 : 503;
+    const body: Record<string, unknown> = { error: error.code };
+    if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
+    return json(body, status, error.retryAfterSeconds === null ? {} : { 'retry-after': String(error.retryAfterSeconds) });
+  }
   // GithubApiError carries no code, and GithubAppAuthError's derived code
   // reflects what the queue can retry, not what the user should do next:
   // both resolve here from the provider status.
@@ -715,6 +770,12 @@ async function beginGithubInstall(request: Request, env: Partial<Env>): Promise<
   const requestedJobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
   const jobId = requestedJobId || crypto.randomUUID();
   if (!validJobId(jobId)) return json({ error: 'invalid_job_id' }, 400);
+  const admission = await admitProvisioningRequest(env as Env, provisioningAdmissionConfig(env), {
+    request,
+    jobId,
+    hmacSecret: env.GITHUB_CLIENT_SECRET,
+  }, Date.now());
+  if (admission.action !== 'allow') return admissionResponse(admission);
 
   const now = Math.floor(Date.now() / 1000);
   const payload: SignedStatePayload = {
@@ -759,6 +820,13 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   if (record.phase === 'consumed') return json({ error: 'github_state_replayed' }, 400);
   if (record.expiresAt <= Math.floor(Date.now() / 1000)) return json({ error: 'github_state_expired' }, 400);
 
+  const admissionConfig = provisioningAdmissionConfig(env);
+  const control = await admitProvisioningStage(env as Env, admissionConfig, {
+    stage: 'github_callback',
+    jobId: record.jobId,
+  }, Date.now());
+  if (control.action !== 'allow') return admissionResponse(control);
+
   const installationId = validInstallationId(url.searchParams.get('installation_id'));
   const code = url.searchParams.get('code');
   if (!installationId && !record.installationId && !code) {
@@ -767,6 +835,14 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   if (url.searchParams.has('setup_action') && !['install', 'update'].includes(url.searchParams.get('setup_action') || '')) {
     return json({ error: 'github_setup_invalid' }, 400);
   }
+  const replay = await admitProvisioningCallback(env as Env, admissionConfig, {
+    provider: 'github',
+    phase: code ? 'oauth' : 'setup',
+    nonce: payload.nonce,
+    stage: 'github_callback',
+    jobId: record.jobId,
+  }, Date.now());
+  if (replay.action !== 'allow') return admissionResponse(replay);
 
   try {
     let identity: GithubIdentity | undefined;
@@ -795,11 +871,31 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
         // the OAuth callback contract also permits code-only callbacks. Discover
         // this App's installation from the authenticated user's installations in
         // that case rather than trusting an unverified query parameter.
+        const accountAdmission = await admitProvisioningAccount(env as Env, admissionConfig, {
+          accountId: authenticatedUser.id,
+          jobId: record.jobId,
+        }, Date.now());
+        if (accountAdmission.action !== 'allow') throw new ProvisioningAdmissionRefusedError(accountAdmission, 'github');
         if (!selectedInstallationId) {
           selectedInstallationId = await findUserInstallation(userToken.bearer(), env.GITHUB_APP_ID as string);
         }
-        const userInstallation = await getUserInstallation(userToken.bearer(), selectedInstallationId);
-        identity = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
+        let userInstallation: GithubInstallationAccount;
+        try {
+          userInstallation = await getUserInstallation(userToken.bearer(), selectedInstallationId);
+        } catch (error) {
+          if (error instanceof GithubApiError && error.status === 403) {
+            await recordProvisioningIdentityDenial(jobs, admissionConfig, { accountId: authenticatedUser.id, reason: 'provider_denied' }, Date.now());
+          }
+          throw error;
+        }
+        try {
+          identity = assertUsablePersonalInstallation(userInstallation, authenticatedUser);
+        } catch (error) {
+          if (error instanceof FlowFailure && error.code === 'github_installation_suspended') {
+            await recordProvisioningIdentityDenial(jobs, admissionConfig, { accountId: authenticatedUser.id, reason: 'suspended' }, Date.now());
+          }
+          throw error;
+        }
         // Generation happens while the short-lived OAuth token is in memory:
         // creating a repository from the template requires user-to-server
         // authentication. An earlier attempt's generated repository is reused
@@ -813,6 +909,12 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
           fetch,
           {
             beforeCreate: async () => {
+              const createControl = await admitProvisioningStage(env as Env, admissionConfig, {
+                stage: 'github_repository',
+                jobId: record.jobId,
+                accountId: identity!.id,
+              }, Date.now());
+              if (createControl.action !== 'allow') throw new ProvisioningAdmissionRefusedError(createControl, 'github');
               const budget = await consumeGlobalMutationBudget(jobs, throttleConfig, Date.now(), Math.random);
               if (!budget.admitted) {
                 throw new ProvisioningGateRefusedError({
@@ -905,6 +1007,16 @@ export function continueNotionOnboarding(
     // Any later status means this job was already handed to the queue, so a
     // duplicate callback must not write secrets or enqueue it again.
     if (job.status !== 'awaiting_notion') return;
+    const admission = await admitProvisioningStage(env as Env, provisioningAdmissionConfig(env), {
+      stage: 'notion_secrets',
+      jobId,
+      accountId: job.identity.id,
+    }, Date.now());
+    if (admission.action !== 'allow') {
+      throw new NotionOAuthError(admissionFailureCode(admission.reason) as NotionOAuthErrorCode, 503, {
+        retry_after_seconds: admission.retryAfterSeconds,
+      });
+    }
 
     let ready = job;
     if (!ready.data.notionSecretsWrittenAt) {
@@ -919,6 +1031,16 @@ export function continueNotionOnboarding(
           sleep: runtime.sleep,
         });
         await saveNotionTemplateResolution(env.JOBS, { version: 1, jobId, resolution });
+        const beforeSecrets = await admitProvisioningStage(env as Env, provisioningAdmissionConfig(env), {
+          stage: 'notion_secrets',
+          jobId,
+          accountId: job.identity.id,
+        }, Date.now());
+        if (beforeSecrets.action !== 'allow') {
+          throw new NotionOAuthError(admissionFailureCode(beforeSecrets.reason) as NotionOAuthErrorCode, 503, {
+            retry_after_seconds: beforeSecrets.retryAfterSeconds,
+          });
+        }
         const installationToken = await createGithubInstallationToken(
           env as Pick<Env, 'GITHUB_APP_ID' | 'GITHUB_APP_PRIVATE_KEY'>,
           job.installationId,
@@ -996,13 +1118,20 @@ async function beginNotionForJob(request: Request, env: Partial<Env>): Promise<R
   }
   const url = new URL(request.url);
   const jobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
-  if (!jobId || !validJobId(jobId) || !await loadProvisioningJob(env.JOBS, jobId)) {
+  const job = jobId && validJobId(jobId) ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  if (!jobId || !validJobId(jobId) || !job) {
     return json({
       error: 'provisioning_job_missing',
       message: 'Connect GitHub first.',
       connect_url: '/connect/github',
     }, 409);
   }
+  const admission = await admitProvisioningStage(env as Env, provisioningAdmissionConfig(env), {
+    stage: 'notion_callback',
+    jobId,
+    accountId: job.identity.id,
+  }, Date.now());
+  if (admission.action !== 'allow') return admissionResponse(admission);
   return beginNotionAuthorization(request, env);
 }
 

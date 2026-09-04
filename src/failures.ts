@@ -21,6 +21,9 @@
 
 export const FLOW_FAILURE_CODES = [
   'invalid_job_id',
+  'provisioning_paused',
+  'provisioning_rejected',
+  'provisioning_control_invalid',
 ] as const;
 
 export const NOTION_FAILURE_CODES = [
@@ -66,6 +69,9 @@ export const GITHUB_FAILURE_CODES = [
   'github_account_mismatch',
   'github_provisioning_already_active',
   'github_rate_limited',
+  'github_request_burst_limited',
+  'github_account_attempt_limited',
+  'github_identity_temporarily_denied',
   'github_app_unavailable',
   'github_app_auth_failed',
 ] as const;
@@ -182,6 +188,36 @@ const FLOW_FAILURES: { [C in FlowFailureCode]: FailureDescriptor } = {
       action: 'Start again from the dashboard to get a fresh link.',
     },
     support: { area: 'platform', note: 'Job id failed the format check before any provider call.' },
+  },
+  provisioning_paused: {
+    retryable: false,
+    recovery: 'restart_flow',
+    httpStatus: 503,
+    user: {
+      message: 'New site setup is temporarily paused.',
+      action: 'Try again shortly. Already deployed sites continue to work normally.',
+    },
+    support: { area: 'platform', note: 'Operator or stage admission control paused new provisioning work.' },
+  },
+  provisioning_rejected: {
+    retryable: false,
+    recovery: 'restart_flow',
+    httpStatus: 503,
+    user: {
+      message: 'New site setup is temporarily unavailable.',
+      action: 'Try again later. Already deployed sites continue to work normally.',
+    },
+    support: { area: 'platform', note: 'Operator admission control rejected new provisioning work.' },
+  },
+  provisioning_control_invalid: {
+    retryable: false,
+    recovery: 'contact_support',
+    httpStatus: 503,
+    user: {
+      message: 'Site setup is temporarily unavailable.',
+      action: 'Try again later or contact support if the problem continues.',
+    },
+    support: { area: 'platform', note: 'Admission control configuration was invalid or unreadable.' },
   },
 };
 
@@ -578,6 +614,36 @@ const GITHUB_FAILURES: { [C in GithubFailureCode]: FailureDescriptor } = {
       action: 'We\u2019ll keep trying automatically. If setup does not finish, start again later.',
     },
     support: { area: 'github', note: 'GitHub 429 on identity, installation, code exchange, or app-auth calls.' },
+  },
+  github_request_burst_limited: {
+    retryable: false,
+    recovery: 'restart_flow',
+    httpStatus: 429,
+    user: {
+      message: 'We received too many setup requests at once.',
+      action: 'Wait a moment, then try again.',
+    },
+    support: { area: 'platform', note: 'The privacy-preserving request burst window was exhausted.' },
+  },
+  github_account_attempt_limited: {
+    retryable: false,
+    recovery: 'restart_flow',
+    httpStatus: 429,
+    user: {
+      message: 'Too many setup attempts were made for this account.',
+      action: 'Wait for the attempt window to expire, then try again.',
+    },
+    support: { area: 'platform', note: 'The account attempt window was exhausted before provider mutation.' },
+  },
+  github_identity_temporarily_denied: {
+    retryable: false,
+    recovery: { kind: 'user_action', action: 'restore_provider_access_then_try_again' },
+    httpStatus: 423,
+    user: {
+      message: 'The connected GitHub account is not available for site setup right now.',
+      action: 'Check GitHub app access and try again after it is restored.',
+    },
+    support: { area: 'github', note: 'A provider-denied identity is held behind a short TTL cooldown.' },
   },
   github_app_unavailable: {
     retryable: true,

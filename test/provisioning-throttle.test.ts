@@ -1,7 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  admitProvisioningAccount,
+  admitProvisioningCallback,
+  admitProvisioningRequest,
+  admitProvisioningStage,
   acquireProvisioningStart,
+  provisioningAdmissionConfig,
+  provisioningCallbackKey,
+  provisioningDenialKey,
+  recordProvisioningIdentityDenial,
   accountLeaseKey,
   consumeGlobalMutationBudget,
   gateProvisioningStep,
@@ -192,6 +200,86 @@ describe('provisioningThrottleConfig', () => {
     expect(() => provisioningThrottleConfig({ PROVISIONING_MUTATIONS_PER_MINUTE: raw })).toThrow();
     expect(() => provisioningThrottleConfig({ PROVISIONING_MUTATIONS_PER_HOUR: raw })).toThrow();
     expect(() => provisioningThrottleConfig({ PROVISIONING_LEASE_TTL_SECONDS: raw })).toThrow();
+  });
+});
+
+describe('provisioning admission controls', () => {
+  const admissionEnv = (kv: MemoryKV) => ({ JOBS: kv as unknown as KVNamespace });
+
+  test('kill switch rejects new stages and queue gates before lease or mutation budget writes', async () => {
+    const kv = new MemoryKV();
+    await kv.put('provisioning:admission:control', JSON.stringify({
+      version: 1,
+      mode: 'kill',
+      pausedStages: [],
+      rejectedStages: [],
+      updatedAt: NOW,
+      expiresAt: null,
+    }));
+    const config = provisioningAdmissionConfig({});
+
+    const admission = await admitProvisioningStage(admissionEnv(kv), config, {
+      stage: 'github_repository',
+      jobId: 'job-killed',
+    }, NOW);
+    expect(admission).toEqual({
+      action: 'reject',
+      stage: 'github_repository',
+      reason: 'global_kill',
+      retryAfterSeconds: 60,
+    });
+    const beforeGate = kv.snapshot();
+    const gate = await gateProvisioningStep(kv as unknown as KVNamespace, makeJob('job-killed'), 'patch_config', provisioningThrottleConfig({}), NOW, () => 0, config);
+    expect(gate).toEqual({ action: 'pause', reason: 'stage_paused', delaySeconds: 60 });
+    expect(kv.rawValue(GLOBAL_RATE_KEY)).toBeUndefined();
+    expect(kv.rawValue(accountLeaseKey(IDENTITY.id))).toBeUndefined();
+    expect(kv.snapshot()).not.toBe(beforeGate);
+  });
+
+  test('callback claims serialize concurrent replays to one winner', async () => {
+    const kv = new MemoryKV();
+    const config = provisioningAdmissionConfig({});
+    const decisions = await Promise.all(Array.from({ length: 32 }, () => admitProvisioningCallback(admissionEnv(kv), config, {
+      provider: 'github',
+      phase: 'oauth',
+      nonce: 'nonce-1',
+      jobId: 'job-1',
+      stage: 'github_callback',
+    }, NOW)));
+    expect(decisions.filter((decision) => decision.action === 'allow')).toHaveLength(1);
+    expect(decisions.filter((decision) => decision.action === 'reject')).toHaveLength(31);
+    expect(kv.rawValue(provisioningCallbackKey('github', 'oauth', 'nonce-1'))).toContain('job-1');
+  });
+
+  test('request burst is keyed by an HMAC of the network prefix, never the raw address', async () => {
+    const kv = new MemoryKV();
+    const config = provisioningAdmissionConfig({
+      PROVISIONING_REQUEST_BURST_LIMIT: '2',
+    });
+    const request = new Request('https://example.com/connect/github', { headers: { 'CF-Connecting-IP': '203.0.113.42' } });
+    const first = await admitProvisioningRequest(admissionEnv(kv), config, { request, jobId: 'job-1', hmacSecret: 'test-secret' }, NOW);
+    const second = await admitProvisioningRequest(admissionEnv(kv), config, { request, jobId: 'job-2', hmacSecret: 'test-secret' }, NOW + 1);
+    const third = await admitProvisioningRequest(admissionEnv(kv), config, { request, jobId: 'job-3', hmacSecret: 'test-secret' }, NOW + 2);
+    expect(first.action).toBe('allow');
+    expect(second.action).toBe('allow');
+    expect(third).toMatchObject({ action: 'reject', reason: 'request_burst' });
+    expect(kv.snapshot()).not.toContain('203.0.113.42');
+    expect([...JSON.parse(kv.snapshot()) as [string, string][]].some(([key]) => key.startsWith('provisioning:admission:burst:'))).toBe(true);
+  });
+
+  test('account attempts and provider denials fail closed before repository generation', async () => {
+    const kv = new MemoryKV();
+    const config = provisioningAdmissionConfig({ PROVISIONING_ACCOUNT_ATTEMPT_LIMIT: '2' });
+    const first = await admitProvisioningAccount(admissionEnv(kv), config, { accountId: 42, jobId: 'job-1' }, NOW);
+    const second = await admitProvisioningAccount(admissionEnv(kv), config, { accountId: 42, jobId: 'job-2' }, NOW + 1);
+    const third = await admitProvisioningAccount(admissionEnv(kv), config, { accountId: 42, jobId: 'job-3' }, NOW + 2);
+    expect(first.action).toBe('allow');
+    expect(second.action).toBe('allow');
+    expect(third).toMatchObject({ action: 'reject', reason: 'account_attempt_limit' });
+    await recordProvisioningIdentityDenial(kv as unknown as KVNamespace, config, { accountId: 42, reason: 'suspended' }, NOW + 3);
+    const denied = await admitProvisioningAccount(admissionEnv(kv), config, { accountId: 42, jobId: 'job-4' }, NOW + 4);
+    expect(denied).toMatchObject({ action: 'reject', reason: 'identity_denied' });
+    expect(kv.rawValue(provisioningDenialKey(42))).toContain('suspended');
   });
 });
 
