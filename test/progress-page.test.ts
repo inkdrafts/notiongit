@@ -5,7 +5,6 @@ import type { ProvisioningFailureCode } from '../src/failures';
 import { projectProvisioning, type ProgressSnapshot } from '../src/progress';
 import {
   progressPage,
-  PROGRESS_POLL_BASE_INTERVAL_FLOOR,
   PROGRESS_POLL_INTERVAL_MS,
   PROGRESS_POLL_MAX_INTERVAL_MS,
 } from '../src/progress-page';
@@ -125,17 +124,19 @@ describe('progress page', () => {
     expect(progressPage('job-123', FAILED)).toContain('data-state="blocked"');
   });
 
-  test('meta refresh appears only for non-terminal snapshots and honors the cadence hint', () => {
+  test('offers a manual refresh to no-JS visitors on non-terminal snapshots only', () => {
     const waiting = snapshotFor('queued', (job) => {
       job.wait = { reason: 'global_throttled', untilMs: NOW + 90_000, updatedAt: NOW };
     });
 
-    expect(progressPage('job-123', ACTIVE))
-      .toContain(`<noscript><meta http-equiv="refresh" content="${PROGRESS_POLL_BASE_INTERVAL_FLOOR}"></noscript>`);
-    expect(progressPage('job-123', waiting)).toContain('<meta http-equiv="refresh" content="90">');
-    expect(progressPage('job-123', AWAITING)).toContain('<meta http-equiv="refresh"');
+    for (const snapshot of [ACTIVE, waiting, AWAITING]) {
+      const page = progressPage('job-123', snapshot);
+      expect(page).toContain('<noscript><p class="muted">');
+      expect(page).toContain('href="/progress?job_id=job-123"');
+      expect(page).not.toContain('http-equiv="refresh"');
+    }
     for (const snapshot of [SUCCEEDED, FAILED, MISSING]) {
-      expect(progressPage('job-123', snapshot)).not.toContain('http-equiv="refresh"');
+      expect(progressPage('job-123', snapshot)).not.toContain('<noscript');
     }
   });
 
@@ -270,15 +271,15 @@ describe('progress page', () => {
   test('the ?check=1 outcome renders inline in the propagation area of a succeeded snapshot', () => {
     const okPage = progressPage('job-123', SUCCEEDED_LINKS, { reachable: true, checkedAt: NOW });
     expect(okPage)
-      .toContain('<p id="site-check-result" class="muted">Checked just now: your site is answering.</p>');
+      .toContain('<p id="site-check-result" class="muted" role="status">Checked just now: your site is answering.</p>');
     const lagPage = progressPage('job-123', SUCCEEDED, { reachable: false, checkedAt: NOW });
     expect(lagPage)
-      .toContain('<p id="site-check-result" class="muted">Checked just now: not answering yet. Try again in a minute.</p>');
+      .toContain('<p id="site-check-result" class="muted" role="status">Checked just now: not answering yet. Try again in a minute.</p>');
   });
 
   test('a plain render hides the result line and carries the no-JS check link', () => {
     for (const snapshot of [ACTIVE, SUCCEEDED, MISSING]) {
-      expect(progressPage('job-123', snapshot)).toContain('<p id="site-check-result" class="muted" hidden></p>');
+      expect(progressPage('job-123', snapshot)).toContain('<p id="site-check-result" class="muted" role="status" hidden></p>');
     }
     expect(progressPage('job-123', SUCCEEDED))
       .toContain('<a id="site-check-link" href="/progress?job_id=job-123&amp;check=1">Check if it is up yet</a>');

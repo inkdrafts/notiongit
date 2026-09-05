@@ -375,7 +375,6 @@ export type {
 
 export {
   progressPage,
-  PROGRESS_POLL_BASE_INTERVAL_FLOOR,
   PROGRESS_POLL_INTERVAL_MS,
   PROGRESS_POLL_MAX_INTERVAL_MS,
 } from './progress-page';
@@ -405,7 +404,6 @@ export {
   STATUS_SESSION_TTL_SECONDS,
   STATUS_STATE_COOKIE,
   STATUS_STATE_TTL_SECONDS,
-  STATUS_REFRESH_SECONDS,
 } from './status';
 export type {
   DeployOutcome,

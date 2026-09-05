@@ -1611,7 +1611,7 @@ describe('progress routes', () => {
       const plain = await route(new Request(`https://example.com/progress?job_id=${JOB_ID}`), env);
       expect(plain.status).toBe(200);
       expect(requested).toEqual([]);
-      expect(await plain.text()).toContain('<p id="site-check-result" class="muted" hidden></p>');
+      expect(await plain.text()).toContain('<p id="site-check-result" class="muted" role="status" hidden></p>');
     } finally {
       globalThis.fetch = originalFetch;
     }

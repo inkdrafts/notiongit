@@ -60,10 +60,8 @@ export const STATUS_SESSION_COOKIE = '__Host-status-session';
 export const STATUS_STATE_COOKIE = '__Host-status-state';
 export const STATUS_SESSION_TTL_SECONDS = 8 * 60 * 60;
 export const STATUS_STATE_TTL_SECONDS = 10 * 60;
-/** Meta-refresh cadence while a sync run is in flight; no-JS-safe polling. */
-export const STATUS_REFRESH_SECONDS = 30;
 /** A dispatch run still non-completed after this long is treated as stuck:
- * the page stops auto-refreshing and a manual re-run is allowed to proceed
+ * the page stops offering a refresh and a manual re-run is allowed to proceed
  * rather than answering `already_running` forever. */
 export const STATUS_RUN_STUCK_SECONDS = 60 * 60;
 
@@ -226,8 +224,9 @@ export interface SiteStatus {
   site: { url: string };
   sync: SyncOutcome;
   deploy: DeployOutcome;
-  /** Meta-refresh hint; non-null only while a sync run is in flight. */
-  refreshAfterSeconds: number | null;
+  /** True while a sync run is freshly in flight; the session page then offers
+   * a manual refresh instead of reloading itself. */
+  runInFlight: boolean;
 }
 
 /** The discriminated union of every page state a signed-in visitor can reach.
@@ -344,7 +343,7 @@ export function projectSiteStatus(discovery: SiteDiscovery, session: StatusSessi
       site: { url: siteUrl(viewerLogin, discovery.repository.name, discovery.repository.htmlUrl) },
       sync: discovery.syncRun === null ? { kind: 'never_ran' } : syncOutcomeOf(discovery.syncRun),
       deploy: deployOutcomeOf(discovery.build),
-      refreshAfterSeconds: syncRunning && !runStuck ? STATUS_REFRESH_SECONDS : null,
+      runInFlight: syncRunning && !runStuck,
     },
   };
 }

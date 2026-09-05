@@ -8,6 +8,7 @@
  */
 
 import {
+  progressPageUrl,
   PROGRESS_STAGE_ORDER,
   PROGRESS_STAGE_REGISTRY,
   type ProgressSnapshot,
@@ -18,8 +19,6 @@ import {
 
 export const PROGRESS_POLL_INTERVAL_MS = 5000;
 export const PROGRESS_POLL_MAX_INTERVAL_MS = 60_000;
-/** Floor for the no-JS meta-refresh cadence, in seconds. */
-export const PROGRESS_POLL_BASE_INTERVAL_FLOOR = 15;
 
 /** Result of the one-shot server-side probe behind `?check=1`; null when the
  * render never probed (the default — a plain render must add no latency). */
@@ -75,11 +74,6 @@ function liveText(progress: PublicProgress): string {
   if (progress.status === 'missing') return progress.message;
   const current = currentStageOf(progress);
   return current ? PROGRESS_STAGE_REGISTRY[current.id].headline : PAGE_HEADINGS[progress.status];
-}
-
-function refreshSeconds(progress: PublicProgress): number {
-  const hint = progress.status === 'active' ? progress.pollAfterSeconds : null;
-  return Math.max(PROGRESS_POLL_BASE_INTERVAL_FLOOR, hint ?? PROGRESS_POLL_BASE_INTERVAL_FLOOR);
 }
 
 // The design-token custom properties are duplicated from landing-page.ts on
@@ -322,7 +316,10 @@ const SCRIPT = `
     }
     const current = (progress.stages ?? []).find((stage) => stage.state === 'current' || stage.state === 'blocked');
     const headline = current ? HEADLINES[current.id] : HEADINGS[progress.status];
-    liveElement.textContent = progress.status === 'failed' ? progress.message : headline;
+    // Writing identical text re-triggers some screen readers; announce only
+    // real changes so a slow poll cadence never reads the same line twice.
+    const announcement = progress.status === 'failed' ? progress.message : headline;
+    if (liveElement.textContent !== announcement) liveElement.textContent = announcement;
     document.title = current && !isTerminal(next) ? headline : HEADINGS[progress.status];
   }
 
@@ -394,8 +391,8 @@ function panelsHtml(progress: PublicProgress, jobId: string, siteCheck: SiteChec
   const postsUrl = progress.status === 'succeeded' ? progress.notionLinks.postsUrl : null;
   const checkOutcome = progress.status === 'succeeded' ? siteCheck : null;
   const checkResultLine = checkOutcome === null
-    ? '<p id="site-check-result" class="muted" hidden></p>'
-    : `<p id="site-check-result" class="muted">${escapeHtml(checkOutcome.reachable ? CHECK_OK_COPY : CHECK_NOT_YET_COPY)}</p>`;
+    ? '<p id="site-check-result" class="muted" role="status" hidden></p>'
+    : `<p id="site-check-result" class="muted" role="status">${escapeHtml(checkOutcome.reachable ? CHECK_OK_COPY : CHECK_NOT_YET_COPY)}</p>`;
   const checkHref = `/progress?job_id=${encodeURIComponent(jobId)}&check=1`;
 
   return [
@@ -464,9 +461,12 @@ export function progressPage(
   const title = isTerminal(progress) || !current
     ? heading
     : PROGRESS_STAGE_REGISTRY[current.id].headline;
+  // The no-JS affordance is a manual reload, never a forced meta refresh:
+  // auto-reload with no way to decline is a WCAG 2.2.1 failure (axe
+  // meta-refresh, critical).
   const refresh = isTerminal(progress)
     ? ''
-    : `<noscript><meta http-equiv="refresh" content="${refreshSeconds(progress)}"></noscript>`;
+    : `<noscript><p class="muted">This page updates itself with JavaScript. Without it, <a href="${escapeHtml(progressPageUrl(jobId))}">refresh the page</a> to check on the setup.</p></noscript>`;
   const statusUrl = `/progress/status?job_id=${encodeURIComponent(jobId)}`;
   const siteCheckUrl = `/progress/site-check?job_id=${encodeURIComponent(jobId)}`;
 
@@ -477,13 +477,13 @@ export function progressPage(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <style>${STYLES}</style>
-${refresh}
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to content</a>
 <main id="main-content" data-status-url="${escapeHtml(statusUrl)}" data-site-check-url="${escapeHtml(siteCheckUrl)}">
 <h1 id="progress-heading">${escapeHtml(heading)}</h1>
 <p id="progress-live" role="status" aria-live="polite">${escapeHtml(liveText(progress))}</p>
+${refresh}
 ${stagesOf(progress).length ? `<ol class="checklist" aria-label="Setup steps">
 ${stagesOf(progress).map(checklistRow).join('\n')}
 </ol>` : ''}
