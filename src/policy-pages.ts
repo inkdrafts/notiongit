@@ -7,7 +7,9 @@
  * claim here is either computed from the source constant that enforces it
  * (`PROVISIONING_JOB_TTL_SECONDS`, `STATUS_SESSION_TTL_SECONDS`) or pinned by
  * test/policy-pages.test.ts to the platform figures documented in
- * `docs/observability.md`. The copy deliberately makes no security
+ * `docs/observability.md`. Operator-configured windows (the abuse-control
+ * counters) describe the deployed `wrangler.toml` and are re-checked by the
+ * launch checklist. The copy deliberately makes no security
  * certification claim and promises no perfect security.
  *
  * Mirrors the other routes: one self-contained document per policy, design
@@ -178,7 +180,7 @@ kept for at most seven days.</td>
 <td>Short-lived counters that keep someone from starting many setups at once.
 A counter contains a GitHub account id or a keyed hash of your network address,
 never the address itself.</td>
-<td>Between one minute and seven days depending on the counter.</td>
+<td>From one minute up to seven days with the deployed configuration.</td>
 </tr>
 <tr>
 <td>Dashboard session</td>
@@ -215,8 +217,9 @@ ${SESSION_HOURS} hours.</li>
 <li>It never shows you advertising and never sells data.</li>
 <li>It never reads your Notion page content. Your page content is read by the
 sync workflow inside your own repository, not by InkDrafts.</li>
-<li>It never posts to Notion or GitHub on your behalf after setup. Setup only
-creates and configures your repository.</li>
+<li>It never edits your content after setup. Syncing is performed by the
+GitHub Action inside your repository; the only thing InkDrafts can still
+start is a sync run you ask for from the <a href="/status">dashboard</a>.</li>
 <li>It never asks you for a password, token, or secret. No one from InkDrafts
 will ever need one.</li>
 </ul>
