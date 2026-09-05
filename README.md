@@ -160,6 +160,14 @@ The GitHub App settings, least-privilege permission matrix, callback URLs, and
 credential rotation procedure are documented in
 [`docs/github-app-runbook.md`](docs/github-app-runbook.md).
 
+Public launch is gated by
+[`docs/launch-checklist.md`](docs/launch-checklist.md): every gate item needs
+evidence or a documented waiver, the five security reviews live in
+[`docs/launch-gate-reviews.md`](docs/launch-gate-reviews.md), and the
+post-launch monitoring and rollback plan is
+[`docs/post-launch.md`](docs/post-launch.md). The automatable checks are
+`bun run scripts/launch-gate.ts` and `bun run scripts/license-audit.ts`.
+
 The read-only development-repository Pages acceptance check is opt-in:
 
 ```sh
