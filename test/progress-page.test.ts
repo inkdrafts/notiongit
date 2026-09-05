@@ -191,7 +191,8 @@ describe('progress page', () => {
     // server verified the site at publish time.
     expect(page).toContain('We checked that your site was live right before publishing finished.');
     expect(page).toContain('GitHub’s network may still be updating it. It is usually ready within a few minutes.');
-    expect(page).toContain('Changes you make in Notion appear on your site automatically. Syncing runs about every 10 minutes.');
+    expect(page).toContain('The scheduled sync tries to run every 10 minutes, but GitHub can delay it by hours');
+    expect(page).toContain('The repository’s Actions tab shows every sync run and can also run one by hand.');
     expect(page).toContain('<a href="/status">your dashboard</a>');
     expect(page).toContain('href="https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site"');
     expect(page).toContain('Writing happens in Notion, so you never need GitHub for your everyday work.');
