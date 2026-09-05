@@ -255,7 +255,6 @@ describe('Notion template resolution', () => {
     expect(resolution.pagesSchema.optionNames.Status).toEqual(['Draft', 'Published']);
     expect(resolution.postsSchema.optionNames.Tags).toEqual(['guide']);
     expect(resolution.postsSchema.propertyTypes['Publish Date']).toBe('date');
-    // The canonical URLs ride along on responses the resolution already fetches.
     expect(resolution.templateRootUrl).toBe(ROOT_PAGE_URL);
     expect(resolution.pagesUrl).toBe(PAGES_DB_URL);
     expect(resolution.postsUrl).toBe(POSTS_DB_URL);

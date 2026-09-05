@@ -1211,8 +1211,6 @@ describe('Notion onboarding continuation', () => {
       templateRootUrl: ROOT_PAGE_URL,
     });
 
-    // The job record carries the API-returned canonical URLs; a link
-    // synthesized from a bare ID would embed one below and fail.
     const jobRecord = await kv.get(`github:onboarding-job:${JOB_ID}`);
     for (const id of [PAGES_DB, POSTS_DB]) {
       expect(jobRecord).not.toContain(id);
@@ -1222,7 +1220,6 @@ describe('Notion onboarding continuation', () => {
     expect(jobRecord).toContain(POSTS_DB_URL);
     expect(jobRecord).toContain(ROOT_PAGE_URL);
 
-    // Rendered output never carries the raw IDs either.
     const page = await route(new Request(`https://example.com/progress?job_id=${JOB_ID}`), env);
     const rendered = await page.text();
     for (const id of [PAGES_DB, POSTS_DB]) {
@@ -1546,7 +1543,6 @@ describe('progress routes', () => {
       const body = await ok.json() as { reachable: boolean; checkedAt: number };
       expect(body.reachable).toBe(true);
       expect(body.checkedAt).toBeGreaterThan(0);
-      // Exactly one probe, and its URL is the job record's, never request input.
       expect(requested).toEqual([job.data.repository.url]);
 
       requested.length = 0;
