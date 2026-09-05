@@ -240,7 +240,7 @@ describe('projectSiteStatus', () => {
           runUrl: 'https://github.com/alice/alice.github.io/actions/runs/555',
         },
         deploy: { kind: 'built', commitSha: 'head-sha' },
-        refreshAfterSeconds: null,
+        runInFlight: false,
       },
     });
   });
@@ -254,13 +254,13 @@ describe('projectSiteStatus', () => {
     expect(view).toMatchObject({ kind: 'session', site: { site: { url: 'https://alice.github.io/alice-inkdrafts' } } });
   });
 
-  test('a run still in flight is running and turns on the meta-refresh hint', () => {
+  test('a run still in flight is running and turns on the refresh affordance', () => {
     const view = projectSiteStatus(okDiscovery({ syncRun: syncRun({ status: 'in_progress', conclusion: null }) }), SESSION, NOW);
     expect(view).toMatchObject({
       kind: 'session',
       site: {
         sync: { kind: 'running', startedAtMs: Date.parse(CREATED_AT) },
-        refreshAfterSeconds: 30,
+        runInFlight: true,
       },
     });
   });
@@ -288,7 +288,7 @@ describe('projectSiteStatus', () => {
     const view = projectSiteStatus(okDiscovery({ syncRun: null, build: null }), SESSION, NOW);
     expect(view).toMatchObject({
       kind: 'session',
-      site: { sync: { kind: 'never_ran' }, deploy: { kind: 'never_built' }, refreshAfterSeconds: null },
+      site: { sync: { kind: 'never_ran' }, deploy: { kind: 'never_built' }, runInFlight: false },
     });
   });
 
@@ -810,7 +810,7 @@ describe('status routes', () => {
       env,
     );
     expect(installLeg.status).toBe(400);
-    expect(await installLeg.json()).toEqual({ error: 'github_state_invalid' });
+    expect(await installLeg.text()).toContain('Error code: <code>github_state_invalid</code>');
   });
 
   test('the rerun gates refuse in order: origin, session, form token', async () => {
@@ -1078,6 +1078,7 @@ describe('status routes', () => {
       const html = await page.text();
       expect(html).toContain('A sync is running right now');
       expect(html).not.toContain('http-equiv="refresh"');
+      expect(html).not.toContain('>Refresh</a>');
     });
   });
 
@@ -1139,7 +1140,9 @@ describe('status routes', () => {
         env,
       );
       expect(running.status).toBe(200);
-      expect(await running.text()).toContain('http-equiv="refresh" content="30; url=/status"');
+      const html = await running.text();
+      expect(html).toContain('>Refresh</a>');
+      expect(html).not.toContain('http-equiv="refresh"');
     });
   });
 

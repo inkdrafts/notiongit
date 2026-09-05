@@ -1,5 +1,19 @@
 import { describe, expect, test } from 'bun:test';
 
+import { userCopy, type ProvisioningFailureCode } from '../src/failures';
+
+/** Consent-handoff failures render the shared HTML error page; assert the
+ * status, the visible machine code, and the registry's canonical copy. */
+async function expectErrorPage(response: Response, status: number, code: ProvisioningFailureCode): Promise<string> {
+  expect(response.status).toBe(status);
+  const text = await response.text();
+  expect(response.headers.get('content-type')).toContain('text/html');
+  expect(text).toContain(`Error code: <code>${code}</code>`);
+  expect(text).toContain(userCopy(code).message);
+  return text;
+}
+
+
 import {
   createProvisioningJob,
   NOTION_STATE_COOKIE,
@@ -151,30 +165,26 @@ describe('Notion OAuth', () => {
   test('rejects missing, tampered, and replayed state', async () => {
     const { location, cookie, kv } = await start();
     const missing = await route(new Request('https://staging.example/auth/notion/callback?code=x'), env(kv));
-    expect(missing.status).toBe(400);
-    expect(await missing.json()).toEqual({ error: 'notion_state_missing' });
+    await expectErrorPage(missing, 400, 'notion_state_missing');
 
     const tamperedState = `${location.searchParams.get('state')}x`;
     const tampered = await route(
       new Request(`https://staging.example/auth/notion/callback?state=${encodeURIComponent(tamperedState)}&code=x`, { headers: { Cookie: cookie } }),
       env(kv),
     );
-    expect(tampered.status).toBe(400);
-    expect(await tampered.json()).toEqual({ error: 'notion_state_invalid' });
+    await expectErrorPage(tampered, 400, 'notion_state_invalid');
 
     const success = await route(
       callbackUrl(location, cookie, 'error=access_denied'),
       env(kv),
     );
-    expect(success.status).toBe(400);
-    expect(await success.json()).toEqual({ error: 'notion_authorization_denied' });
+    await expectErrorPage(success, 400, 'notion_authorization_denied');
 
     const replay = await route(
       callbackUrl(location, cookie, 'code=x'),
       env(kv),
     );
-    expect(replay.status).toBe(400);
-    expect(await replay.json()).toEqual({ error: 'notion_state_replayed' });
+    await expectErrorPage(replay, 400, 'notion_state_replayed');
   });
 
   test('rejects an expired state record before calling Notion', async () => {
@@ -189,8 +199,7 @@ describe('Notion OAuth', () => {
       env(kv),
       { fetcher: async () => { throw new Error('Notion must not be called'); } },
     );
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: 'notion_state_expired' });
+    await expectErrorPage(response, 400, 'notion_state_expired');
   });
 
   test('rejects a callback from a different browser flow', async () => {
@@ -199,8 +208,7 @@ describe('Notion OAuth', () => {
       new Request(`https://staging.example/auth/notion/callback?state=${encodeURIComponent(location.searchParams.get('state')!)}&code=x`),
       env(kv),
     );
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: 'notion_state_invalid' });
+    await expectErrorPage(response, 400, 'notion_state_invalid');
   });
 
   test('does not echo provider errors or credentials', async () => {
@@ -216,9 +224,7 @@ describe('Notion OAuth', () => {
         }, { status: 400 }),
       },
     );
-    const body = await response.text();
-    expect(response.status).toBe(400);
-    expect(body).toBe(JSON.stringify({ error: 'notion_authorization_failed' }));
+    const body = await expectErrorPage(response, 400, 'notion_authorization_failed');
     expect(body).not.toContain('secret-one-time-code');
     expect(body).not.toContain('provider-token-that-must-not-leak');
     expect(body).not.toContain('private-workspace-id');

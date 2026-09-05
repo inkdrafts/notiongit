@@ -146,8 +146,14 @@ const CONNECT_URL = '/status?connect=1';
 const NOTICES: { [N in NonNullable<StatusPageChrome['notice']>]: string } = {
   signin_required: 'Please sign in with GitHub to see your site status.',
   sync_triggered: 'A sync was triggered. Reload in a moment to watch it run.',
-  already_running: 'A sync is already running. This page reloads itself while it runs.',
+  already_running: 'A sync is already running. Refresh to pick up the result when it finishes.',
 };
+
+/** The document never reloads itself: forced refresh with no way to decline
+ * is a WCAG 2.2.1 failure (axe meta-refresh, critical), so a run in flight
+ * offers a manual reload instead. */
+const REFRESH_HTML = `
+<p><a href="/status">Refresh</a> to pick up the result when the run finishes.</p>`;
 
 const DISCONNECT_HTML = `
 <section class="card">
@@ -238,6 +244,7 @@ ${deployHtml(model.site.deploy)}
 <p>Site: <a href="${escapeHtml(model.site.site.url)}">${escapeHtml(model.site.site.url)}</a><br>
 Repository: <a href="${escapeHtml(model.site.repository.url)}">${escapeHtml(model.site.repository.name)}</a></p>
 </section>
+${model.site.runInFlight ? REFRESH_HTML : ''}
 ${chrome.rerunFormToken === null ? '' : rerunFormHtml(chrome.rerunFormToken)}
 ${DISCONNECT_HTML}`;
 
@@ -298,11 +305,6 @@ ${model.reason === 'no_installation' ? '' : `<a class="cta" href="${CONNECT_URL}
 
 export function statusPage(model: StatusPageModel, chrome: StatusPageChrome): string {
   const heading = PAGE_HEADINGS[model.kind];
-  const refresh = model.kind === 'session' && model.site.refreshAfterSeconds !== null
-    // The refresh target drops the query so the post-redirect notice renders
-    // once instead of re-appearing on every poll.
-    ? `<meta http-equiv="refresh" content="${model.site.refreshAfterSeconds}; url=/status">`
-    : '';
 
   return `<!doctype html>
 <html lang="en">
@@ -311,7 +313,6 @@ export function statusPage(model: StatusPageModel, chrome: StatusPageChrome): st
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(heading)}</title>
 <style>${STYLES}</style>
-${refresh}
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to content</a>

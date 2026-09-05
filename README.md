@@ -13,6 +13,10 @@ bun run test
 bun run build
 ```
 
+Accessibility is gated by the axe suite in `bun run test` and the real-browser
+reflow/keyboard checks in `bun run test:reflow`; the manual matrix and known
+limitations live in [`docs/accessibility.md`](docs/accessibility.md).
+
 The initial Cloudflare Workers sealed-box experiment is documented in
 [`spikes/libsodium-workers/README.md`](spikes/libsodium-workers/README.md), and
 the hosting decision is recorded in
