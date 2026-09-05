@@ -383,6 +383,8 @@ describe('projectSiteStatus', () => {
       kind: 'session',
       site: { sync: { kind: 'never_ran' }, deploy: { kind: 'never_built' }, runInFlight: false },
     });
+    const html = statusPage(view, { notice: null, rerunFormToken: null });
+    expect(html).toContain('Your site also syncs on a schedule, though GitHub can delay a scheduled run by hours under load.');
   });
 
   test('a building or errored latest build renders its own deploy arm', () => {

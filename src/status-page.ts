@@ -216,7 +216,7 @@ function summaryDetails(sync: Extract<SyncOutcome, { source: 'summary_v1' }>): s
 }
 
 function syncHtml(sync: SyncOutcome, summaryFallback?: SummaryFallbackReason): string {
-  if (sync.kind === 'never_ran') return '<p>No hand-triggered sync has run yet. Your site also syncs on its schedule.</p>';
+  if (sync.kind === 'never_ran') return '<p>No hand-triggered sync has run yet. Your site also syncs on a schedule, though GitHub can delay a scheduled run by hours under load.</p>';
   const runLink = sync.runUrl === null ? '' : ` <a href="${escapeHtml(sync.runUrl)}">View the run on GitHub</a>.`;
   const when = (ms: number | null) => (ms === null ? '' : ` ${utcText(ms)}`);
   const fallbackReason = summaryFallback === 'unsupported_version'
