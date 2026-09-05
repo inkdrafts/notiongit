@@ -247,24 +247,27 @@ per-step query above already shows.
 
 ## Retention
 
-Three retention windows apply, and they are all different.
+Three retention windows apply, and they are all different. Since the owner's
+2026-09-05 free-tier decision, only the first and third are active: the
+Analytics Engine binding is not deployed, so the dataset receives nothing.
 
 - **Job records in KV: 24 hours.** `PROVISIONING_JOB_TTL_SECONDS` in
   `provisioning-job.ts` is `24 * 60 * 60`, and every record this project writes
   uses the same `expirationTtl`. After that, the durable record of what a job did
   is gone, and only the two observability sinks remain.
-- **Analytics Engine: three months.** Cloudflare's Analytics Engine limits page
-  states "Data written to Workers Analytics Engine is stored for three months"
-  (verified 2026-09-03).
-- **Workers Logs: 3 days on the Free plan, 7 days on the Paid plan.** Cloudflare's
-  Workers Logs page gives both figures and a maximum retention of 7 days (verified
-  2026-09-03). Which one applies depends on the account's plan, and this repository
-  does not record which plan the `notiongit` account is on. Confirm it before
-  relying on the longer figure — see "Manual verification follow-up".
+- **Analytics Engine: three months, inactive.** Cloudflare's Analytics Engine
+  limits page states "Data written to Workers Analytics Engine is stored for
+  three months" (verified 2026-09-03). Nothing is written today: the binding
+  does not deploy on the free tier, and the owner chose not to add the paid
+  plan for it (2026-09-05). The re-enable recipe is at the end of this document.
+- **Workers Logs: 3 days.** Cloudflare's Workers Logs page gives 3 days on the
+  Free plan and 7 on the Paid plan (verified 2026-09-03). The free figure is
+  the one in force, and it is what the policy pages now claim.
 
-The practical consequence is that per-job forensics has the shortest window of the
-three. A user report older than a week can be answered from aggregates and from
-`blob2`, but the full structured log line for that job is gone.
+The practical consequence is that per-job forensics has the shortest window.
+A user report older than three days can no longer be answered from the full
+structured log line; the dead-letter queue count and the KV job record within
+its 24 hours are what remain.
 
 ## Sampling
 
@@ -442,8 +445,9 @@ after the verification below.
 
 ## Manual verification follow-up
 
-Three things are unverified. None of them blocks the event sinks, which are
-covered by tests; all of them block turning the cron trigger on.
+These verifications are deferred with the dataset itself. None of them blocks
+the log sink, which is covered by tests and receives every event today; all of
+them come back to life the day the paid tier is added.
 
 1. **The Analytics Engine SQL response row shape has not been checked against a
    live account.** `AnalyticsEngineSqlResponse` in `src/observability-alerts.ts`
@@ -461,24 +465,42 @@ covered by tests; all of them block turning the cron trigger on.
    `scripts/drill-alerts.ts` runs the shipped `alertWindowQuery` against the
    live SQL API and rules on the response shape, and `--rows-file` rehearses
    the evaluation and delivery half offline.
-2. **Neither dataset has received a data point yet.** Cloudflare creates an
-   Analytics Engine dataset automatically the first time a Worker writes to it
-   after the binding is declared ("Get started", verified 2026-09-03), so nothing
-   needs creating by hand — but a deploy carrying the bindings also requires
-   Analytics Engine to be enabled on the account. It is not yet: the versions
-   API rejects such a deploy with error 10089 until Analytics Engine is enabled
-   in the dashboard (observed 2026-09-05). Until that enablement plus a real
-   traffic deploy, no data point exists in either dataset. Confirm both
-   datasets are queryable after that deploy.
-3. **The account's Workers Logs plan tier is not recorded**, so the retention
-   figure above is either 3 or 7 days. Check the plan on the Cloudflare account
-   before writing 7 days into any user-facing privacy claim.
+2. **Neither dataset has received a data point, and none can until the paid
+   tier.** The versions API rejects any deploy carrying the bindings with error
+   10089 until Analytics Engine is enabled in the dashboard (observed
+   2026-09-05), which is why the bindings are removed from `wrangler.toml`.
+   Re-adding them is step 1 of the re-enable recipe below.
+3. **Workers Logs plan tier: resolved for the free tier.** The owner declined
+   the paid plan (2026-09-05), so retention is 3 days and the policy pages say
+   so. If the paid tier is ever added, re-check the figure before claiming 7
+   days anywhere user-facing.
+
+## Re-enabling the paid tier
+
+The owner's 2026-09-05 decision removed the Analytics Engine bindings to stay
+on the free plan. If real adoption justifies the $5/month Workers Paid plan,
+restore the funnel sink in this order:
+
+1. Enable Analytics Engine in the Cloudflare dashboard, then re-add the three
+   `[[analytics_engine_datasets]]` blocks and the `PROVISIONING_METRICS_DATASET`
+   vars that commit `free-tier-observability` removed from `wrangler.toml`.
+2. Deploy, drive one real or injected event, and run
+   `bun run scripts/drill-alerts.ts <dataset> <webhook>` to verify the SQL row
+   shape before trusting any number it produces.
+3. Set `CF_ANALYTICS_API_TOKEN` (Account Analytics read only) and
+   `OBSERVABILITY_ALERT_WEBHOOK_URL` as secrets per environment.
+4. Re-check the Workers Logs retention figure and every user-facing day count.
+5. Uncomment the `[triggers]` cron in `wrangler.toml` and deploy.
+
+Until then, the `scheduled` handler stays wired and tested but is never
+invoked, and the funnel lives entirely in Workers Logs.
 
 `ANALYTICS_DATASET` is no longer hardcoded: `runObservabilityAlertCheck` reads
-the dataset name from `PROVISIONING_METRICS_DATASET`, a non-secret `[vars]`
-entry set per environment in `wrangler.toml` (`notiongit_provisioning_events`
-in production, `notiongit_staging_provisioning_events` in staging), so a
-staging alert check can no longer query production data.
+the dataset name from `PROVISIONING_METRICS_DATASET`. That var is not deployed
+on the free tier; when the re-enable recipe restores it, it stays a per-
+environment `[vars]` entry (`notiongit_provisioning_events` in production,
+`notiongit_staging_provisioning_events` in staging), so a staging alert check
+can never query production data.
 
 ## References
 

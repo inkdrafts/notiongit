@@ -444,8 +444,9 @@ typecheck rather than a convention — the canary tests in
 `test/observability.test.ts` push a token-bearing error through the real
 emission path and assert it reaches neither sink. Threshold alerting over the
 dataset (`observability-alerts.ts`) is wired into the `scheduled` handler and
-unit-tested, but `wrangler.toml` leaves its cron trigger commented out until
-the Analytics Engine SQL response shape is verified against a live dataset. The
+unit-tested, but the dataset itself is not deployed on the free tier (owner
+decision 2026-09-05), so `wrangler.toml` leaves its cron trigger commented
+out; the re-enable recipe is in [`observability.md`](observability.md). The
 event schema, column map, dashboard queries, retention, access, and the triage
 runbook are in [`Observability`](observability.md); the two-sink decision is
 [ADR 0004](decisions/0004-observability.md).

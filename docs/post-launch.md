@@ -15,29 +15,27 @@ those rows put in force.
 2. **Dead letters.** Any `job_dead_lettered` is one user whose site never
    published. Triage per [`observability.md`](observability.md#incident-triage)
    §Incident triage, step by step, starting from the `jobId`.
-3. **Alerts.** With the cron trigger enabled (see "Enablement" below), the
-   webhook delivers step failure rate, dead-letter, and rate-limit alerts
-   hourly. Alerts carry no `jobId`, so step 1 of triage turns them into job
-   ids from Workers Logs.
+3. **Alerts.** Inactive on the free tier (see "Enablement" below); triage
+   starts from Workers Logs and the dead-letter queue instead. With the paid
+   tier and the cron trigger enabled, the webhook delivers step failure rate,
+   dead-letter, and rate-limit alerts hourly. Alerts carry no `jobId`, so
+   step 1 of triage turns them into job ids from Workers Logs.
 4. **Provider status.** GitHub and Notion incidents masquerade as funnel
    failures. Check provider status pages before changing anything
    (admission-runbook "Roll back safely", step 3).
 
 ## Enablement
 
-These steps happen at launch; each is pending in the checklist until done:
+These steps happen at launch; each is pending in the checklist until done.
+The alert-specific steps are deferred with the paid tier (owner decision
+2026-09-05; the recipe is in [`observability.md`](observability.md#re-enabling-the-paid-tier)):
 
-- [ ] Enable Analytics Engine on the Cloudflare account (dashboard): until it
-      is enabled, deploying any version with the dataset bindings fails with
-      API error 10089, so this precedes every other enablement step.
-- [ ] Set `CF_ANALYTICS_API_TOKEN` and `OBSERVABILITY_ALERT_WEBHOOK_URL` as
-      production secrets and verify the SQL row shape against the live
-      dataset ([`observability.md`](observability.md#manual-verification-follow-up)
-      §Manual verification follow-up) with `scripts/drill-alerts.ts`.
-- [ ] Uncomment the `[triggers]` cron in `wrangler.toml` and deploy.
-- [ ] Fire one synthetic threshold breach in staging and record the webhook
-      delivery: `scripts/drill-alerts.ts` against the staging dataset and
-      webhook with `--dead-letter-threshold 0` fires on any window.
+- [ ] Deploy merged `main` to production (#86) and confirm the funnel's
+      `job_queued` through `job_succeeded` lines reach Workers Logs.
+- [ ] Deferred with the paid tier: enable Analytics Engine, set
+      `CF_ANALYTICS_API_TOKEN` and `OBSERVABILITY_ALERT_WEBHOOK_URL`, verify
+      the SQL row shape with `scripts/drill-alerts.ts`, uncomment the cron,
+      and fire one synthetic breach with `--dead-letter-threshold 0`.
 
 ## Rollback ladder
 
