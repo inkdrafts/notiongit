@@ -123,11 +123,15 @@ function connect(wsUrl: string): Promise<Cdp> {
 }
 
 const CHROME_PORT = 9223;
+const CHROME_LOG = '/tmp/notiongit-reflow-chrome.log';
 
+// Output lands in a file so a startup failure on a runner names its cause.
 const chrome = Bun.spawn([
-  'google-chrome-stable', '--headless=new', '--no-sandbox', '--disable-gpu',
-  `--remote-debugging-port=${CHROME_PORT}`, '--user-data-dir=/tmp/notiongit-reflow-chrome',
-  '--window-size=1024,800', 'about:blank',
+  'sh', '-c',
+  `exec google-chrome-stable --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage` +
+  ` --disable-extensions --no-first-run --remote-debugging-port=${CHROME_PORT}` +
+  ` --user-data-dir=/tmp/notiongit-reflow-chrome --window-size=1024,800 about:blank` +
+  ` >"${CHROME_LOG}" 2>&1`,
 ], { stdout: 'ignore', stderr: 'ignore' });
 
 interface Failure {
@@ -139,18 +143,26 @@ interface Failure {
 const failures: Failure[] = [];
 
 try {
-  let targets: { type: string; webSocketDebuggerUrl: string }[] = [];
-  for (let attempt = 0; attempt < 40; attempt++) {
+  // CI runners cold-start Chrome slowly; 30 seconds with fail-fast on an
+  // early process exit keeps the wait bounded and the failure readable.
+  let pageTarget: { type: string; webSocketDebuggerUrl: string } | undefined;
+  for (let attempt = 0; attempt < 120; attempt++) {
+    if (chrome.exitCode !== null) break;
     await new Promise((resolve) => setTimeout(resolve, 250));
     try {
-      targets = await (await fetch(`http://127.0.0.1:${CHROME_PORT}/json/list`)).json() as typeof targets;
-      if (targets.some((target) => target.type === 'page')) break;
+      const targets = await (await fetch(`http://127.0.0.1:${CHROME_PORT}/json/list`)).json() as { type: string; webSocketDebuggerUrl: string }[];
+      pageTarget = targets.find((target) => target.type === 'page');
+      if (pageTarget) break;
     } catch {
       // Chrome not accepting connections yet.
     }
   }
-  const pageTarget = targets.find((target) => target.type === 'page');
-  if (!pageTarget) throw new Error('Chrome did not expose a debuggable page');
+  if (!pageTarget) {
+    const log = await Bun.file(CHROME_LOG).text().catch(() => '(no Chrome log)');
+    throw new Error(
+      `Chrome did not expose a debuggable page (exit code ${chrome.exitCode}). Chrome log:\n${log.slice(-2000)}`,
+    );
+  }
 
   for (const surface of Object.keys(routes)) {
     for (const zoom of [1, 2]) {
