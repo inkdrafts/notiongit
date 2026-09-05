@@ -256,6 +256,7 @@ export const LANDING_PAGE = `<!doctype html>
       </p>
       <a class="cta" href="/connect/github">Connect GitHub to get started</a>
       <p class="cta-note">Free GitHub Pages hosting. You'll connect Notion in the next step.</p>
+      <p class="cta-note">Before you connect, read the <a href="/privacy">Privacy Policy</a> and <a href="/terms">Terms of Service</a>.</p>
     </div>
   </section>
 
@@ -340,6 +341,10 @@ export const LANDING_PAGE = `<!doctype html>
           is interrupted partway through.
         </li>
       </ul>
+      <p>
+        The full details are in the <a href="/privacy">Privacy Policy</a> and
+        the <a href="/security">Security and Data Handling</a> page.
+      </p>
     </div>
   </section>
 
@@ -378,6 +383,12 @@ export const LANDING_PAGE = `<!doctype html>
       <a href="#how-it-works">How it works</a>
       <a href="#privacy-security">Privacy &amp; security</a>
       <a href="#open-source">Open source</a>
+      <a href="/privacy">Privacy Policy</a>
+      <a href="/terms">Terms of Service</a>
+      <a href="/security">Security</a>
+      <a href="/acceptable-use">Acceptable use</a>
+      <a href="/support">Support</a>
+      <a href="/leaving">Leaving InkDrafts</a>
     </nav>
   </div>
 </footer>

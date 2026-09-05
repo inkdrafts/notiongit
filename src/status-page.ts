@@ -172,7 +172,9 @@ authorization on GitHub (Settings &#8594; Applications &#8594; Authorized OAuth 
 A status page signed in during the last 8 hours keeps working until its
 session expires.</li>
 </ul>
-<p class="muted">In every case your repository and your published site stay yours.</p>
+<p class="muted">In every case your repository and your published site stay yours.
+The full walkthrough, including deleting your site, is on the
+<a href="/leaving">Leaving InkDrafts</a> page.</p>
 </section>`;
 
 function syncHtml(sync: SyncOutcome): string {
