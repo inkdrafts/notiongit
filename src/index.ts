@@ -411,6 +411,8 @@ export type {
   DeployOutcome,
   SafeSummaryParse,
   SafeSummaryResult,
+  SummaryCounts,
+  SummaryFallbackReason,
   SiteDiscovery,
   SiteStatus,
   StatusEnv,

@@ -238,6 +238,32 @@ function statusStates(): Record<string, string> {
       { kind: 'succeeded', finishedAtMs: 2, runUrl: null },
       { kind: 'built', commitSha: 'abc123' },
     ), { notice: 'sync_triggered', rerunFormToken: 'token' }),
+    session_summary: statusPage(session(
+      {
+        kind: 'succeeded',
+        source: 'summary_v1',
+        code: 'synced',
+        detail: 'pages: 1 created',
+        pages: { created: 1, updated: 0, renamed: 0, deleted: 0, unchanged: 0, errors: 0 },
+        posts: null,
+        finishedAtMs: 2,
+        runUrl: null,
+      },
+      { kind: 'built', commitSha: 'abc123' },
+    ), CHROME),
+    session_no_op: statusPage(session(
+      {
+        kind: 'no_op',
+        source: 'summary_v1',
+        code: 'missing_credentials',
+        detail: 'skipped',
+        pages: null,
+        posts: null,
+        finishedAtMs: 2,
+        runUrl: null,
+      },
+      { kind: 'built', commitSha: 'abc123' },
+    ), CHROME),
     session_failed: statusPage(session(
       { kind: 'failed', conclusion: 'failure', finishedAtMs: 3, runUrl: null },
       { kind: 'errored' },

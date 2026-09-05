@@ -391,11 +391,13 @@ every render re-derives the site from GitHub — the installation is re-read
 with the App JWT and cross-checked against the session by account id, an
 installation token is minted on the spot, the installation's repositories are
 matched against the InkDrafts marker (`findReusableGeneratedRepository`), and
-the workflow's latest `workflow_dispatch` run and latest Pages build are read
-once each (a listing that does not fit the five-page cap refuses as
-unavailable rather than rendering a partial list as "no site"). Uninstall,
-repository rename, and marker edits therefore self-heal on the next visit
-instead of needing reconciliation.
+the workflow's latest `workflow_dispatch` run, its `notiongit-run-summary`
+artifact, and the latest Pages build are read once each (a listing that does
+not fit the five-page cap refuses as unavailable rather than rendering a
+partial list as "no site"). An absent, expired, malformed, or unsupported
+summary falls back to the run conclusion. Uninstall, repository rename, and
+marker edits therefore self-heal on the next visit instead of needing
+reconciliation.
 
 Ownership is re-proved rather than stored: the provisioning job record
 expires on a rolling 24-hour TTL and has no user-to-job index, so it could not
@@ -418,11 +420,13 @@ gating), the global mutation budget, and a per-account fixed window
 crash overcounts, and after the budget so an infrastructure refusal never
 spends one of the account's slots), then dispatches the same
 `sync-notion.yml` workflow with `allow_bulk_delete: 'false'` hardcoded in
-`dispatchNotionSyncWorkflow`. Sync results render from the run conclusion
-(`success` is the only conclusion that can render as success) and say so on
-the page: the versioned run summary is emitted only into in-run step outputs
-with no REST read-back, so the worker never parses one today;
-`parseSafeSummary` is the tested parse guard for a future summary channel.
+`dispatchNotionSyncWorkflow`. The worker reads the latest run's
+`notiongit-run-summary` artifact with the same installation token, unzips its
+single `run-summary.json` member, and passes it through `parseSafeSummary`.
+Summary `success`, `no_op`, and `failure` results can show their safe detail
+and per-collection counts. An absent, expired, malformed, or unsupported
+summary renders the existing conclusion-derived result and names the
+fallback. The summary is render-scoped and never enters KV.
 
 ## Observability
 

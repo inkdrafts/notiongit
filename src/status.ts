@@ -7,8 +7,7 @@
  * site truth from GitHub with an installation token minted on the spot, and
  * the only retained state is the short-lived signed session cookie in the
  * browser plus the per-account rerun window. Sync and deploy results render
- * from the workflow run conclusion: the versioned run summary is emitted only
- * into in-run step outputs with no REST read-back.
+ * from the latest workflow run and its readable versioned summary artifact.
  */
 
 import {
@@ -20,7 +19,14 @@ import {
   type GithubInstallationAccount,
 } from './github-app-auth';
 import { userCopy, type ProvisioningFailureCode } from './failures';
-import { dispatchNotionSyncWorkflow, GithubSyncError, latestDispatchedSyncRun, latestSyncRun, type NotionSyncRunIdentity } from './notion-sync';
+import {
+  dispatchNotionSyncWorkflow,
+  GithubSyncError,
+  latestDispatchedSyncRun,
+  latestSyncRun,
+  latestSyncRunSummary,
+  type NotionSyncRunIdentity,
+} from './notion-sync';
 import {
   admitProvisioningRequest,
   admitProvisioningStage,
@@ -193,7 +199,28 @@ export type SyncOutcome =
   | { kind: 'never_ran' }
   | { kind: 'running'; startedAtMs: number | null; runUrl: string | null }
   | { kind: 'succeeded'; finishedAtMs: number | null; runUrl: string | null }
-  | { kind: 'failed'; conclusion: string; finishedAtMs: number | null; runUrl: string | null };
+  | { kind: 'failed'; conclusion: string; finishedAtMs: number | null; runUrl: string | null }
+  | {
+      kind: 'succeeded' | 'no_op' | 'failed';
+      source: 'summary_v1';
+      code: string | null;
+      detail: string | null;
+      pages: SummaryCounts | null;
+      posts: SummaryCounts | null;
+      finishedAtMs: number | null;
+      runUrl: string | null;
+    };
+
+export interface SummaryCounts {
+  created: number;
+  updated: number;
+  renamed: number;
+  deleted: number;
+  unchanged: number;
+  errors: number;
+}
+
+export type SummaryFallbackReason = 'malformed' | 'unsupported_version';
 
 export type DeployOutcome =
   | { kind: 'never_built' }
@@ -211,6 +238,7 @@ export type SiteDiscovery =
       accountLogin: string;
       repository: GeneratedRepositoryIdentity;
       syncRun: NotionSyncRunIdentity | null;
+      summary: SafeSummaryParse | null;
       build: GithubPagesBuildIdentity | null;
     }
   | {
@@ -224,6 +252,7 @@ export interface SiteStatus {
   site: { url: string };
   sync: SyncOutcome;
   deploy: DeployOutcome;
+  summaryFallback?: SummaryFallbackReason;
   /** True while a sync run is freshly in flight; the session page then offers
    * a manual refresh instead of reloading itself. */
   runInFlight: boolean;
@@ -249,19 +278,42 @@ function epochMs(value: string): number | null {
 }
 
 /**
- * Parse-guard for the versioned run summary (notiongit-sync, schema v1). No
- * src caller exists because GitHub exposes no read-back for step outputs or
- * step summaries; the notiongit-sync summary-channel follow-up calls this
- * once a readable channel exists. Non-JSON, non-object, or shape-violating
- * payloads are `malformed`; a documented shape carrying a different
- * `schema_version` is `unsupported_version`; within v1 an unknown `code` is
- * accepted as-is and the caller falls back on `result` alone.
+ * Parse-guard for the versioned run summary from notiongit-sync schema v1.
+ * Non-JSON, non-object, or shape-violating payloads are `malformed`; a
+ * documented shape carrying a different `schema_version` is
+ * `unsupported_version`; within v1 an unknown `code` is accepted as-is and
+ * the caller falls back on `result` alone.
  */
 export type SafeSummaryResult = 'success' | 'no_op' | 'failure';
 
 export type SafeSummaryParse =
-  | { ok: true; source: 'summary_v1'; result: SafeSummaryResult; code: string | null; finishedAtMs: number | null }
+  | {
+      ok: true;
+      source: 'summary_v1';
+      result: SafeSummaryResult;
+      code: string | null;
+      detail: string | null;
+      pages: SummaryCounts | null;
+      posts: SummaryCounts | null;
+      finishedAtMs: number | null;
+    }
   | { ok: false; reason: 'malformed' | 'unsupported_version' };
+
+function summaryCounts(value: unknown): SummaryCounts | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const keys = ['created', 'updated', 'renamed', 'deleted', 'unchanged', 'errors'] as const;
+  if (!keys.every((key) => Number.isSafeInteger(record[key]) && (record[key] as number) >= 0)) return undefined;
+  return {
+    created: record.created as number,
+    updated: record.updated as number,
+    renamed: record.renamed as number,
+    deleted: record.deleted as number,
+    unchanged: record.unchanged as number,
+    errors: record.errors as number,
+  };
+}
 
 export function parseSafeSummary(text: string): SafeSummaryParse {
   let payload: unknown;
@@ -277,16 +329,23 @@ export function parseSafeSummary(text: string): SafeSummaryParse {
   if (record.result !== 'success' && record.result !== 'no_op' && record.result !== 'failure') {
     return { ok: false, reason: 'malformed' };
   }
+  const pages = summaryCounts(record.pages);
+  const posts = summaryCounts(record.posts);
+  if (pages === undefined || posts === undefined) return { ok: false, reason: 'malformed' };
+  if (record.detail !== undefined && typeof record.detail !== 'string') return { ok: false, reason: 'malformed' };
   return {
     ok: true,
     source: 'summary_v1',
     result: record.result,
     code: typeof record.code === 'string' ? record.code : null,
+    detail: typeof record.detail === 'string' ? record.detail : null,
+    pages,
+    posts,
     finishedAtMs: typeof record.finished_at === 'string' ? epochMs(record.finished_at) : null,
   };
 }
 
-function syncOutcomeOf(run: NotionSyncRunIdentity): SyncOutcome {
+function conclusionSyncOutcomeOf(run: NotionSyncRunIdentity): SyncOutcome {
   const runUrl = run.htmlUrl || null;
   if (run.status !== 'completed') {
     return { kind: 'running', startedAtMs: run.createdAtMs, runUrl };
@@ -300,6 +359,22 @@ function syncOutcomeOf(run: NotionSyncRunIdentity): SyncOutcome {
     finishedAtMs: run.updatedAtMs ?? run.createdAtMs,
     runUrl,
   };
+}
+
+function syncOutcomeOf(run: NotionSyncRunIdentity, summary: SafeSummaryParse | null): SyncOutcome {
+  if (run.status !== 'completed' || summary === null || !summary.ok) return conclusionSyncOutcomeOf(run);
+  const outcome = {
+    source: summary.source,
+    code: summary.code,
+    detail: summary.detail,
+    pages: summary.pages,
+    posts: summary.posts,
+    finishedAtMs: summary.finishedAtMs ?? run.updatedAtMs ?? run.createdAtMs,
+    runUrl: run.htmlUrl || null,
+  } as const;
+  if (summary.result === 'success') return { kind: 'succeeded', ...outcome };
+  if (summary.result === 'no_op') return { kind: 'no_op', ...outcome };
+  return { kind: 'failed', ...outcome };
 }
 
 function deployOutcomeOf(build: GithubPagesBuildIdentity | null): DeployOutcome {
@@ -341,9 +416,10 @@ export function projectSiteStatus(discovery: SiteDiscovery, session: StatusSessi
     site: {
       repository: { name: discovery.repository.name, url: discovery.repository.htmlUrl },
       site: { url: siteUrl(viewerLogin, discovery.repository.name, discovery.repository.htmlUrl) },
-      sync: discovery.syncRun === null ? { kind: 'never_ran' } : syncOutcomeOf(discovery.syncRun),
+      sync: discovery.syncRun === null ? { kind: 'never_ran' } : syncOutcomeOf(discovery.syncRun, discovery.summary),
       deploy: deployOutcomeOf(discovery.build),
       runInFlight: syncRunning && !runStuck,
+      ...(discovery.summary !== null && !discovery.summary.ok ? { summaryFallback: discovery.summary.reason } : {}),
     },
   };
 }
@@ -426,7 +502,17 @@ export async function discoverSite(
   } catch (error) {
     return discoveryFailure(error);
   }
-  return { ok: true, accountLogin, repository, syncRun, build };
+  const summaryText = syncRun === null || syncRun.status !== 'completed'
+    ? null
+    : await latestSyncRunSummary(installationToken.raw, repository.fullName, syncRun.runId, fetcher);
+  return {
+    ok: true,
+    accountLogin,
+    repository,
+    syncRun,
+    summary: summaryText === null ? null : parseSafeSummary(summaryText),
+    build,
+  };
 }
 
 /**
