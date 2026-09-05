@@ -78,6 +78,7 @@ import {
   saveNotionTemplateResolution,
 } from './notion-template';
 import { LANDING_PAGE } from './landing-page';
+import { POLICY_PAGES } from './policy-pages';
 import { progressPageUrl, projectProvisioning } from './progress';
 import { progressPage, type SiteCheckOutcome } from './progress-page';
 import { checkPublicSiteReachable } from './site-deployment';
@@ -1081,6 +1082,11 @@ export function route(
 
   if (request.method === 'GET' && url.pathname === '/healthz') {
     return json({ ok: true, service: 'notiongit' });
+  }
+
+  const policy = POLICY_PAGES[url.pathname];
+  if (request.method === 'GET' && policy) {
+    return html(policy.document);
   }
 
   if (request.method === 'GET' && url.pathname === '/connect/github') {

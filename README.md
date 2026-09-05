@@ -164,6 +164,13 @@ The launch-gate rehearsal procedure lives in
 [`docs/rehearsal-script.md`](docs/rehearsal-script.md), and the report
 template it commits is
 [`docs/rehearsal-report-template.md`](docs/rehearsal-report-template.md).
+Public launch is gated by
+[`docs/launch-checklist.md`](docs/launch-checklist.md): every gate item needs
+evidence or a documented waiver, the five security reviews live in
+[`docs/launch-gate-reviews.md`](docs/launch-gate-reviews.md), and the
+post-launch monitoring and rollback plan is
+[`docs/post-launch.md`](docs/post-launch.md). The automatable checks are
+`bun run scripts/launch-gate.ts` and `bun run scripts/license-audit.ts`.
 
 The read-only development-repository Pages acceptance check is opt-in:
 

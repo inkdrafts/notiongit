@@ -15,6 +15,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 
 import type { ProvisioningFailureCode } from '../src/failures';
 import { LANDING_PAGE } from '../src/landing-page';
+import { POLICY_PAGES, POLICY_PATHS } from '../src/policy-pages';
 import { createProvisioningJob, PROVISIONING_STEP_ORDER, type ProvisioningJob } from '../src/provisioning-job';
 import { progressPage, type SiteCheckOutcome } from '../src/progress-page';
 import { projectProvisioning, type ProgressSnapshot } from '../src/progress';
@@ -105,6 +106,12 @@ describe('accessibility suite', () => {
   test('every status state has no serious or critical violations', async () => {
     for (const [label, documentHtml] of Object.entries(statusStates())) {
       await expectAccessible(`status/${label}`, documentHtml);
+    }
+  });
+
+  test('every policy page has no serious or critical violations', async () => {
+    for (const path of POLICY_PATHS) {
+      await expectAccessible(`policy${path}`, POLICY_PAGES[path]!.document);
     }
   });
 });
