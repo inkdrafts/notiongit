@@ -457,13 +457,19 @@ covered by tests; all of them block turning the cron trigger on.
    comparing the response to the interface. Check specifically whether
    `count` comes back as a JSON number or a string: `summarizeAlertWindow` requires
    `typeof row.count === 'number'` and drops the row otherwise, which is the most
-   likely way this silently returns zero alerts.
+   likely way this silently returns zero alerts. The check is a command:
+   `scripts/drill-alerts.ts` runs the shipped `alertWindowQuery` against the
+   live SQL API and rules on the response shape, and `--rows-file` rehearses
+   the evaluation and delivery half offline.
 2. **Neither dataset has received a data point yet.** Cloudflare creates an
    Analytics Engine dataset automatically the first time a Worker writes to it
    after the binding is declared ("Get started", verified 2026-09-03), so nothing
-   needs creating by hand — but until a deploy carrying this code serves real
-   traffic, every query above returns nothing. Confirm both datasets are queryable
-   after the first such deploy.
+   needs creating by hand — but a deploy carrying the bindings also requires
+   Analytics Engine to be enabled on the account. It is not yet: the versions
+   API rejects such a deploy with error 10089 until Analytics Engine is enabled
+   in the dashboard (observed 2026-09-05). Until that enablement plus a real
+   traffic deploy, no data point exists in either dataset. Confirm both
+   datasets are queryable after that deploy.
 3. **The account's Workers Logs plan tier is not recorded**, so the retention
    figure above is either 3 or 7 days. Check the plan on the Cloudflare account
    before writing 7 days into any user-facing privacy claim.

@@ -144,12 +144,13 @@ export interface AlertCheckEnv {
 }
 
 const DEFAULT_ALERT_WINDOW_MINUTES = 60;
-const DATASET_NAME_PATTERN = /^[A-Za-z0-9_]+$/u;
+export const DATASET_NAME_PATTERN = /^[A-Za-z0-9_]+$/u;
 
 // `datasetName` is interpolated into SQL text; the caller checks it against
 // `DATASET_NAME_PATTERN` before calling this, so it never reaches here
-// unvalidated.
-function alertWindowQuery(windowMinutes: number, datasetName: string): string {
+// unvalidated. Exported for the alert drill (scripts/drill-alerts.ts), which
+// verifies this exact SQL against the live Analytics Engine SQL API.
+export function alertWindowQuery(windowMinutes: number, datasetName: string): string {
   // Also interpolated, so reduced to a positive integer rather than trusted
   // as an arbitrary caller-supplied value.
   const minutes = Math.max(1, Math.floor(windowMinutes));
@@ -165,7 +166,9 @@ function isSqlResponse(value: unknown): value is AnalyticsEngineSqlResponse {
   return typeof value === 'object' && value !== null && Array.isArray((value as { data?: unknown }).data);
 }
 
-function alertMessage(alert: ObservabilityAlert): string {
+// Exported with `alertWindowQuery` for the alert drill (scripts/drill-alerts.ts),
+// which posts the exact payload `runObservabilityAlertCheck` would.
+export function alertMessage(alert: ObservabilityAlert): string {
   switch (alert.kind) {
     case 'step_failure_rate':
       return `Provisioning step ${alert.step} failed ${(alert.failureRate * 100).toFixed(1)}% of ${alert.sampleSize} attempts in the last ${alert.windowMinutes} minutes`;

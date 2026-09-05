@@ -16,8 +16,13 @@ bun run build
 bun run scripts/launch-gate.ts                       # against production
 bun run scripts/launch-gate.ts http://127.0.0.1:8787 # against a deployment
 bun run scripts/license-audit.ts
+bun run scripts/drill-admission-control.ts <staging URL> <staging JOBS namespace id>
+bun run scripts/drill-alerts.ts <dataset> <webhook URL>
 git diff --check
 ```
+
+The drills need Cloudflare credentials from the environment; each script
+header states exactly which.
 
 ## A. Policies published and reachable before consent
 
@@ -39,6 +44,7 @@ runs (2026-09-05):
 | --- | --- | --- |
 | Against current code served locally | 13/14. The one failure is the callback route answering 500 with the error page, which is what an unconfigured environment returns; a deployed Worker with its secrets returns 400 for the same request | The code under review passes every URL check it can answer |
 | Against production (`notiongit.notiongit.workers.dev`) | 5/14. healthz, the public App, and the three repositories pass. The landing page, policies, and callback checks fail because production runs the 2026-09-01 foundation deploy and has not received any code since | **Production is stale.** Deploy merged `main` (with this PR) before any launch step, then re-run for the full 14/14 |
+| Against staging (`notiongit-staging.notiongit.workers.dev`), 2026-09-05 | 14/14, including the callback-route check the local run cannot answer | Current `main` passes every URL check when the environment carries its secrets. The staging deploy used a drill config identical to `wrangler.toml` minus the Analytics Engine bindings, which do not deploy until Analytics Engine is enabled (see §E) |
 
 | Item | Evidence | Status |
 | --- | --- | --- |
@@ -59,8 +65,8 @@ each with its evidence. The dependency/license audit is automated:
 | Dependency and license audit | `bun run scripts/license-audit.ts`: 10/10 direct dependencies inside the permissive allowlist (ISC, MIT, MPL-2.0, MIT OR Apache-2.0) | PASS |
 | Threat-model review | Reviews doc §3 | PASS |
 | Backup and rollback review | Reviews doc §4 | PASS |
-| Incident drill: kill switch exercised in staging | [`provisioning-admission-runbook.md`](provisioning-admission-runbook.md) is the drill script; run it against staging and record the observed pause, refusal, and resume | PENDING |
-| Incident drill: alert path exercised | [`observability.md`](observability.md#manual-verification-follow-up) §Manual verification follow-up is the drill script; verify the SQL row shape, fire a synthetic threshold, and record the webhook delivery | PENDING |
+| Incident drill: kill switch exercised in staging | `bun run scripts/drill-admission-control.ts` against staging, 2026-09-05: 6/6 steps. Baseline admits (302 to github.com); `kill` refuses with 503 `provisioning_rejected` and writes a `global_kill` audit record; `pause` holds with 503 `provisioning_paused` and a `global_pause` audit record; resume with `active` admits again | PASS |
+| Incident drill: alert path exercised | The drill is a command: `bun run scripts/drill-alerts.ts` runs the shipped `alertWindowQuery`, rules on the response shape, evaluates thresholds, and delivers alerts. Its evaluation and delivery halves are proven against offline fixtures (both alert kinds fire and reach the webhook; a string `count` is flagged as the silent row-drop it would be). The live query is PENDING on two blockers: Analytics Engine is not enabled on the Cloudflare account (see §E), and no Account Analytics read token exists to set as `CF_ANALYTICS_API_TOKEN` | PENDING |
 
 ## D. Provider and funnel verification
 
@@ -76,7 +82,7 @@ each with its evidence. The dependency/license audit is automated:
 
 | Item | Evidence | Status |
 | --- | --- | --- |
-| Deploy merged `main` to production | `bun run build` dry-run passes; the manual Deploy workflow needs the `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets, which are **not yet set** (`gh secret set`, never commit them) | PENDING |
+| Deploy merged `main` to production | `bun run build` dry-run passes; the manual Deploy workflow needs the `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets, which are **not yet set** (`gh secret set`, never commit them). Analytics Engine must also be enabled on the Cloudflare account first: deploying any version carrying the `analytics_engine_datasets` bindings fails with API error 10089 until it is enabled in the dashboard (observed 2026-09-05 deploying staging; the drill deploy in §B shipped without the bindings) | PENDING |
 | `inkdrafts.com` serves the Worker | Custom-domain routing is configured in the Cloudflare dashboard, not in `wrangler.toml`; after DNS, `https://inkdrafts.com/healthz` must answer. Until then production is `https://notiongit.notiongit.workers.dev` | PENDING |
 | Full launch-gate run is green against the final production domain | `bun run scripts/launch-gate.ts https://inkdrafts.com` (or the workers.dev origin if launch precedes DNS) after the deploy row passes | PENDING |
 | Production OAuth/install/provisioning smoke test | Repeat a real onboarding on a fresh account per [`rehearsal-script.md`](rehearsal-script.md) run A, after the deploy and DNS rows | PENDING |
