@@ -29,6 +29,7 @@ export interface GithubRepositorySummary {
   default_branch?: string;
   description?: string | null;
   fork?: boolean;
+  topics?: string[];
 }
 
 export class GithubRepositoryApiError extends Error {

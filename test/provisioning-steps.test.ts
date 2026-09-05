@@ -74,9 +74,10 @@ function base64(content: string): string {
 }
 
 describe('runVerifyRepository', () => {
-  test('records the readable head sha and tree sha', async () => {
+  test('records the readable head sha and tree sha, and applies the topic marker', async () => {
     const job = makeJob();
-    const fetcher = (async (input: RequestInfo | URL) => {
+    const topicRequests: unknown[] = [];
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url === 'https://api.github.com/repos/alice/alice.github.io') {
         return Response.json({ id: 1001, full_name: 'alice/alice.github.io', default_branch: 'main', fork: false });
@@ -84,11 +85,16 @@ describe('runVerifyRepository', () => {
       if (url === 'https://api.github.com/repos/alice/alice.github.io/commits/main') {
         return Response.json({ sha: 'generated-head-sha', commit: { tree: { sha: 'generated-tree-sha' } } });
       }
+      if (url === 'https://api.github.com/repos/alice/alice.github.io/topics' && init?.method === 'PUT') {
+        topicRequests.push(JSON.parse(String(init.body)));
+        return Response.json({ names: ['inkdrafts-site'] });
+      }
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
 
     const patch = await PROVISIONING_STEP_HANDLERS.verify_repository(job, makeContext(fetcher));
     expect(patch.generatedRepository).toMatchObject({ headSha: 'generated-head-sha', headTreeSha: 'generated-tree-sha' });
+    expect(topicRequests).toEqual([{ names: ['inkdrafts-site'] }]);
   });
 });
 

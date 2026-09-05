@@ -101,6 +101,7 @@ export {
   awaitGeneratedRepositoryCommit,
   findReusableGeneratedRepository,
   GENERATED_REPOSITORY_DESCRIPTION,
+  GENERATED_REPOSITORY_TOPIC,
   generateOrReuseRepository,
   generateRepositoryFromTemplate,
   getTemplateHead,

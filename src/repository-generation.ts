@@ -22,11 +22,18 @@ export const TEMPLATE_REPOSITORY_NAME = 'notiongit-template';
 export const TEMPLATE_REPOSITORY_FULL_NAME = `${TEMPLATE_REPOSITORY_OWNER}/${TEMPLATE_REPOSITORY_NAME}`;
 
 /**
- * The product description sent with every generated repository. It doubles as
- * the marker that distinguishes an InkDrafts-generated repository from a
- * foreign repository that happens to hold the selected name.
+ * The product description sent with every generated repository. Owners edit
+ * descriptions, so this is a fallback marker: `GENERATED_REPOSITORY_TOPIC` is
+ * the primary one because it survives that edit.
  */
 export const GENERATED_REPOSITORY_DESCRIPTION = 'Notion-powered site published with InkDrafts';
+
+/**
+ * The durable marker topic applied once the App's installation can reach a
+ * generated repository. Unlike the description, an owner cannot edit this
+ * away by hand without knowing to look in the topics list.
+ */
+export const GENERATED_REPOSITORY_TOPIC = 'inkdrafts-site';
 
 export const GENERATE_MAX_POLL_ATTEMPTS = 8;
 export const GENERATE_POLL_INITIAL_DELAY_MS = 250;
@@ -143,12 +150,17 @@ function generatedIdentity(
   };
 }
 
-/** A repository is ours to reuse when it is not a fork and carries the marker description. */
+/**
+ * A repository is ours to reuse when it is not a fork and carries either
+ * marker: the durable topic, or the description for a repository generated
+ * before the topic could be set (or one an owner edited before this attempt).
+ */
 export function isInkdraftsGeneratedRepository(repository: GithubRepositorySummary): boolean {
   return (
     typeof repository.name === 'string' &&
     repository.fork !== true &&
-    repository.description === GENERATED_REPOSITORY_DESCRIPTION
+    (repository.description === GENERATED_REPOSITORY_DESCRIPTION ||
+      (repository.topics ?? []).includes(GENERATED_REPOSITORY_TOPIC))
   );
 }
 
@@ -269,6 +281,26 @@ export interface GeneratedRepositoryPollOptions {
 }
 
 /**
+ * Best-effort: apply the durable topic marker through the App's
+ * Administration permission. Called once the installation is known to reach
+ * the repository, so a failure here (a scope gap, a transient error) leaves
+ * the description marker as the reuse test instead of blocking provisioning.
+ */
+async function setGeneratedRepositoryTopic(
+  authorization: string,
+  repositoryFullName: string,
+  fetcher: typeof fetch,
+): Promise<void> {
+  try {
+    await fetcher(`${GITHUB_API}/repos/${repositoryFullName}/topics`, {
+      method: 'PUT',
+      headers: withJsonContent(githubHeaders(authorization)),
+      body: JSON.stringify({ names: [GENERATED_REPOSITORY_TOPIC] }),
+    });
+  } catch {}
+}
+
+/**
  * Poll until the generated repository reports `main` with a readable initial
  * commit. Generation is asynchronous — the first repository response can
  * carry a placeholder default branch and no readable commit — so `404`s,
@@ -276,6 +308,9 @@ export interface GeneratedRepositoryPollOptions {
  * the installation token so success also proves the App installation received
  * the repository; exhausting the attempts raises a distinct timeout error.
  * Only a fork is terminal, because a fork never becomes a generated repository.
+ * Success also applies the durable topic marker (best-effort, see
+ * `setGeneratedRepositoryTopic`) so a later retry can reuse this repository
+ * even after its description is edited.
  */
 export async function awaitGeneratedRepositoryCommit(
   authorization: string,
@@ -316,6 +351,7 @@ export async function awaitGeneratedRepositoryCommit(
         );
         const treeSha = commit?.commit?.tree?.sha;
         if (typeof commit?.sha === 'string' && commit.sha && typeof treeSha === 'string' && treeSha) {
+          await setGeneratedRepositoryTopic(authorization, repositoryFullName, fetcher);
           return { defaultBranch: 'main', headSha: commit.sha, headTreeSha: treeSha };
         }
       }
