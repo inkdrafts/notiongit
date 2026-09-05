@@ -117,6 +117,18 @@ export interface SiteDeploymentProgress {
   verifiedAt: number | null;
 }
 
+/**
+ * Canonical Notion URLs for this job's duplicated template, captured from the
+ * API responses the database IDs came from. Only API-returned canonical URLs
+ * — never IDs and never synthesized links — so a null field means "Notion did
+ * not hand us a usable URL" and renders as linkless copy.
+ */
+export interface NotionTemplateLinks {
+  pagesUrl: string | null;
+  postsUrl: string | null;
+  templateRootUrl: string | null;
+}
+
 export interface ProvisioningJobData {
   repository: RepositoryDestination;
   generatedRepository: GeneratedRepositoryIdentity;
@@ -124,6 +136,8 @@ export interface ProvisioningJobData {
   sync: NotionSyncProgress | null;
   syncDispatchMarker: SyncDispatchMarker | null;
   deployment: SiteDeploymentProgress | null;
+  /** Written once, in the same write that sets `notionSecretsWrittenAt`. */
+  notionLinks: NotionTemplateLinks | null;
   /**
    * When the repository's three Actions secrets were written by the Notion
    * OAuth callback — a timestamp, never the values. Until it is set the job
@@ -165,6 +179,14 @@ export function provisioningJobKey(jobId: string): string {
 
 export function isTerminalProvisioningStatus(status: ProvisioningJobStatus): boolean {
   return status === 'succeeded' || status === 'failed' || status === 'dead_letter';
+}
+
+/** A job whose terminal success is established, so success-only helpers take
+ * exactly what they can trust instead of re-checking the status. */
+export type SucceededProvisioningJob = ProvisioningJob & { status: 'succeeded' };
+
+export function isSucceededProvisioningJob(job: ProvisioningJob): job is SucceededProvisioningJob {
+  return job.status === 'succeeded';
 }
 
 /** The first step that has not yet succeeded, or `null` once every step has. */
@@ -214,6 +236,7 @@ export function createProvisioningJob(params: CreateProvisioningJobParams): Prov
       sync: null,
       syncDispatchMarker: null,
       deployment: null,
+      notionLinks: null,
       notionSecretsWrittenAt: null,
     },
     lock: null,
@@ -246,9 +269,15 @@ function sanitizedStepErrors(job: ProvisioningJob): ProvisioningJob['steps'] {
 export async function loadProvisioningJob(kv: KVNamespace, jobId: string): Promise<ProvisioningJob | null> {
   const job = await kv.get<ProvisioningJob>(provisioningJobKey(jobId), 'json');
   if (!job || job.version !== PROVISIONING_JOB_VERSION) return null;
-  // Records written before the throttle existed carry no `wait`; the version
+  // Records written before the throttle existed carry no `wait`, and records
+  // written before URL capture existed carry no `notionLinks`; the version
   // stays 1 because the 24h TTL drains them without a migration.
-  return { ...job, steps: sanitizedStepErrors(job), wait: job.wait ?? null };
+  return {
+    ...job,
+    steps: sanitizedStepErrors(job),
+    wait: job.wait ?? null,
+    data: { ...job.data, notionLinks: job.data.notionLinks ?? null },
+  };
 }
 
 /** Persist a job with the same rolling TTL used everywhere else in this project — the

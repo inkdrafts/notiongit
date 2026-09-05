@@ -239,3 +239,33 @@ export async function verifyPublicSiteReachable(
 
   throw new GithubDeployError('github_deploy_url_unreachable', 504);
 }
+
+export interface SiteCheckOptions {
+  fetcher?: typeof fetch;
+  sleep?: (milliseconds: number) => Promise<void>;
+}
+
+/**
+ * One-shot answer to "is the public site answering right now", for the
+ * success screen's re-check affordance. `verifyPublicSiteReachable` stays the
+ * single reachable oracle; this wrapper pins the attempt budget to exactly 1,
+ * so there is no retry loop in the request path and the worst case is one
+ * outbound GET (sub-second typically, bounded above by the runtime's own
+ * fetch timeout). Any unreachable outcome — non-2xx or network error —
+ * collapses to false; nothing about the failure mode escapes.
+ */
+export async function checkPublicSiteReachable(
+  url: string,
+  options: SiteCheckOptions = {},
+): Promise<boolean> {
+  try {
+    await verifyPublicSiteReachable(url, {
+      maxAttempts: 1,
+      fetcher: options.fetcher,
+      sleep: options.sleep ?? defaultSleep,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}

@@ -149,6 +149,12 @@ export interface NotionTemplateResolution {
   pagesSchema: NotionDatabaseSchemaSummary;
   postsSchema: NotionDatabaseSchemaSummary;
   resolvedAt: number;
+  /** Canonical Notion URLs captured from the same API responses the IDs came
+   * from. Null means Notion did not hand us a usable URL; links are never
+   * synthesized from the bare IDs. */
+  templateRootUrl: string | null;
+  pagesUrl: string | null;
+  postsUrl: string | null;
 }
 
 export type NotionTemplateErrorCode =
@@ -186,7 +192,12 @@ interface NotionPropertyShape {
 interface NotionDatabaseResponse {
   object?: unknown;
   id?: unknown;
+  url?: unknown;
   properties?: Record<string, NotionPropertyShape>;
+}
+
+interface NotionPageResponse {
+  url?: unknown;
 }
 
 interface NotionBlockShape {
@@ -256,6 +267,25 @@ export function normalizeNotionId(value: string): string | null {
     compact.slice(16, 20),
     compact.slice(20, 32),
   ].join('-');
+}
+
+/**
+ * Boundary parser for the canonical URLs the Notion API returns alongside
+ * every resource: only an absolute https URL on notion.so or a subdomain
+ * qualifies. Null is the modeled "not captured", so a future host change
+ * degrades to linkless copy instead of a broken link.
+ */
+export function parseNotionCanonicalUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:') return null;
+  const isNotionHost = parsed.hostname === 'notion.so' || parsed.hostname.endsWith('.notion.so');
+  return isNotionHost ? parsed.href : null;
 }
 
 const defaultSleep = (milliseconds: number) =>
@@ -393,6 +423,21 @@ async function fetchTemplateDatabase(
   }
   if (result.status === 401 || result.status === 403) return { kind: 'forbidden' };
   return { kind: 'invisible' };
+}
+
+/**
+ * Best-effort canonical URL of the duplicated root page — a cosmetic link,
+ * so any failure (status, shape, network) degrades to null and must never
+ * block resolution or the secrets write.
+ */
+async function fetchTemplateRootUrl(
+  accessToken: string,
+  rootId: string,
+  fetcher: typeof fetch,
+): Promise<string | null> {
+  const result = await notionGetJson<NotionPageResponse>(`/v1/pages/${rootId}`, accessToken, fetcher);
+  if (result.status !== 200 || !result.body) return null;
+  return parseNotionCanonicalUrl(result.body.url);
 }
 
 function optionNamesFor(property: NotionPropertyShape): string[] {
@@ -545,6 +590,7 @@ type DatabaseIdentity = TemplateDatabaseRole | 'ambiguous' | 'unrecognized';
 
 interface IdentifiedCandidate {
   summary: NotionDatabaseSchemaSummary;
+  url: string | null;
   identity: DatabaseIdentity;
   scores: Record<TemplateDatabaseRole, FingerprintScore>;
 }
@@ -570,6 +616,7 @@ function identifyTemplateDatabase(databaseId: string, database: NotionDatabaseRe
 
   return {
     summary: summarizeDatabase(databaseId, properties),
+    url: parseNotionCanonicalUrl(database.url),
     identity,
     scores,
   };
@@ -698,6 +745,9 @@ export async function resolveNotionTemplateDatabases(
         pagesSchema: pages.summary,
         postsSchema: posts.summary,
         resolvedAt: Date.now(),
+        templateRootUrl: await fetchTemplateRootUrl(accessToken, rootId, fetcher),
+        pagesUrl: pages.url,
+        postsUrl: posts.url,
       };
       const validation = validateNotionTemplateSchemas(resolution);
       if (!validation.valid) {
@@ -760,5 +810,15 @@ export async function loadNotionTemplateResolution(
 ): Promise<NotionTemplateResolutionRecord | null> {
   const record = await kv.get<NotionTemplateResolutionRecord>(notionTemplateResolutionKey(jobId), 'json');
   if (!record || record.version !== 1 || typeof record.jobId !== 'string') return null;
-  return record;
+  // Records written before URL capture existed carry no link fields; the
+  // version stays 1 because the 24h TTL drains them without a migration.
+  return {
+    ...record,
+    resolution: {
+      ...record.resolution,
+      templateRootUrl: record.resolution.templateRootUrl ?? null,
+      pagesUrl: record.resolution.pagesUrl ?? null,
+      postsUrl: record.resolution.postsUrl ?? null,
+    },
+  };
 }

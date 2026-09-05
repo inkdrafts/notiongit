@@ -63,7 +63,32 @@ function failFirst(job: ProvisioningJob, code: ProvisioningFailureCode): void {
 
 const ACTIVE = snapshotFor('queued');
 const AWAITING = snapshotFor('awaiting_notion');
+const NOTION_LINKS = {
+  pagesUrl: 'https://www.notion.so/alice/Pages-11111111111141118111111111111111',
+  postsUrl: 'https://www.notion.so/alice/Posts-22222222222242228222222222222222',
+  templateRootUrl: 'https://www.notion.so/alice/My-Site-Home',
+};
 const SUCCEEDED = snapshotFor('succeeded', succeedAll);
+const SUCCEEDED_LINKS = snapshotFor('succeeded', (job) => {
+  succeedAll(job);
+  job.data.notionLinks = NOTION_LINKS;
+});
+const SUCCEEDED_PROJECT = snapshotFor('succeeded', (job) => {
+  succeedAll(job);
+  job.data.notionLinks = NOTION_LINKS;
+  job.data.repository = {
+    name: 'alice-inkdrafts',
+    url: 'https://alice.github.io/alice-inkdrafts',
+    baseurl: '/alice-inkdrafts',
+    kind: 'project',
+  };
+  job.data.generatedRepository = {
+    ...job.data.generatedRepository,
+    fullName: 'alice/alice-inkdrafts',
+    name: 'alice-inkdrafts',
+    htmlUrl: 'https://github.com/alice/alice-inkdrafts',
+  };
+});
 const FAILED = snapshotFor('dead_letter', (job) => failFirst(job, 'github_rate_limited'));
 const MISSING: ProgressSnapshot = projectProvisioning(null, NOW);
 
@@ -131,6 +156,8 @@ describe('progress page', () => {
     expect(page).toContain(`const POLL_MAX_MS = ${PROGRESS_POLL_MAX_INTERVAL_MS}`);
     expect(page).not.toContain('innerHTML');
     expect(page).not.toContain('document.write');
+    const script = page.slice(page.lastIndexOf('<script>') + '<script>'.length).split('</script>')[0];
+    expect(() => new Function(script)).not.toThrow();
   });
 
   test('makes no request outside the origin', () => {
@@ -152,6 +179,50 @@ describe('progress page', () => {
     expect(page).toContain('href="https://github.com/alice/alice.github.io"');
     expect(page).toContain('alice.github.io</a>');
     expect(page).toContain('data-state="done"');
+  });
+
+  test('the success screen names its sections and keeps every promised affordance', () => {
+    const page = progressPage('job-123', SUCCEEDED_LINKS);
+    expect(page).toContain('<h2>Everyday writing happens in Notion</h2>');
+    expect(page).toContain('<h2>Your site is a repository you own</h2>');
+    expect(page).toContain('>View your site</a>');
+    // The propagation line is always present, even though succeeded means the
+    // server verified the site at publish time.
+    expect(page).toContain('We checked that your site was live right before publishing finished.');
+    expect(page).toContain('GitHub’s network may still be updating it. It is usually ready within a few minutes.');
+    expect(page).toContain('Changes you make in Notion appear on your site automatically. Syncing runs about every 10 minutes.');
+    expect(page).toContain('<a href="/status">your dashboard</a>');
+    expect(page).toContain('href="https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site"');
+    expect(page).toContain('Writing happens in Notion, so you never need GitHub for your everyday work.');
+    expect(page).toContain('your site keeps working even if InkDrafts disappears.');
+  });
+
+  test('captured Notion links render as real anchors with their fallbacks hidden', () => {
+    const page = progressPage('job-123', SUCCEEDED_LINKS);
+    expect(page).toContain('<a id="notion-root-link" href="https://www.notion.so/alice/My-Site-Home">Open in Notion</a>');
+    expect(page).toContain('<a id="notion-pages-link" href="https://www.notion.so/alice/Pages-11111111111141118111111111111111">Open in Notion</a>');
+    expect(page).toContain('<a id="notion-posts-link" href="https://www.notion.so/alice/Posts-22222222222242228222222222222222">Open in Notion</a>');
+    for (const id of ['notion-root-link-missing', 'notion-pages-link-missing', 'notion-posts-link-missing']) {
+      expect(page).toContain(`id="${id}" class="notion-missing" hidden`);
+    }
+  });
+
+  test('a null Notion link renders linkless fallback copy and never an empty href', () => {
+    const page = progressPage('job-123', SUCCEEDED);
+    for (const id of ['notion-root-link', 'notion-pages-link', 'notion-posts-link']) {
+      expect(page).not.toContain(`<a id="${id}"`);
+      expect(page).toContain(`id="${id}-missing" class="notion-missing">`);
+    }
+    expect(page).toContain('We could not capture a link here. You can find this page in your Notion workspace.');
+    expect(page).not.toContain('href=""');
+  });
+
+  test('pins the exact live URL for both the apex and the project destination', () => {
+    expect(progressPage('job-123', SUCCEEDED_LINKS))
+      .toContain('<a id="site-link" class="cta" href="https://alice.github.io">View your site</a>');
+    const project = progressPage('job-123', SUCCEEDED_PROJECT);
+    expect(project).toContain('<a id="site-link" class="cta" href="https://alice.github.io/alice-inkdrafts">View your site</a>');
+    expect(project).toContain('href="https://github.com/alice/alice-inkdrafts"');
   });
 
   test('failure renders taxonomy copy, the blocked stage, and a conditional restart link', () => {
@@ -182,20 +253,82 @@ describe('progress page', () => {
     expect(script).toContain("setText('missing-action', progress.action)");
     expect(script).toContain("setLink('site-link', progress.site.url)");
     expect(script).toContain("setLink('repository-link', progress.repository.url, progress.repository.name)");
+    expect(script).toContain("setNotionLink('notion-root-link', progress.notionLinks.templateRootUrl)");
+    expect(script).toContain("setNotionLink('notion-pages-link', progress.notionLinks.pagesUrl)");
+    expect(script).toContain("setNotionLink('notion-posts-link', progress.notionLinks.postsUrl)");
+  });
+
+  test('polling stops at terminal and never navigates the page', () => {
+    const script = progressPage('job-123', SUCCEEDED).slice(progressPage('job-123', SUCCEEDED).lastIndexOf('<script>'));
+    // One guard in poll(), one after the initial render: both stop scheduling
+    // at terminal, and no branch navigates or refreshes.
+    expect(script.match(/if \(isTerminal\(snapshot\)\) return;/gu)).toHaveLength(2);
+    expect(script).not.toContain('location.');
+    expect(script).not.toContain('window.open');
+  });
+
+  test('the ?check=1 outcome renders inline in the propagation area of a succeeded snapshot', () => {
+    const okPage = progressPage('job-123', SUCCEEDED_LINKS, { reachable: true, checkedAt: NOW });
+    expect(okPage)
+      .toContain('<p id="site-check-result" class="muted">Checked just now: your site is answering.</p>');
+    const lagPage = progressPage('job-123', SUCCEEDED, { reachable: false, checkedAt: NOW });
+    expect(lagPage)
+      .toContain('<p id="site-check-result" class="muted">Checked just now: not answering yet. Try again in a minute.</p>');
+  });
+
+  test('a plain render hides the result line and carries the no-JS check link', () => {
+    for (const snapshot of [ACTIVE, SUCCEEDED, MISSING]) {
+      expect(progressPage('job-123', snapshot)).toContain('<p id="site-check-result" class="muted" hidden></p>');
+    }
+    expect(progressPage('job-123', SUCCEEDED))
+      .toContain('<a id="site-check-link" href="/progress?job_id=job-123&amp;check=1">Check if it is up yet</a>');
+  });
+
+  test('the client-side check binds at most once, writes the shared copy, and never reschedules', () => {
+    const page = progressPage('job-123', SUCCEEDED);
+    const script = page.slice(page.lastIndexOf('<script>'));
+    const bindStart = script.indexOf('function bindSiteCheck');
+    const bindEnd = script.indexOf('function render(');
+    expect(bindStart).toBeGreaterThan(-1);
+    expect(bindEnd).toBeGreaterThan(bindStart);
+    const bindBody = script.slice(bindStart, bindEnd);
+    expect(bindBody).toContain('if (siteCheckBound) return;');
+    expect(bindBody).toContain("fetch(siteCheckUrl, { headers: { accept: 'application/json' } })");
+    expect(bindBody).not.toContain('schedule');
+    expect(bindBody).not.toContain('timer');
+    // The result line reuses the same constants the server rendered the ?check=1
+    // outcome from, so both transports phrase it identically.
+    expect(script).toContain('reachable ? CHECK_OK : CHECK_NOT_YET');
+    // Entering succeeded binds it; a second render call must not rebind.
+    expect(script.match(/bindSiteCheck\(\);/gu)).toHaveLength(1);
   });
 
   test('escapes snapshot data in text, attributes, and the JSON island', () => {
     const hostile = snapshotFor('succeeded', (job) => {
+      succeedAll(job);
       job.data.generatedRepository.name = 'alice<script>alert(1)</script>';
       job.data.generatedRepository.htmlUrl = 'https://github.com/alice/repo" onmouseover="alert(1)';
+      job.data.repository = { ...job.data.repository, url: 'https://alice.github.io/" onmouseover="alert(6)' };
+      job.data.notionLinks = {
+        pagesUrl: 'https://www.notion.so/pages" onmouseover="alert(3)',
+        postsUrl: 'https://www.notion.so/posts\' onload="alert(4)',
+        templateRootUrl: 'https://www.notion.so/root" onclick="alert(5)',
+      };
     });
     const page = progressPage('job-123', hostile);
 
     expect(page).toContain('alice&lt;script&gt;alert(1)&lt;/script&gt;');
     expect(page).toContain('href="https://github.com/alice/repo&quot; onmouseover=&quot;alert(1)"');
+    expect(page).toContain('href="https://alice.github.io/&quot; onmouseover=&quot;alert(6)"');
+    expect(page).toContain('href="https://www.notion.so/pages&quot; onmouseover=&quot;alert(3)"');
+    expect(page).toContain('href="https://www.notion.so/posts&#39; onload=&quot;alert(4)"');
+    expect(page).toContain('href="https://www.notion.so/root&quot; onclick=&quot;alert(5)"');
     expect(page).toContain('alice\\u003cscript>alert(1)\\u003c/script>');
     expect(progressPage('job-1" <script>', MISSING)).toContain(
       'data-status-url="/progress/status?job_id=job-1%22%20%3Cscript%3E"',
+    );
+    expect(progressPage('job-1" <script>', MISSING)).toContain(
+      'data-site-check-url="/progress/site-check?job_id=job-1%22%20%3Cscript%3E"',
     );
   });
 

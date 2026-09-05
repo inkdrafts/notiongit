@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   awaitPagesBuildForCommit,
+  checkPublicSiteReachable,
   getRepositoryMainHeadSha,
   latestPagesBuild,
   verifyPublicSiteReachable,
@@ -154,5 +155,41 @@ describe('verifyPublicSiteReachable', () => {
         throw new Error('network down');
       },
     })).rejects.toMatchObject({ code: 'github_deploy_url_unreachable' });
+  });
+});
+
+describe('checkPublicSiteReachable', () => {
+  test('answers true with exactly one request when the site answers', async () => {
+    let calls = 0;
+    const reachable = await checkPublicSiteReachable('https://alice.github.io/', {
+      fetcher: async () => {
+        calls += 1;
+        return new Response('ok', { status: 200 });
+      },
+    });
+    expect(reachable).toBe(true);
+    expect(calls).toBe(1);
+  });
+
+  test('answers false with exactly one request when the site does not answer', async () => {
+    let calls = 0;
+    const reachable = await checkPublicSiteReachable('https://alice.github.io/', {
+      fetcher: async () => {
+        calls += 1;
+        return new Response('', { status: 404 });
+      },
+      sleep: async () => {},
+    });
+    expect(reachable).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  test('collapses a network failure into false', async () => {
+    const reachable = await checkPublicSiteReachable('https://alice.github.io/', {
+      fetcher: async () => {
+        throw new Error('network down');
+      },
+    });
+    expect(reachable).toBe(false);
   });
 });

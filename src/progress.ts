@@ -67,7 +67,12 @@ export type PublicProgress =
       readonly pollAfterSeconds: number | null }
   | { readonly status: 'succeeded'; readonly stages: readonly ProgressStageView[];
       readonly repository: { readonly name: string; readonly url: string };
-      readonly site: { readonly url: string } }
+      readonly site: { readonly url: string };
+      readonly notionLinks: {
+        readonly pagesUrl: string | null;
+        readonly postsUrl: string | null;
+        readonly templateRootUrl: string | null;
+      } }
   | { readonly status: 'failed'; readonly stages: readonly ProgressStageView[];
       readonly message: string; readonly action: string;
       readonly restartUrl: string | null }
@@ -91,6 +96,14 @@ const WAIT_NOTICE: { readonly message: string; readonly action: string } = {
 const MISSING_COPY = userCopy('provisioning_job_missing');
 const RESTART_URL = '/connect/github';
 const LAST_STEP = PROVISIONING_STEP_ORDER[PROVISIONING_STEP_ORDER.length - 1];
+
+/** Stand-in for a job resolved before canonical-URL capture existed: every
+ * Notion link renders as its linkless fallback copy. */
+const NULL_NOTION_LINKS: Extract<PublicProgress, { status: 'succeeded' }>['notionLinks'] = {
+  pagesUrl: null,
+  postsUrl: null,
+  templateRootUrl: null,
+};
 
 export function progressPageUrl(jobId: string): string {
   return `/progress?job_id=${encodeURIComponent(jobId)}`;
@@ -139,6 +152,7 @@ export function projectProvisioning(job: ProvisioningJob | null, now: number): P
         stages: stageViewsAt(PROGRESS_STAGE_ORDER.length),
         repository: { name: job.data.generatedRepository.name, url: job.data.generatedRepository.htmlUrl },
         site: { url: job.data.repository.url },
+        notionLinks: job.data.notionLinks ?? NULL_NOTION_LINKS,
       },
     };
   }

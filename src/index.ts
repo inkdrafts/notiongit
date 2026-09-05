@@ -29,8 +29,10 @@ import {
 } from './github-app-auth';
 import {
   createProvisioningJob,
+  isSucceededProvisioningJob,
   loadProvisioningJob,
   saveProvisioningJob,
+  type NotionTemplateLinks,
 } from './provisioning-job';
 import { callbackFailure, codedFailureCode, FlowFailure } from './failures';
 import {
@@ -76,7 +78,8 @@ import {
 } from './notion-template';
 import { LANDING_PAGE } from './landing-page';
 import { progressPageUrl, projectProvisioning } from './progress';
-import { progressPage } from './progress-page';
+import { progressPage, type SiteCheckOutcome } from './progress-page';
+import { checkPublicSiteReachable } from './site-deployment';
 import { isStatusCallbackState, statusCallback, statusHome, statusRerun } from './status';
 import { reportError } from './safe-serialize';
 export {
@@ -177,6 +180,7 @@ export type {
 
 export {
   awaitPagesBuildForCommit,
+  checkPublicSiteReachable,
   getRepositoryMainHeadSha,
   verifyPublicSiteReachable,
   GithubDeployError,
@@ -188,6 +192,7 @@ export type {
   GithubDeployStatus,
   GithubPagesBuildIdentity,
   PagesBuildPollOptions,
+  SiteCheckOptions,
   SiteVerifyOptions,
 } from './site-deployment';
 
@@ -200,6 +205,7 @@ export type { GithubAppAuthEnv, GithubInstallationAccount } from './github-app-a
 
 export {
   createProvisioningJob,
+  isSucceededProvisioningJob,
   isTerminalProvisioningStatus,
   loadProvisioningJob,
   nextPendingStep,
@@ -219,6 +225,7 @@ export {
 export type {
   CreateProvisioningJobParams,
   NotionSyncProgress,
+  NotionTemplateLinks,
   ProvisioningJob,
   ProvisioningJobData,
   ProvisioningJobIdentity,
@@ -229,6 +236,7 @@ export type {
   ProvisioningStepState,
   ProvisioningStepStatus,
   SiteDeploymentProgress,
+  SucceededProvisioningJob,
   SyncDispatchMarker,
 } from './provisioning-job';
 
@@ -371,6 +379,7 @@ export {
   PROGRESS_POLL_INTERVAL_MS,
   PROGRESS_POLL_MAX_INTERVAL_MS,
 } from './progress-page';
+export type { SiteCheckOutcome } from './progress-page';
 
 export {
   admitStatusRerun,
@@ -424,6 +433,7 @@ export {
   NOTION_TEMPLATE_SCHEMA_VERSION,
   PAGES_FINGERPRINT,
   PAGES_SCHEMA_CONTRACT,
+  parseNotionCanonicalUrl,
   POSTS_FINGERPRINT,
   POSTS_SCHEMA_CONTRACT,
   resolveNotionTemplateDatabases,
@@ -904,6 +914,7 @@ export function continueNotionOnboarding(
 
     let ready = job;
     if (!ready.data.notionSecretsWrittenAt) {
+      let notionLinks: NotionTemplateLinks | null = null;
       try {
         if (!duplicatedTemplateId) throw new NotionTemplateError('notion_template_not_duplicated', 400);
         // Resolved fresh every time, never from the stored record: a second
@@ -914,6 +925,13 @@ export function continueNotionOnboarding(
           fetcher: runtime.fetcher,
           sleep: runtime.sleep,
         });
+        // Only the API-returned canonical URLs travel with the job record —
+        // never the database IDs, which remain server-side sync credentials.
+        notionLinks = {
+          pagesUrl: resolution.pagesUrl,
+          postsUrl: resolution.postsUrl,
+          templateRootUrl: resolution.templateRootUrl,
+        };
         await saveNotionTemplateResolution(env.JOBS, { version: 1, jobId, resolution });
         const beforeSecrets = await admitProvisioningStage(env as Env, provisioningAdmissionConfig(env), {
           stage: 'notion_secrets',
@@ -948,7 +966,11 @@ export function continueNotionOnboarding(
         throw error;
       }
       const writtenAt = Date.now();
-      ready = { ...job, data: { ...job.data, notionSecretsWrittenAt: writtenAt }, updatedAt: writtenAt };
+      ready = {
+        ...job,
+        data: { ...job.data, notionLinks, notionSecretsWrittenAt: writtenAt },
+        updatedAt: writtenAt,
+      };
       await saveProvisioningJob(env.JOBS, ready);
     }
 
@@ -1015,9 +1037,28 @@ async function progressPageResponse(request: Request, env: Partial<Env>): Promis
   const url = new URL(request.url);
   const jobId = url.searchParams.get('job_id') ?? '';
   const job = validJobId(jobId) && env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  // No-JS retry: only an explicit ?check=1 on a succeeded job probes, and the
+  // probe is the same one-shot the site-check endpoint runs. A plain render
+  // never fetches, so it never adds latency.
+  const succeeded = job !== null && isSucceededProvisioningJob(job) ? job : null;
+  const siteCheck: SiteCheckOutcome | null = succeeded && url.searchParams.get('check') === '1'
+    ? { reachable: await checkPublicSiteReachable(succeeded.data.repository.url), checkedAt: Date.now() }
+    : null;
   // An absent, malformed, or unknown id renders the same missing page; only
   // the status differs, so a bookmark of an expired job still reads as gone.
-  return html(progressPage(jobId, projectProvisioning(job, Date.now())), job ? 200 : 404);
+  return html(progressPage(jobId, projectProvisioning(job, Date.now()), siteCheck), job ? 200 : 404);
+}
+
+async function progressSiteCheckResponse(request: Request, env: Partial<Env>): Promise<Response> {
+  const url = new URL(request.url);
+  const jobId = url.searchParams.get('job_id') ?? '';
+  // The job id is the bearer capability, so missing, malformed, unknown, and
+  // non-succeeded jobs all read as the same not-found; there is no distinction
+  // to leak. The probed URL comes from the record, never from the request.
+  const job = validJobId(jobId) && env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
+  if (job === null || !isSucceededProvisioningJob(job)) return json({ error: 'not_found' }, 404);
+  const reachable = await checkPublicSiteReachable(job.data.repository.url);
+  return json({ reachable, checkedAt: Date.now() });
 }
 
 async function progressStatusResponse(request: Request, env: Partial<Env>): Promise<Response> {
@@ -1057,6 +1098,10 @@ export function route(
 
   if (request.method === 'GET' && url.pathname === '/progress/status') {
     return progressStatusResponse(request, env);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/progress/site-check') {
+    return progressSiteCheckResponse(request, env);
   }
 
   if (request.method === 'GET' && url.pathname === '/status') {

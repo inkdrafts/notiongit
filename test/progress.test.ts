@@ -35,19 +35,24 @@ interface JobOptions {
   waitUntilMs?: number | null;
   waitReason?: 'global_throttled' | 'operator_paused' | 'stage_paused';
   secretsWritten?: boolean;
+  kind?: 'apex' | 'project';
+  notionLinks?: { pagesUrl: string | null; postsUrl: string | null; templateRootUrl: string | null };
 }
 
 function makeJob(status: ProvisioningJobStatus, options: JobOptions = {}): ProvisioningJob {
+  const project = options.kind === 'project';
   const job = createProvisioningJob({
     jobId: 'job-123',
     installationId: SENTINELS.installationId,
     identity: { id: 42, login: SENTINELS.login, accountType: 'User' },
-    repository: { name: 'alice.github.io', url: 'https://alice.github.io', baseurl: '', kind: 'apex' },
+    repository: project
+      ? { name: 'alice-inkdrafts', url: 'https://alice.github.io/alice-inkdrafts', baseurl: '/alice-inkdrafts', kind: 'project' }
+      : { name: 'alice.github.io', url: 'https://alice.github.io', baseurl: '', kind: 'apex' },
     generatedRepository: {
       id: 1001,
-      fullName: 'alice/alice.github.io',
-      name: 'alice.github.io',
-      htmlUrl: 'https://github.com/alice/alice.github.io',
+      fullName: project ? 'alice/alice-inkdrafts' : 'alice/alice.github.io',
+      name: project ? 'alice-inkdrafts' : 'alice.github.io',
+      htmlUrl: project ? 'https://github.com/alice/alice-inkdrafts' : 'https://github.com/alice/alice.github.io',
       defaultBranch: 'main',
       templateFullName: 'inkdrafts/notiongit-template',
       templateHeadSha: 'template-head-sha',
@@ -88,6 +93,7 @@ function makeJob(status: ProvisioningJobStatus, options: JobOptions = {}): Provi
     data: {
       ...job.data,
       notionSecretsWrittenAt: (options.secretsWritten ?? enqueued) ? NOW + 1 : null,
+      notionLinks: options.notionLinks ?? null,
       sync: { runId: SENTINELS.runId, htmlUrl: 'sentinel-run-url', conclusion: null },
       deployment: { commitSha: SENTINELS.commitSha, buildId: null, status: 'building', verifiedAt: null },
     },
@@ -139,13 +145,49 @@ describe('progress projection', () => {
     expect(stageStates(succeeded)).toEqual(ALL_PENDING.map(() => 'done'));
   });
 
-  test('succeeded exposes only the repository and site identity the flow already showed', () => {
-    const snapshot = projectProvisioning(makeJob('succeeded', { completedSteps: 7 }), NOW);
+  test('succeeded exposes only the allowlisted identity, site, and canonical Notion links', () => {
+    const snapshot = projectProvisioning(makeJob('succeeded', {
+      completedSteps: 7,
+      notionLinks: {
+        pagesUrl: 'https://www.notion.so/alice/Pages-1',
+        postsUrl: 'https://www.notion.so/alice/Posts-2',
+        templateRootUrl: 'https://www.notion.so/alice/Home-3',
+      },
+    }), NOW);
     expect(snapshot.progress).toEqual({
       status: 'succeeded',
       stages: expect.any(Array),
       repository: { name: 'alice.github.io', url: 'https://github.com/alice/alice.github.io' },
       site: { url: 'https://alice.github.io' },
+      notionLinks: {
+        pagesUrl: 'https://www.notion.so/alice/Pages-1',
+        postsUrl: 'https://www.notion.so/alice/Posts-2',
+        templateRootUrl: 'https://www.notion.so/alice/Home-3',
+      },
+    });
+  });
+
+  test('a succeeded record written before URL capture projects all-null links', () => {
+    const snapshot = projectProvisioning(makeJob('succeeded', { completedSteps: 7 }), NOW);
+    expect(snapshot.progress).toMatchObject({
+      status: 'succeeded',
+      notionLinks: { pagesUrl: null, postsUrl: null, templateRootUrl: null },
+    });
+  });
+
+  test('apex and project destinations each expose their own site URL branch', () => {
+    const apex = projectProvisioning(makeJob('succeeded', { completedSteps: 7, kind: 'apex' }), NOW);
+    expect(apex.progress).toMatchObject({
+      status: 'succeeded',
+      site: { url: 'https://alice.github.io' },
+      repository: { name: 'alice.github.io', url: 'https://github.com/alice/alice.github.io' },
+    });
+
+    const project = projectProvisioning(makeJob('succeeded', { completedSteps: 7, kind: 'project' }), NOW);
+    expect(project.progress).toMatchObject({
+      status: 'succeeded',
+      site: { url: 'https://alice.github.io/alice-inkdrafts' },
+      repository: { name: 'alice-inkdrafts', url: 'https://github.com/alice/alice-inkdrafts' },
     });
   });
 
