@@ -376,19 +376,7 @@ describe('orphan rows', () => {
     ]));
   });
 
-  /**
-   * Registry entries with no producing site today. Each one names why the
-   * lint doesn't fail the build over it instead of silently ignoring it.
-   */
-  const ALLOWED_ORPHANS: Readonly<Record<string, string>> = {
-    notion_template_not_validated:
-      'The registry describes a preflight gate ("no stored template resolution, or a schema ' +
-      'version mismatch") that nothing in src/ calls: loadNotionTemplateResolution is exported ' +
-      'from notion-template.ts and has no caller. Tracked in notiongit#78 instead of building the ' +
-      'gate inside this lint issue.',
-  };
-
-  test('every registry code not named as an exception has a producing site in src/', () => {
+  test('every registry code has a producing site in src/', () => {
     const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
     const registryFile = join(srcDir, 'failures.ts');
 
@@ -404,10 +392,7 @@ describe('orphan rows', () => {
       for (const code of producedCodes(readFileSync(file, 'utf8'), knownCodes)) reachable.add(code);
     }
 
-    const orphans = ALL_CODES.filter((code) => !reachable.has(code) && !(code in ALLOWED_ORPHANS));
+    const orphans = ALL_CODES.filter((code) => !reachable.has(code));
     expect(orphans).toEqual([]);
-
-    const staleExceptions = Object.keys(ALLOWED_ORPHANS).filter((code) => reachable.has(code));
-    expect(staleExceptions).toEqual([]);
   });
 });
