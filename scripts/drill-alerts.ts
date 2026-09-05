@@ -23,6 +23,16 @@
  * synthetic alert on any window, which exercises delivery without waiting
  * for real failures. Exits nonzero when the shape check fails, the query
  * fails, or a delivery is not accepted.
+ *
+ * To put real rows into a dataset without waiting for traffic, write a job
+ * record to the environment's JOBS namespace and send its message by hand;
+ * wrangler has no send command, but the REST API accepts one:
+ *
+ *   POST /accounts/<account>/queues/<queue id>/messages  {"body":{"jobId":"..."}}
+ *
+ * The consumer runs the job's next step against the staging secrets and the
+ * step's events land in the dataset. `wrangler queues purge <name>` clears
+ * the leftovers.
  */
 
 import {
