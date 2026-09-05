@@ -4,6 +4,7 @@ import {
   awaitGeneratedRepositoryCommit,
   findReusableGeneratedRepository,
   GENERATED_REPOSITORY_DESCRIPTION,
+  GENERATED_REPOSITORY_TOPIC,
   generateOrReuseRepository,
   generateRepositoryFromTemplate,
   getTemplateHead,
@@ -51,7 +52,7 @@ function scriptedFetch(responses: Array<{ match: (request: RecordedRequest) => b
       url: request.url,
       authorization: request.headers.get('authorization'),
       contentType: request.headers.get('content-type'),
-      body: request.method === 'POST' ? await request.json().catch(() => null) : null,
+      body: request.method === 'POST' || request.method === 'PUT' ? await request.json().catch(() => null) : null,
     };
     requests.push(recorded);
     for (const entry of responses) {
@@ -211,6 +212,22 @@ describe('findReusableGeneratedRepository', () => {
     expect(isInkdraftsGeneratedRepository(summary({ name: 'x', description: 'unrelated' }))).toBe(false);
     expect(isInkdraftsGeneratedRepository({ name: 'x', description: null })).toBe(false);
   });
+
+  test('the topic marker survives an edited description', () => {
+    const renamed = summary({
+      name: 'alice-inkdrafts',
+      description: 'My personal site',
+      topics: [GENERATED_REPOSITORY_TOPIC],
+    });
+    expect(isInkdraftsGeneratedRepository(renamed)).toBe(true);
+    expect(findReusableGeneratedRepository([renamed], 'alice')?.name).toBe('alice-inkdrafts');
+  });
+
+  test('an unrelated topic list does not manufacture a marker', () => {
+    expect(isInkdraftsGeneratedRepository(
+      summary({ name: 'x', description: 'unrelated', topics: ['blog'] }),
+    )).toBe(false);
+  });
 });
 
 describe('getTemplateHead', () => {
@@ -321,6 +338,49 @@ describe('awaitGeneratedRepositoryCommit', () => {
       fetcher: fetcher as unknown as typeof fetch,
       sleep: async () => { throw new Error('must not sleep'); },
     })).rejects.toMatchObject({ code: 'github_generate_branch_mismatch' });
+  });
+
+  test('applies the durable topic marker once the commit is readable', async () => {
+    const { fetcher, requests } = scriptedFetch([
+      {
+        match: (request) => request.method === 'GET' && request.url.endsWith('/repos/alice/alice.github.io'),
+        respond: () => jsonResponse(200, { default_branch: 'main', fork: false }),
+      },
+      {
+        match: (request) => request.method === 'GET' && request.url.endsWith('/commits/main'),
+        respond: () => jsonResponse(200, { sha: 'head-sha', commit: { tree: { sha: 'head-tree-sha' } } }),
+      },
+      {
+        match: (request) => request.method === 'PUT' && request.url.endsWith('/topics'),
+        respond: () => jsonResponse(200, { names: [GENERATED_REPOSITORY_TOPIC] }),
+      },
+    ]);
+
+    const result = await awaitGeneratedRepositoryCommit('Bearer installation-token', 'alice/alice.github.io', { fetcher });
+
+    expect(result.headSha).toBe('head-sha');
+    const topicRequest = requests.find((request) => request.method === 'PUT');
+    expect(topicRequest).toMatchObject({
+      url: 'https://api.github.com/repos/alice/alice.github.io/topics',
+      authorization: 'Bearer installation-token',
+      body: { names: [GENERATED_REPOSITORY_TOPIC] },
+    });
+  });
+
+  test('a topic marker failure does not fail the poll', async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = new Request(input, init);
+      if (request.method === 'PUT') throw new Error('network down');
+      if (request.url.endsWith('/commits/main')) {
+        return jsonResponse(200, { sha: 'head-sha', commit: { tree: { sha: 'head-tree-sha' } } });
+      }
+      return jsonResponse(200, { default_branch: 'main', fork: false });
+    };
+
+    const result = await awaitGeneratedRepositoryCommit('Bearer installation-token', 'alice/alice.github.io', {
+      fetcher: fetcher as unknown as typeof fetch,
+    });
+    expect(result.headSha).toBe('head-sha');
   });
 });
 
