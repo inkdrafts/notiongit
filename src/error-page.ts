@@ -129,6 +129,7 @@ ${detailsHtml(failure.details)}
 ${failure.restartHref === null ? '' : `<a class="cta" href="${failure.restartHref}">Start again</a>`}
 ${failure.retryAfterSeconds === null ? '' : `<p class="muted">You can try again ${retryText(failure.retryAfterSeconds)}.</p>`}
 <p class="muted">Error code: <code>${failure.code}</code></p>
+<p class="muted">Questions? See <a href="/support">Support</a> or the <a href="/privacy">Privacy Policy</a>.</p>
 </main>
 </body>
 </html>`;

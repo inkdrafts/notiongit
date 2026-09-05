@@ -408,6 +408,7 @@ function panelsHtml(progress: PublicProgress, jobId: string, siteCheck: SiteChec
     '<p>Your repository is ready and its setup secrets are stored.</p>',
     '<p>Connect Notion so InkDrafts can find your Pages and Posts databases. The first sync and publish then run on their own.</p>',
     `<a class="cta" href="${escapeHtml(connectNotionHref)}">Connect Notion</a>`,
+    '<p class="muted">Notion grants read access only, and InkDrafts keeps no copy of the token. Read the <a href="/privacy">Privacy Policy</a> before you continue.</p>',
     '</section>',
 
     `${open('succeeded')}`,
