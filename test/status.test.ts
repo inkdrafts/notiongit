@@ -33,6 +33,7 @@ import {
   type SiteDiscovery,
   type StatusSession,
 } from '../src/status';
+import { statusPage } from '../src/status-page';
 
 class MemoryKV {
   private values = new Map<string, string>();
@@ -158,6 +159,7 @@ const BUILD_BUILT: GithubPagesBuildIdentity = { buildId: 3, status: 'built', com
 function okDiscovery(overrides: {
   repository?: GeneratedRepositoryIdentity;
   syncRun?: NotionSyncRunIdentity | null;
+  summary?: SiteDiscovery extends { ok: true } ? SiteDiscovery['summary'] : never;
   build?: GithubPagesBuildIdentity | null;
 } = {}): SiteDiscovery {
   return {
@@ -165,6 +167,7 @@ function okDiscovery(overrides: {
     accountLogin: 'alice',
     repository: overrides.repository ?? REPOSITORY,
     syncRun: overrides.syncRun === undefined ? syncRun() : overrides.syncRun,
+    summary: overrides.summary === undefined ? null : overrides.summary,
     build: overrides.build === undefined ? BUILD_BUILT : overrides.build,
   };
 }
@@ -299,6 +302,62 @@ describe('projectSiteStatus', () => {
     });
   });
 
+  test('a successful summary supplies its source, detail, and collection counts', () => {
+    const summary = parseSafeSummary(JSON.stringify({
+      schema_version: 1,
+      result: 'success',
+      code: 'synced',
+      detail: 'pages: 1 created',
+      finished_at: UPDATED_AT,
+      pages: { created: 1, updated: 2, renamed: 3, deleted: 4, unchanged: 5, errors: 6 },
+      posts: null,
+    }));
+    const view = projectSiteStatus(okDiscovery({ summary }), SESSION, NOW);
+    expect(view).toMatchObject({
+      kind: 'session',
+      site: {
+        sync: {
+          kind: 'succeeded',
+          source: 'summary_v1',
+          code: 'synced',
+          detail: 'pages: 1 created',
+          pages: { created: 1, updated: 2, renamed: 3, deleted: 4, unchanged: 5, errors: 6 },
+          posts: null,
+          finishedAtMs: Date.parse(UPDATED_AT),
+        },
+      },
+    });
+    const html = statusPage(view, { notice: null, rerunFormToken: null });
+    expect(html).toContain('pages: 1 created');
+    expect(html).toContain('Pages: 1 created, 2 updated, 3 renamed, 4 deleted, 5 unchanged, 6 errors');
+  });
+
+  test('only a summary can produce no_op', () => {
+    const summary = parseSafeSummary(JSON.stringify({ schema_version: 1, result: 'no_op', code: 'missing_credentials' }));
+    expect(projectSiteStatus(okDiscovery({ summary }), SESSION, NOW)).toMatchObject({
+      kind: 'session',
+      site: { sync: { kind: 'no_op', source: 'summary_v1', code: 'missing_credentials' } },
+    });
+  });
+
+  test('an unsupported summary falls back to the run conclusion and records the reason', () => {
+    const summary = parseSafeSummary(JSON.stringify({ schema_version: 2, result: 'success' }));
+    expect(projectSiteStatus(okDiscovery({ summary }), SESSION, NOW)).toMatchObject({
+      kind: 'session',
+      site: {
+        sync: { kind: 'succeeded', finishedAtMs: Date.parse(UPDATED_AT), runUrl: syncRun().htmlUrl },
+        summaryFallback: 'unsupported_version',
+      },
+    });
+  });
+
+  test('summary fallback reasons reach the rendered page', () => {
+    const view = projectSiteStatus(okDiscovery({ summary: { ok: false, reason: 'malformed' } }), SESSION, NOW);
+    const html = statusPage(view, { notice: null, rerunFormToken: null });
+    expect(html).toContain('The saved summary could not be read.');
+    expect(html).toContain('Derived from the workflow run result');
+  });
+
   test('any terminal non-success conclusion degrades to failed carrying the raw string', () => {
     for (const conclusion of ['failure', 'cancelled', 'timed_out', 'some_new_github_conclusion', null]) {
       const view = projectSiteStatus(
@@ -365,6 +424,9 @@ describe('parseSafeSummary', () => {
       source: 'summary_v1',
       result: 'success',
       code: 'synced',
+      detail: 'ok',
+      pages: null,
+      posts: null,
       finishedAtMs: Date.parse(UPDATED_AT),
     });
   });
@@ -385,9 +447,9 @@ describe('parseSafeSummary', () => {
 
   test('a new code within v1 is accepted raw, falling back on result alone', () => {
     expect(parseSafeSummary(JSON.stringify({ schema_version: 1, result: 'failure', code: 'brand_new_code' })))
-      .toEqual({ ok: true, source: 'summary_v1', result: 'failure', code: 'brand_new_code', finishedAtMs: null });
+      .toEqual({ ok: true, source: 'summary_v1', result: 'failure', code: 'brand_new_code', detail: null, pages: null, posts: null, finishedAtMs: null });
     expect(parseSafeSummary(JSON.stringify({ schema_version: 1, result: 'no_op' })))
-      .toEqual({ ok: true, source: 'summary_v1', result: 'no_op', code: null, finishedAtMs: null });
+      .toEqual({ ok: true, source: 'summary_v1', result: 'no_op', code: null, detail: null, pages: null, posts: null, finishedAtMs: null });
   });
 });
 
@@ -1260,6 +1322,25 @@ describe('status routes', () => {
       const html = await running.text();
       expect(html).toContain('>Refresh</a>');
       expect(html).not.toContain('http-equiv="refresh"');
+    });
+  });
+
+  test('an unreadable summary artifact keeps the conclusion result', async () => {
+    const kv = new MemoryKV();
+    const env = await statusEnvWithAppKey(kv);
+    const cookie = await sessionCookie();
+
+    await withScriptedFetch((request) => {
+      if (request.url.includes('/actions/runs/555/artifacts?')) {
+        return Response.json({ artifacts: [{ id: 9, name: 'notiongit-run-summary', expired: false }] });
+      }
+      if (request.url.includes('/actions/artifacts/9/zip')) return new Response('not a zip', { status: 200 });
+      return healthySiteHandler(request);
+    }, async () => {
+      const response = await route(new Request('https://example.com/status', { headers: { Cookie: cookie } }), env);
+      const html = await response.text();
+      expect(html).toContain('Last hand-triggered sync succeeded');
+      expect(html).toContain('Derived from the workflow run result');
     });
   });
 

@@ -129,11 +129,15 @@ function runIdentity(run: WorkflowRunResponse): NotionSyncRunIdentity {
 }
 
 function runsPath(repositoryFullName: string): string {
+  return `${repositoryPath(repositoryFullName)}/actions/workflows/${SYNC_WORKFLOW_FILE}`;
+}
+
+function repositoryPath(repositoryFullName: string): string {
   const parts = repositoryFullName.split('/');
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
     throw new GithubSyncError('github_sync_unavailable', 502);
   }
-  return `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/actions/workflows/${SYNC_WORKFLOW_FILE}`;
+  return `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}`;
 }
 
 /** Non-secret snapshot of a workflow's current run ids, used to detect a new run. */
@@ -170,6 +174,116 @@ export async function latestDispatchedSyncRun(
   const body = await readJson<{ workflow_runs?: WorkflowRunResponse[] }>(response);
   const run = (body?.workflow_runs ?? []).find(isUsableRunShape);
   return run ? runIdentity(run) : null;
+}
+
+const RUN_SUMMARY_ARTIFACT_NAME = 'notiongit-run-summary';
+const MAX_RUN_SUMMARY_BYTES = 1024 * 1024;
+
+interface WorkflowArtifact {
+  id?: unknown;
+  name?: unknown;
+  expired?: unknown;
+}
+
+function uint16(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] | (bytes[offset + 1] << 8);
+}
+
+function uint32(bytes: Uint8Array, offset: number): number {
+  return (
+    bytes[offset] |
+    (bytes[offset + 1] << 8) |
+    (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24)
+  ) >>> 0;
+}
+
+async function unzipRunSummary(buffer: ArrayBuffer): Promise<string | null> {
+  const bytes = new Uint8Array(buffer);
+  const minimumEndOfCentralDirectory = 22;
+  const endSearchStart = Math.max(0, bytes.length - minimumEndOfCentralDirectory - 0xffff);
+  let endOfCentralDirectory = -1;
+  for (let offset = bytes.length - minimumEndOfCentralDirectory; offset >= endSearchStart; offset -= 1) {
+    if (offset >= 0 && uint32(bytes, offset) === 0x06054b50) {
+      endOfCentralDirectory = offset;
+      break;
+    }
+  }
+  if (endOfCentralDirectory < 0) return null;
+
+  const centralDirectorySize = uint32(bytes, endOfCentralDirectory + 12);
+  const centralDirectoryOffset = uint32(bytes, endOfCentralDirectory + 16);
+  if (centralDirectoryOffset + centralDirectorySize > bytes.length) return null;
+
+  const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+  let offset = centralDirectoryOffset;
+  const directoryEnd = centralDirectoryOffset + centralDirectorySize;
+  while (offset + 46 <= directoryEnd && uint32(bytes, offset) === 0x02014b50) {
+    const compressionMethod = uint16(bytes, offset + 10);
+    const compressedSize = uint32(bytes, offset + 20);
+    const uncompressedSize = uint32(bytes, offset + 24);
+    const fileNameSize = uint16(bytes, offset + 28);
+    const extraSize = uint16(bytes, offset + 30);
+    const commentSize = uint16(bytes, offset + 32);
+    const localHeaderOffset = uint32(bytes, offset + 42);
+    const entryEnd = offset + 46 + fileNameSize + extraSize + commentSize;
+    if (entryEnd > directoryEnd) return null;
+    const fileName = decoder.decode(bytes.slice(offset + 46, offset + 46 + fileNameSize));
+    if (fileName === 'run-summary.json') {
+      if (
+        compressionMethod !== 0 && compressionMethod !== 8 ||
+        uncompressedSize > MAX_RUN_SUMMARY_BYTES ||
+        localHeaderOffset + 30 > bytes.length ||
+        uint32(bytes, localHeaderOffset) !== 0x04034b50
+      ) return null;
+      const localFileNameSize = uint16(bytes, localHeaderOffset + 26);
+      const localExtraSize = uint16(bytes, localHeaderOffset + 28);
+      const dataStart = localHeaderOffset + 30 + localFileNameSize + localExtraSize;
+      const dataEnd = dataStart + compressedSize;
+      if (dataEnd > bytes.length) return null;
+      const compressed = bytes.slice(dataStart, dataEnd);
+      const uncompressed = compressionMethod === 0
+        ? compressed
+        : new Uint8Array(await new Response(
+          new Blob([compressed]).stream().pipeThrough(new DecompressionStream('deflate-raw')),
+        ).arrayBuffer());
+      if (uncompressed.byteLength !== uncompressedSize) return null;
+      return decoder.decode(uncompressed);
+    }
+    offset = entryEnd;
+  }
+  return null;
+}
+
+export async function latestSyncRunSummary(
+  installationToken: string,
+  repositoryFullName: string,
+  runId: number,
+  fetcher: typeof fetch = fetch,
+): Promise<string | null> {
+  try {
+    const headers = githubHeaders(installationToken);
+    const artifactsResponse = await fetcher(
+      `${GITHUB_API}${repositoryPath(repositoryFullName)}/actions/runs/${runId}/artifacts?name=${encodeURIComponent(RUN_SUMMARY_ARTIFACT_NAME)}&per_page=1`,
+      { headers },
+    );
+    if (!artifactsResponse.ok) return null;
+    const body = await readJson<{ artifacts?: WorkflowArtifact[] }>(artifactsResponse);
+    const artifact = (body?.artifacts ?? []).find((candidate) =>
+      candidate.name === RUN_SUMMARY_ARTIFACT_NAME &&
+      Number.isSafeInteger(candidate.id) &&
+      candidate.expired !== true);
+    if (!artifact) return null;
+
+    const archiveResponse = await fetcher(
+      `${GITHUB_API}${repositoryPath(repositoryFullName)}/actions/artifacts/${artifact.id}/zip`,
+      { headers },
+    );
+    if (!archiveResponse.ok) return null;
+    return await unzipRunSummary(await archiveResponse.arrayBuffer());
+  } catch {
+    return null;
+  }
 }
 
 /**

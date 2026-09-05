@@ -11,7 +11,7 @@
  * session is escaped on its way into the document.
  */
 
-import type { DeployOutcome, StatusPageModel, SyncOutcome } from './status';
+import type { DeployOutcome, StatusPageModel, SummaryCounts, SummaryFallbackReason, SyncOutcome } from './status';
 
 /** Request-scoped extras the handlers own: the post-redirect-get notice and
  * the signed CSRF token embedded in the Sync-now form. Neither is domain
@@ -139,6 +139,7 @@ const STYLES = `
   ul.revocations { margin: 0; padding-left: 1.25rem; }
   ul.revocations li { margin: 0 0 0.75rem; }
   ul.revocations li:last-child { margin-bottom: 0; }
+  ul.sync-counts { margin: 0.5rem 0 0; padding-left: 1.25rem; }
 `;
 
 const CONNECT_URL = '/status?connect=1';
@@ -177,11 +178,57 @@ The full walkthrough, including deleting your site, is on the
 <a href="/leaving">Leaving InkDrafts</a> page.</p>
 </section>`;
 
-function syncHtml(sync: SyncOutcome): string {
+function countsText(counts: SummaryCounts): string {
+  return `${counts.created} created, ${counts.updated} updated, ${counts.renamed} renamed, ${counts.deleted} deleted, ${counts.unchanged} unchanged, ${counts.errors} errors`;
+}
+
+function summaryStatement(sync: Extract<SyncOutcome, { source: 'summary_v1' }>): string {
+  switch (sync.code) {
+    case 'synced':
+      return sync.kind === 'succeeded' ? 'The sync completed.' : 'The sync reported a success result.';
+    case 'missing_credentials':
+      return 'No sync ran because Notion credentials are missing.';
+    case 'bulk_delete_guard':
+      return 'The sync stopped because a bulk delete looked unsafe.';
+    case 'sync_error':
+      return 'The sync failed before it could finish.';
+    case 'row_errors':
+      return 'The sync finished with some rows that could not sync.';
+  }
+  if (sync.kind === 'succeeded') return 'The sync completed.';
+  if (sync.kind === 'no_op') return 'The sync did not change the site.';
+  return 'The sync reported a failure.';
+}
+
+function summaryLabel(sync: Extract<SyncOutcome, { source: 'summary_v1' }>): string {
+  if (sync.kind === 'succeeded') return 'Last hand-triggered sync succeeded.';
+  if (sync.kind === 'no_op') return 'Last hand-triggered sync made no changes.';
+  return 'Last hand-triggered sync failed.';
+}
+
+function summaryDetails(sync: Extract<SyncOutcome, { source: 'summary_v1' }>): string {
+  const counts = [
+    sync.pages === null ? '' : `<li>Pages: ${countsText(sync.pages)}</li>`,
+    sync.posts === null ? '' : `<li>Posts: ${countsText(sync.posts)}</li>`,
+  ].join('');
+  const detail = sync.detail === null ? '' : `<p class="muted">${escapeHtml(sync.detail)}</p>`;
+  return `${detail}${counts === '' ? '' : `<ul class="sync-counts">${counts}</ul>`}`;
+}
+
+function syncHtml(sync: SyncOutcome, summaryFallback?: SummaryFallbackReason): string {
   if (sync.kind === 'never_ran') return '<p>No hand-triggered sync has run yet. Your site also syncs on its schedule.</p>';
   const runLink = sync.runUrl === null ? '' : ` <a href="${escapeHtml(sync.runUrl)}">View the run on GitHub</a>.`;
   const when = (ms: number | null) => (ms === null ? '' : ` ${utcText(ms)}`);
-  const fallback = '<p class="muted">Derived from the workflow run result; per-file counts and scheduled runs are on GitHub.</p>';
+  const fallbackReason = summaryFallback === 'unsupported_version'
+    ? ' The saved summary uses an unsupported version.'
+    : summaryFallback === 'malformed'
+      ? ' The saved summary could not be read.'
+      : '';
+  const fallback = `<p class="muted">Derived from the workflow run result; per-file counts and scheduled runs are on GitHub.${fallbackReason}</p>`;
+  if ('source' in sync) {
+    const statusClass = sync.kind === 'failed' ? 'danger' : 'ok';
+    return `<p class="${statusClass}">${summaryLabel(sync)}${when(sync.finishedAtMs)}</p>${runLink}<p>${summaryStatement(sync)}</p>${summaryDetails(sync)}`;
+  }
   switch (sync.kind) {
     case 'running':
       return `<p class="ok">A sync is running right now.${when(sync.startedAtMs)}</p>${runLink}${fallback}`;
@@ -238,7 +285,7 @@ a quick redirect you barely notice.</p>
 ${chrome.notice === null ? '' : notice(chrome.notice)}
 <section class="card">
 <h2>Content sync</h2>
-${syncHtml(model.site.sync)}
+${syncHtml(model.site.sync, model.site.summaryFallback)}
 </section>
 <section class="card">
 <h2>Publishing</h2>

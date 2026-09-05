@@ -125,7 +125,7 @@ required by the planned endpoint set; read access is implicit in write access.
 | Administration | Write | Generate a repository from the template and satisfy the Pages administrator check. | `POST /repos/{template_owner}/{template_repo}/generate`; `POST /repos/{owner}/{repo}/pages` |
 | Contents | Write | Read the template/repository and patch deployment-owned `_config.yml`. | Template generation requires Contents read; issue #12 requires Contents write. |
 | Secrets | Write | Read the Actions public key and create/update the three repository secrets. | `GET /repos/{owner}/{repo}/actions/secrets/public-key`; `PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}` |
-| Actions | Write | Dispatch the first sync and poll its workflow run. | `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches` |
+| Actions | Write | Dispatch the first sync, poll its workflow run, and read the per-run summary artifact. | `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`; `GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts`; `GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip` |
 | Pages | Write | Create and inspect the legacy Pages site and deployment. | `POST /repos/{owner}/{repo}/pages`; Pages status/deployment endpoints |
 
 Request no organization, enterprise, account, issues, pull request, package,
