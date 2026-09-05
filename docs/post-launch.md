@@ -27,13 +27,17 @@ those rows put in force.
 
 These steps happen at launch; each is pending in the checklist until done:
 
+- [ ] Enable Analytics Engine on the Cloudflare account (dashboard): until it
+      is enabled, deploying any version with the dataset bindings fails with
+      API error 10089, so this precedes every other enablement step.
 - [ ] Set `CF_ANALYTICS_API_TOKEN` and `OBSERVABILITY_ALERT_WEBHOOK_URL` as
       production secrets and verify the SQL row shape against the live
       dataset ([`observability.md`](observability.md#manual-verification-follow-up)
-      §Manual verification follow-up).
+      §Manual verification follow-up) with `scripts/drill-alerts.ts`.
 - [ ] Uncomment the `[triggers]` cron in `wrangler.toml` and deploy.
 - [ ] Fire one synthetic threshold breach in staging and record the webhook
-      delivery (the alert drill in the checklist).
+      delivery: `scripts/drill-alerts.ts` against the staging dataset and
+      webhook with `--dead-letter-threshold 0` fires on any window.
 
 ## Rollback ladder
 
