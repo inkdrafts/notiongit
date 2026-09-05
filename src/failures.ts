@@ -47,7 +47,6 @@ export const NOTION_FAILURE_CODES = [
   'notion_template_database_ambiguous',
   'notion_template_schema_invalid',
   'notion_template_unavailable',
-  'notion_template_not_validated',
   'provisioning_job_missing',
   'provisioning_handoff_failed',
 ] as const;
@@ -421,16 +420,6 @@ const NOTION_FAILURES: { [C in NotionFailureCode]: FailureDescriptor } = {
       action: 'Wait a moment, then connect again. If it keeps failing, contact support.',
     },
     support: { area: 'notion', note: 'Found databases kept failing to fetch within the request\u2019s retry budget.' },
-  },
-  notion_template_not_validated: {
-    retryable: false,
-    recovery: { kind: 'user_action', action: 'complete_notion_check_then_connect_github' },
-    httpStatus: 400,
-    user: {
-      message: 'Your Notion databases have not finished their compatibility check yet.',
-      action: 'Connect Notion first and complete the Pages and Posts check, then connect GitHub.',
-    },
-    support: { area: 'notion', note: 'Preflight gate: no stored template resolution, or a schema version mismatch, for this job.' },
   },
   provisioning_job_missing: {
     retryable: false,
