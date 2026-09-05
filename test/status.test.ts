@@ -810,7 +810,7 @@ describe('status routes', () => {
       env,
     );
     expect(installLeg.status).toBe(400);
-    expect(await installLeg.json()).toEqual({ error: 'github_state_invalid' });
+    expect(await installLeg.text()).toContain('Error code: <code>github_state_invalid</code>');
   });
 
   test('the rerun gates refuse in order: origin, session, form token', async () => {

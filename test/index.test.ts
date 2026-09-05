@@ -23,6 +23,20 @@ import {
   type ProvisioningMessage,
 } from '../src/index';
 import worker from '../src/index';
+
+import { userCopy, type ProvisioningFailureCode } from '../src/failures';
+
+/** Consent-handoff failures now render the shared HTML error page instead of
+ * a JSON body; assert the status, the visible machine code, and the
+ * registry's canonical copy. */
+async function expectErrorPage(response: Response, status: number, code: ProvisioningFailureCode): Promise<string> {
+  expect(response.status).toBe(status);
+  const text = await response.text();
+  expect(response.headers.get('content-type')).toContain('text/html');
+  expect(text).toContain(`Error code: <code>${code}</code>`);
+  expect(text).toContain(userCopy(code).message);
+  return text;
+}
 import { Secret } from '../src/secret';
 
 interface MockSequenceEntry {
@@ -240,8 +254,7 @@ describe('HTTP foundation', () => {
       new Request('https://example.com/auth/notion/callback?code=redacted'),
     );
 
-    expect(response.status).toBe(500);
-    expect(await response.json()).toEqual({ error: 'notion_configuration_missing' });
+    await expectErrorPage(response, 500, 'notion_configuration_missing');
   });
 
   test('returns JSON for unknown routes', async () => {
@@ -354,7 +367,7 @@ describe('GitHub App install and authorize flow', () => {
         env,
       );
       expect(replay.status).toBe(400);
-      expect(await replay.json()).toEqual({ error: 'github_state_replayed' });
+      expect(await replay.text()).toContain('Error code: <code>github_state_replayed</code>');
       expect(requests).toHaveLength(6);
     } finally {
       globalThis.fetch = originalFetch;
@@ -481,7 +494,8 @@ describe('GitHub App install and authorize flow', () => {
     });
 
     expect(response.status).toBe(429);
-    expect(await response.json()).toEqual({ error: 'github_generate_rate_limited', retry_after_seconds: 60 });
+    expect(response.headers.get('retry-after')).toBe('60');
+    expect(await response.text()).toContain('Error code: <code>github_generate_rate_limited</code>');
     expect(await kv.get('github:onboarding-job:job-123')).toBeNull();
     expect(kv.entries().join('\n')).not.toContain('user-token');
     expect(queue.sent).toEqual([]);
@@ -516,11 +530,10 @@ describe('GitHub App install and authorize flow', () => {
         env,
       );
       expect(response.status).toBe(429);
-      const body = await response.json() as Record<string, unknown>;
-      expect(body.error).toBe('github_rate_limited');
-      expect(body.retry_after_seconds as number).toBeGreaterThanOrEqual(1);
-      expect(body.retry_after_seconds as number).toBeLessThanOrEqual(60);
-      expect(response.headers.get('retry-after')).toBe(String(body.retry_after_seconds));
+      const retryAfter = Number(response.headers.get('retry-after'));
+      expect(retryAfter).toBeGreaterThanOrEqual(1);
+      expect(retryAfter).toBeLessThanOrEqual(60);
+      expect(await response.text()).toContain('Error code: <code>github_rate_limited</code>');
 
       // Only the code exchange and the identity read ran; nothing was
       // written — not a job record, not a lease, not a consumed state.
@@ -695,8 +708,7 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123`),
         env,
       );
-      expect(response.status).toBe(expectedStatus);
-      expect(await response.json()).toEqual({ error: expectedError });
+      await expectErrorPage(response, expectedStatus, expectedError);
       expect(kv.entries().join('\n')).not.toContain('user-token');
     } finally {
       globalThis.fetch = originalFetch;
@@ -720,8 +732,7 @@ describe('GitHub App install and authorize flow', () => {
         new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}&code=one-time-code&installation_id=123`),
         env,
       );
-      expect(response.status).toBe(429);
-      expect(await response.json()).toEqual({ error: 'github_rate_limited' });
+      await expectErrorPage(response, 429, 'github_rate_limited');
       expect(kv.entries().join('\n')).not.toContain('user-token');
     } finally {
       globalThis.fetch = originalFetch;
@@ -731,20 +742,17 @@ describe('GitHub App install and authorize flow', () => {
   test('rejects denial, invalid state, and missing installation safely', async () => {
     const env = await githubEnv();
     const denied = await route(new Request('https://example.com/auth/github/callback?error=access_denied'), env);
-    expect(denied.status).toBe(400);
-    expect(await denied.json()).toEqual({ error: 'github_authorization_denied' });
+    await expectErrorPage(denied, 400, 'github_authorization_denied');
 
     const invalid = await route(new Request('https://example.com/auth/github/callback?state=forged'), env);
-    expect(invalid.status).toBe(400);
-    expect(await invalid.json()).toEqual({ error: 'github_state_invalid' });
+    await expectErrorPage(invalid, 400, 'github_state_invalid');
 
     const { state } = await getInstallState(env);
     const missing = await route(
       new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}`),
       env,
     );
-    expect(missing.status).toBe(400);
-    expect(await missing.json()).toEqual({ error: 'github_installation_missing' });
+    await expectErrorPage(missing, 400, 'github_installation_missing');
   });
 });
 
@@ -1141,16 +1149,12 @@ describe('Notion authorization entry', () => {
     const env = await githubEnv();
 
     const missing = await route(new Request('https://example.com/connect/notion'), env);
-    expect(missing.status).toBe(409);
-    expect(await missing.json()).toEqual({
-      error: 'provisioning_job_missing',
-      message: 'Connect GitHub first.',
-      connect_url: '/connect/github',
-    });
+    const page = await expectErrorPage(missing, 409, 'provisioning_job_missing');
+    expect(page).toContain('href="/connect/github"');
 
     const unknown = await route(new Request('https://example.com/connect/notion?job_id=job-nope'), env);
     expect(unknown.status).toBe(409);
-    expect(await unknown.json()).toMatchObject({ error: 'provisioning_job_missing' });
+    expect(await unknown.text()).toContain('Error code: <code>provisioning_job_missing</code>');
   });
 
   test('redirects to Notion for a job the GitHub callback created', async () => {
@@ -1406,9 +1410,7 @@ describe('Notion onboarding continuation', () => {
       continueOnboarding: continueNotionOnboarding(env, { fetcher: emptyRoot, sleep: async () => {} }),
     });
 
-    const bodyText = await response.text();
-    expect(response.status).toBe(502);
-    expect(JSON.parse(bodyText)).toEqual({ error: 'notion_template_root_empty' });
+    const bodyText = await expectErrorPage(response, 502, 'notion_template_root_empty');
     expect(bodyText).not.toContain(NOTION_ACCESS_TOKEN);
   });
 

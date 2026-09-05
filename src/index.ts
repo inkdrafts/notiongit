@@ -34,7 +34,8 @@ import {
   saveProvisioningJob,
   type NotionTemplateLinks,
 } from './provisioning-job';
-import { callbackFailure, codedFailureCode, FlowFailure } from './failures';
+import { callbackFailure, codedFailureCode, FlowFailure, type ProvisioningFailureCode } from './failures';
+import { errorPageResponse, restartHrefFor } from './error-page';
 import {
   assertUsablePersonalInstallation,
   exchangeGithubCode,
@@ -513,16 +514,23 @@ function json(data: unknown, status = 200, headers: Record<string, string> = {})
 }
 
 function admissionResponse(decision: Exclude<Awaited<ReturnType<typeof admitProvisioningRequest>>, { action: 'allow' }>): Response {
-  const code = admissionFailureCode(decision.reason);
-  const status = decision.reason === 'callback_replay' ? 400
-    : decision.reason === 'account_attempt_limit' || decision.reason === 'request_burst' ? 429
-      : decision.reason === 'identity_denied' ? 423 : 503;
-  const body: Record<string, unknown> = { error: code };
-  if (decision.action === 'reject' && decision.retryAfterSeconds !== null) body.retry_after_seconds = decision.retryAfterSeconds;
-  const headers: Record<string, string> = decision.action === 'reject' && decision.retryAfterSeconds !== null
-    ? { 'retry-after': String(decision.retryAfterSeconds) }
-    : {};
-  return json(body, status, headers);
+  return failureResponse({
+    code: admissionFailureCode(decision.reason),
+    status: decision.reason === 'callback_replay' ? 400
+      : decision.reason === 'account_attempt_limit' || decision.reason === 'request_burst' ? 429
+        : decision.reason === 'identity_denied' ? 423 : 503,
+    retryAfterSeconds: decision.action === 'reject' ? decision.retryAfterSeconds : null,
+  });
+}
+
+/** Consent handoffs end in a document, so failures render the error page:
+ * only the fetch-only endpoints (progress status, site check) answer JSON. */
+function failureResponse(failure: {
+  code: ProvisioningFailureCode;
+  status: number;
+  retryAfterSeconds: number | null;
+}): Response {
+  return errorPageResponse({ ...failure, restartHref: restartHrefFor(failure.code, '/connect/github') });
 }
 
 function html(document: string, status = 200): Response {
@@ -603,21 +611,19 @@ function authError(error: unknown, request: Request): Response {
     const status = error.code === 'github_account_attempt_limited' ? 429
       : error.code === 'github_identity_temporarily_denied' ? 423
         : error.code === 'github_state_replayed' ? 400 : 503;
-    const body: Record<string, unknown> = { error: error.code };
-    if (error.retryAfterSeconds !== null) body.retry_after_seconds = error.retryAfterSeconds;
-    return json(body, status, error.retryAfterSeconds === null ? {} : { 'retry-after': String(error.retryAfterSeconds) });
+    return failureResponse({ code: error.code, status, retryAfterSeconds: error.retryAfterSeconds });
   }
   // GithubApiError carries no code, and GithubAppAuthError's derived code
   // reflects what the queue can retry, not what the user should do next:
   // both resolve here from the provider status.
   if (error instanceof GithubApiError || error instanceof GithubAppAuthError) {
-    if (error.status === 429) return json({ error: 'github_rate_limited' }, 429);
-    if (error.status === 404) return json({ error: 'github_installation_missing' }, 400);
-    if (error.status === 400 || error.status === 401) return json({ error: 'github_authorization_failed' }, 400);
-    return json({ error: 'github_authorization_unavailable' }, 502);
+    if (error.status === 429) return failureResponse({ code: 'github_rate_limited', status: 429, retryAfterSeconds: null });
+    if (error.status === 404) return failureResponse({ code: 'github_installation_missing', status: 400, retryAfterSeconds: null });
+    if (error.status === 400 || error.status === 401) return failureResponse({ code: 'github_authorization_failed', status: 400, retryAfterSeconds: null });
+    return failureResponse({ code: 'github_authorization_unavailable', status: 502, retryAfterSeconds: null });
   }
   if (error instanceof GithubRepositoryApiError && (error.status === 400 || error.status === 401)) {
-    return json({ error: 'github_authorization_failed' }, 400);
+    return failureResponse({ code: 'github_authorization_failed', status: 400, retryAfterSeconds: null });
   }
   if (error instanceof ProvisioningGateRefusedError) {
     // A refused start is not a failure of the flow. A double starter just
@@ -630,32 +636,31 @@ function authError(error: unknown, request: Request): Response {
         headers: { Location: new URL(progressPageUrl(error.activeJobId), request.url).toString() },
       });
     }
-    return json({
-      error: error.reason === 'account_busy' ? 'github_provisioning_already_active' : 'github_rate_limited',
-      retry_after_seconds: error.retryAfterSeconds,
-    }, error.status, { 'retry-after': String(error.retryAfterSeconds) });
+    return failureResponse({
+      code: error.reason === 'account_busy' ? 'github_provisioning_already_active' : 'github_rate_limited',
+      status: error.status,
+      retryAfterSeconds: error.retryAfterSeconds,
+    });
   }
   if (error instanceof GithubActionsSecretsError) {
-    return json({ error: error.code }, error.status);
+    return failureResponse({ code: error.code, status: error.status, retryAfterSeconds: null });
   }
   const failure = callbackFailure(error, 'github');
-  const body: Record<string, unknown> = { error: failure.code };
-  if (failure.retryAfterSeconds !== null) body.retry_after_seconds = failure.retryAfterSeconds;
   // Deliberately do not expose provider response bodies, OAuth codes, tokens,
   // private keys, or exception messages to the browser; the reportError
   // serialization is redacted by construction (see `safe-serialize.ts`).
   if (codedFailureCode(error) === null) reportError('github_callback_failed', error);
-  return json(body, failure.status);
+  return failureResponse(failure);
 }
 
 async function beginGithubInstall(request: Request, env: Partial<Env>): Promise<Response> {
   if (!env.JOBS || !env.GITHUB_APP_SLUG || !env.GITHUB_CLIENT_SECRET) {
-    return json({ error: 'github_configuration_missing' }, 500);
+    return failureResponse({ code: 'github_configuration_missing', status: 500, retryAfterSeconds: null });
   }
   const url = new URL(request.url);
   const requestedJobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
   const jobId = requestedJobId || crypto.randomUUID();
-  if (!validJobId(jobId)) return json({ error: 'invalid_job_id' }, 400);
+  if (!validJobId(jobId)) return failureResponse({ code: 'invalid_job_id', status: 400, retryAfterSeconds: null });
   const admission = await admitProvisioningRequest(env as Env, provisioningAdmissionConfig(env), {
     request,
     jobId,
@@ -687,7 +692,7 @@ async function beginGithubInstall(request: Request, env: Partial<Env>): Promise<
 
 async function finishGithubCallback(request: Request, env: Partial<Env>): Promise<Response> {
   if (!env.JOBS || !env.GITHUB_APP_ID || !env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
-    return json({ error: 'github_configuration_missing' }, 500);
+    return failureResponse({ code: 'github_configuration_missing', status: 500, retryAfterSeconds: null });
   }
   const url = new URL(request.url);
   const encodedState = url.searchParams.get('state');
@@ -699,18 +704,18 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
     return statusCallback(request, env);
   }
   if (url.searchParams.has('error')) {
-    return json({ error: 'github_authorization_denied' }, 400);
+    return failureResponse({ code: 'github_authorization_denied', status: 400, retryAfterSeconds: null });
   }
-  if (!encodedState) return json({ error: 'github_state_missing' }, 400);
+  if (!encodedState) return failureResponse({ code: 'github_state_missing', status: 400, retryAfterSeconds: null });
   const payload = await verifyGithubState(encodedState, stateSecret(env as Pick<Env, 'GITHUB_CLIENT_SECRET'>));
-  if (!payload) return json({ error: 'github_state_invalid' }, 400);
+  if (!payload) return failureResponse({ code: 'github_state_invalid', status: 400, retryAfterSeconds: null });
 
   const record = await env.JOBS.get<GithubStateRecord>(stateKey(payload.nonce), 'json');
   if (!record || record.jobId !== payload.jobId || record.nonce !== payload.nonce || record.version !== 1) {
-    return json({ error: 'github_state_invalid' }, 400);
+    return failureResponse({ code: 'github_state_invalid', status: 400, retryAfterSeconds: null });
   }
-  if (record.phase === 'consumed') return json({ error: 'github_state_replayed' }, 400);
-  if (record.expiresAt <= Math.floor(Date.now() / 1000)) return json({ error: 'github_state_expired' }, 400);
+  if (record.phase === 'consumed') return failureResponse({ code: 'github_state_replayed', status: 400, retryAfterSeconds: null });
+  if (record.expiresAt <= Math.floor(Date.now() / 1000)) return failureResponse({ code: 'github_state_expired', status: 400, retryAfterSeconds: null });
 
   const admissionConfig = provisioningAdmissionConfig(env);
   const control = await admitProvisioningStage(env as Env, admissionConfig, {
@@ -722,10 +727,10 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   const installationId = validInstallationId(url.searchParams.get('installation_id'));
   const code = url.searchParams.get('code');
   if (!installationId && !record.installationId && !code) {
-    return json({ error: 'github_installation_missing' }, 400);
+    return failureResponse({ code: 'github_installation_missing', status: 400, retryAfterSeconds: null });
   }
   if (url.searchParams.has('setup_action') && !['install', 'update'].includes(url.searchParams.get('setup_action') || '')) {
-    return json({ error: 'github_setup_invalid' }, 400);
+    return failureResponse({ code: 'github_setup_invalid', status: 400, retryAfterSeconds: null });
   }
   const replay = await admitProvisioningCallback(env as Env, admissionConfig, {
     provider: 'github',
@@ -818,7 +823,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
             },
           },
         ));
-        if (!identity || !repository || !generatedRepository) return json({ error: 'github_identity_missing' }, 400);
+        if (!identity || !repository || !generatedRepository) return failureResponse({ code: 'github_identity_missing', status: 400, retryAfterSeconds: null });
 
         // Everything after this point — verifying the generated repository is
         // readable, patching its config, enabling Pages, dispatching and
@@ -856,7 +861,7 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
       // This supports a setup callback arriving before the OAuth callback. The
       // App JWT proves that the installation belongs to this App; the later
       // OAuth callback still proves that it belongs to the authenticated user.
-      if (!selectedInstallationId) return json({ error: 'github_installation_missing' }, 400);
+      if (!selectedInstallationId) return failureResponse({ code: 'github_installation_missing', status: 400, retryAfterSeconds: null });
       const appInstallation = await getAppInstallation(env as Pick<Env, 'GITHUB_APP_ID' | 'GITHUB_APP_PRIVATE_KEY'>, selectedInstallationId);
       assertUsablePersonalInstallation(appInstallation);
       const nextRecord: GithubStateRecord = {
@@ -1010,17 +1015,13 @@ export function continueNotionOnboarding(
  */
 async function beginNotionForJob(request: Request, env: Partial<Env>): Promise<Response> {
   if (!env.JOBS || !env.NOTION_CLIENT_ID || !env.NOTION_CLIENT_SECRET) {
-    return json({ error: 'notion_configuration_missing' }, 500);
+    return failureResponse({ code: 'notion_configuration_missing', status: 500, retryAfterSeconds: null });
   }
   const url = new URL(request.url);
   const jobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
   const job = jobId && validJobId(jobId) ? await loadProvisioningJob(env.JOBS, jobId) : null;
   if (!jobId || !validJobId(jobId) || !job) {
-    return json({
-      error: 'provisioning_job_missing',
-      message: 'Connect GitHub first.',
-      connect_url: '/connect/github',
-    }, 409);
+    return failureResponse({ code: 'provisioning_job_missing', status: 409, retryAfterSeconds: null });
   }
   const admission = await admitProvisioningStage(env as Env, provisioningAdmissionConfig(env), {
     stage: 'notion_callback',

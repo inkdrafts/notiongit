@@ -10,7 +10,8 @@
 import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import type { GithubActionsSecretsErrorCode } from './actions-secrets';
 import type { NotionTemplateErrorCode } from './notion-template';
-import { callbackFailure, codedFailureCode } from './failures';
+import { callbackFailure, codedFailureCode, type ProvisioningFailureCode } from './failures';
+import { errorPageResponse, restartHrefFor } from './error-page';
 import { progressPageUrl } from './progress';
 import { Secret } from './secret';
 import { redactValue, reportError } from './safe-serialize';
@@ -244,11 +245,19 @@ function cookieValue(request: Request, name: string): string | null {
   return null;
 }
 
-function response(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...JSON_HEADERS, ...extraHeaders },
-  });
+function notionFailureResponse(failure: {
+  code: ProvisioningFailureCode;
+  status: number;
+  retryAfterSeconds: number | null;
+  details?: Record<string, unknown> | null;
+  /** Overrides the registry-derived target; null means no button at all. */
+  restartHref?: string | null;
+}, extraHeaders: Record<string, string> = {}): Response {
+  const base = restartHrefFor(failure.code, '/connect/github');
+  return errorPageResponse({
+    ...failure,
+    restartHref: failure.restartHref !== undefined ? failure.restartHref : base,
+  }, extraHeaders);
 }
 
 async function readJson<T>(result: Response): Promise<T | null> {
@@ -265,13 +274,13 @@ export async function beginNotionAuthorization(
   env: Partial<NotionOAuthEnv>,
 ): Promise<Response> {
   if (!env.JOBS || !env.NOTION_CLIENT_ID || !env.NOTION_CLIENT_SECRET) {
-    return response({ error: 'notion_configuration_missing' }, 500);
+    return notionFailureResponse({ code: 'notion_configuration_missing', status: 500, retryAfterSeconds: null });
   }
 
   const url = new URL(request.url);
   const requestedJobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
   const jobId = requestedJobId || crypto.randomUUID();
-  if (!validJobId(jobId)) return response({ error: 'invalid_job_id' }, 400);
+  if (!validJobId(jobId)) return notionFailureResponse({ code: 'invalid_job_id', status: 400, retryAfterSeconds: null });
   emitProvisioningEvent(env, { type: 'consent_started', jobId, ts: Date.now(), provider: 'notion' });
 
   const now = Math.floor(Date.now() / 1000);
@@ -376,29 +385,29 @@ export async function finishNotionCallback(
 ): Promise<Response> {
   const clearCookieHeaders = { 'Set-Cookie': clearRedirectCookie() };
   if (!env.JOBS || !env.NOTION_CLIENT_ID || !env.NOTION_CLIENT_SECRET) {
-    return response({ error: 'notion_configuration_missing' }, 500, clearCookieHeaders);
+    return notionFailureResponse({ code: 'notion_configuration_missing', status: 500, retryAfterSeconds: null }, clearCookieHeaders);
   }
 
   const url = new URL(request.url);
   const encodedState = url.searchParams.get('state');
-  if (!encodedState) return response({ error: 'notion_state_missing' }, 400, clearCookieHeaders);
+  if (!encodedState) return notionFailureResponse({ code: 'notion_state_missing', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
   const payload = await verifyNotionState(encodedState, env.NOTION_CLIENT_SECRET);
-  if (!payload) return response({ error: 'notion_state_invalid' }, 400, clearCookieHeaders);
+  if (!payload) return notionFailureResponse({ code: 'notion_state_invalid', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
   if (payload.exp <= Math.floor(Date.now() / 1000)) {
-    return response({ error: 'notion_state_expired' }, 400, clearCookieHeaders);
+    return notionFailureResponse({ code: 'notion_state_expired', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
   }
 
   if (cookieValue(request, NOTION_STATE_COOKIE) !== payload.nonce) {
-    return response({ error: 'notion_state_invalid' }, 400, clearCookieHeaders);
+    return notionFailureResponse({ code: 'notion_state_invalid', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
   }
 
   const record = await env.JOBS.get<NotionStateRecord>(stateKey(payload.nonce), 'json');
   if (!record || record.version !== 1 || record.jobId !== payload.jobId || record.nonce !== payload.nonce) {
-    return response({ error: 'notion_state_invalid' }, 400, clearCookieHeaders);
+    return notionFailureResponse({ code: 'notion_state_invalid', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
   }
-  if (record.phase === 'consumed') return response({ error: 'notion_state_replayed' }, 400, clearCookieHeaders);
+  if (record.phase === 'consumed') return notionFailureResponse({ code: 'notion_state_replayed', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
   if (record.expiresAt <= Math.floor(Date.now() / 1000)) {
-    return response({ error: 'notion_state_expired' }, 400, clearCookieHeaders);
+    return notionFailureResponse({ code: 'notion_state_expired', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
   }
 
   const admissionConfig = provisioningAdmissionConfig(env);
@@ -407,15 +416,14 @@ export async function finishNotionCallback(
     jobId: payload.jobId,
   }, Date.now());
   if (control.action !== 'allow') {
-    const code = admissionFailureCode(control.reason);
-    const retryAfter = control.retryAfterSeconds;
     const status = control.reason === 'callback_replay' ? 400
       : control.reason === 'request_burst' || control.reason === 'account_attempt_limit' ? 429
         : control.reason === 'identity_denied' ? 423 : 503;
-    return response({ error: code }, status, {
-      ...clearCookieHeaders,
-      ...(retryAfter === null ? {} : { 'Retry-After': String(retryAfter) }),
-    });
+    return notionFailureResponse({
+      code: admissionFailureCode(control.reason),
+      status,
+      retryAfterSeconds: control.retryAfterSeconds,
+    }, clearCookieHeaders);
   }
   const replay = await admitProvisioningCallback(env as NotionOAuthEnv, admissionConfig, {
     provider: 'notion',
@@ -424,7 +432,7 @@ export async function finishNotionCallback(
     stage: 'notion_callback',
     jobId: payload.jobId,
   }, Date.now());
-  if (replay.action !== 'allow') return response({ error: admissionFailureCode(replay.reason, 'notion') }, 400, clearCookieHeaders);
+  if (replay.action !== 'allow') return notionFailureResponse({ code: admissionFailureCode(replay.reason, 'notion'), status: 400, retryAfterSeconds: replay.retryAfterSeconds }, clearCookieHeaders);
 
   // Claiming the callback above closes the replay race. Consume the signed
   // state before the provider call because the authorization code is single-use.
@@ -433,10 +441,10 @@ export async function finishNotionCallback(
   });
 
   if (url.searchParams.has('error')) {
-    return response({ error: 'notion_authorization_denied' }, 400, clearCookieHeaders);
+    return notionFailureResponse({ code: 'notion_authorization_denied', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
   }
   const code = url.searchParams.get('code');
-  if (!code) return response({ error: 'notion_code_missing' }, 400, clearCookieHeaders);
+  if (!code) return notionFailureResponse({ code: 'notion_code_missing', status: 400, retryAfterSeconds: null }, clearCookieHeaders);
 
   try {
     const exchanged = await exchangeNotionCode(
@@ -491,12 +499,18 @@ export async function finishNotionCallback(
         },
       });
     }
-    const body: Record<string, unknown> = { error: failure.code };
     // Only non-secret schema metadata the continuation attached on purpose,
     // redacted on the way out so a future details field cannot smuggle a
     // credential into the browser.
-    if (failure.details) Object.assign(body, redactValue(failure.details));
+    const details = failure.details ? redactValue(failure.details) as Record<string, unknown> : null;
+    const connectUrl = typeof details?.connect_url === 'string' ? details.connect_url : '/connect/github';
     if (codedFailureCode(error) === null) reportError('notion_callback_failed', error);
-    return response(body, failure.status, clearCookieHeaders);
+    return notionFailureResponse({
+      code: failure.code,
+      status: failure.status,
+      retryAfterSeconds: failure.retryAfterSeconds,
+      details,
+      restartHref: restartHrefFor(failure.code, connectUrl),
+    }, clearCookieHeaders);
   }
 }

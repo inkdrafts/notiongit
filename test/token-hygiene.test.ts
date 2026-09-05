@@ -27,6 +27,18 @@ import worker, {
   type ProvisioningJob,
   type ProvisioningMessage,
 } from '../src/index';
+import { userCopy, type ProvisioningFailureCode } from '../src/failures';
+
+/** Consent-handoff failures render the shared HTML error page; assert the
+ * status, the visible machine code, and the registry's canonical copy. */
+async function expectErrorPage(response: Response, status: number, code: ProvisioningFailureCode): Promise<string> {
+  expect(response.status).toBe(status);
+  const text = await response.text();
+  expect(response.headers.get('content-type')).toContain('text/html');
+  expect(text).toContain(`Error code: <code>${code}</code>`);
+  expect(text).toContain(userCopy(code).message);
+  return text;
+}
 import { createProvisioningJob } from '../src/provisioning-job';
 
 // ---------------------------------------------------------------------------
@@ -638,8 +650,7 @@ describe('J1 Notion callback journey', () => {
         ),
       });
       const callback = driven.responses[1];
-      expect(callback.status).toBe(400);
-      expect(await callback.text()).toBe('{"error":"notion_authorization_failed"}');
+      await expectErrorPage(callback, 400, 'notion_authorization_failed');
       assertJourneyClean(driven, recorder);
       return driven;
     });
@@ -656,25 +667,21 @@ describe('J1 Notion callback journey', () => {
         },
       });
       const callback = driven.responses[1];
-      expect(callback.status).toBe(502);
-      expect(await callback.text()).toBe('{"error":"notion_unavailable"}');
+      await expectErrorPage(callback, 502, 'notion_unavailable');
       assertJourneyClean(driven, recorder);
       return driven;
     });
     expect(journey.kv.keysWithPrefix(NOTION_TEMPLATE_RESOLUTION_PREFIX)).toEqual([]);
   });
 
-  test('production error details are merged verbatim and stay canary-free end to end', async () => {
+  test('production error details render on the page and stay canary-free end to end', async () => {
     const journey = await withCapturedConsole(async (recorder) => {
       const driven = await driveNotionCallback({ extraPagesClone: true });
       const callback = driven.responses[1];
-      expect(callback.status).toBe(422);
-      expect(await callback.json()).toEqual({
-        error: 'notion_template_database_ambiguous',
-        scanned: 3,
-        duplicated_roles: ['pages'],
-        ambiguous_databases: 0,
-      });
+      const page = await expectErrorPage(callback, 422, 'notion_template_database_ambiguous');
+      expect(page).toContain('<code>scanned</code>: 3');
+      expect(page).toContain('<code>duplicated_roles</code>: [&quot;pages&quot;]');
+      expect(page).toContain('<code>ambiguous_databases</code>: 0');
       assertJourneyClean(driven, recorder);
       return driven;
     });
@@ -869,8 +876,7 @@ describe('J2 GitHub callback journey', () => {
         }),
       });
       const callback = driven.responses[1];
-      expect(callback.status).toBe(403);
-      expect(await callback.text()).toBe('{"error":"github_installation_suspended"}');
+      await expectErrorPage(callback, 403, 'github_installation_suspended');
       assertJourneyClean(driven, recorder);
       recorder.assertSilent();
       return driven;
@@ -886,7 +892,8 @@ describe('J2 GitHub callback journey', () => {
       });
       const callback = driven.responses[1];
       expect(callback.status).toBe(429);
-      expect(await callback.text()).toBe('{"error":"github_generate_rate_limited","retry_after_seconds":60}');
+      expect(callback.headers.get('retry-after')).toBe('60');
+      await expectErrorPage(callback, 429, 'github_generate_rate_limited');
       assertJourneyClean(driven, recorder);
       recorder.assertSilent();
       return driven;
@@ -1060,8 +1067,7 @@ describe('J4 error funnels', () => {
       boom.accessToken = GITHUB_USER_TOKEN;
       const driven = await runGithubOnboarding({ exchangeToken: () => boom });
       const callback = driven.responses[1];
-      expect(callback.status).toBe(502);
-      expect(await callback.text()).toBe('{"error":"github_authorization_unavailable"}');
+      await expectErrorPage(callback, 502, 'github_authorization_unavailable');
       recorder.assertSingleRecord('github_callback_failed');
       expect(recorder.recordText(0)).toContain('"accessToken":"[redacted]"');
       assertJourneyClean(driven, recorder);
@@ -1095,8 +1101,7 @@ describe('J4 error funnels', () => {
         { fetcher: notionTokenFetch(), continueOnboarding: () => { throw boom; } },
       );
       await addResponse(journey, callback);
-      expect(callback.status).toBe(502);
-      expect(await callback.text()).toBe('{"error":"notion_unavailable"}');
+      await expectErrorPage(callback, 502, 'notion_unavailable');
       expect(recorder.funnelEventTypes()).toEqual(['consent_started', 'consent_failed']);
       const reports = recorder.reportErrorTexts();
       expect(reports).toHaveLength(1);
@@ -1193,12 +1198,9 @@ describe('J4 error funnels', () => {
         },
       );
       await addResponse(journey, callback);
-      expect(callback.status).toBe(422);
-      expect(await callback.json()).toEqual({
-        error: 'notion_template_database_ambiguous',
-        scanned: 2,
-        accessToken: REDACTED_MARKER,
-      });
+      const page = await expectErrorPage(callback, 422, 'notion_template_database_ambiguous');
+      expect(page).toContain('<code>scanned</code>: 2');
+      expect(page).toContain(`<code>accessToken</code>: &quot;${REDACTED_MARKER}&quot;`);
       expect(recorder.funnelEventTypes()).toEqual(['consent_started', 'consent_failed']);
       expect(recorder.reportErrorTexts()).toEqual([]);
     });
