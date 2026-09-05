@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   FAILURE_REGISTRY,
@@ -307,5 +310,104 @@ describe('callbackFailure', () => {
       retryAfterSeconds: null,
       details: { remediation: 'Restore the databases, then reconnect.' },
     });
+  });
+});
+
+/**
+ * Orphan-row lint: a registry entry only earns its place if some site in
+ * src/ can actually produce it. See docs/decisions/0006-failure-taxonomy-
+ * followups.md for why the module `ErrorCode` unions above aren't proof by
+ * themselves — a union member is a declared possibility, not evidence
+ * anything throws or returns it. This scans src/ for the shapes that do
+ * carry that evidence: a literal passed to one of the taxonomy's throwable
+ * classes, a literal assigned to a `code` field, and a literal `return` or
+ * ternary branch inside a function that resolves a code (`admissionFailureCode`,
+ * `GithubAppAuthError`). Every entry above already proves module codes are a
+ * taxonomy subset; this proves the taxonomy has no member none of them ever
+ * reach.
+ */
+describe('orphan rows', () => {
+  const PRODUCING_CLASSES = [
+    'FlowFailure',
+    'GithubActionsSecretsError',
+    'GithubConfigError',
+    'GithubDeployError',
+    'GithubGenerateError',
+    'GithubPagesError',
+    'GithubSyncError',
+    'NotionOAuthError',
+    'NotionTemplateError',
+  ];
+  const CODE = '([a-z][a-z0-9_]*)';
+  const PRODUCING_PATTERNS = [
+    new RegExp(`\\bnew (?:${PRODUCING_CLASSES.join('|')})\\(\\s*'${CODE}'`, 'gu'),
+    new RegExp(`(?<![A-Za-z])code:\\s*'${CODE}'`, 'gu'),
+    new RegExp(`\\breturn\\s+'${CODE}'`, 'gu'),
+    new RegExp(`\\?\\s*'${CODE}'\\s*:\\s*'${CODE}'`, 'gu'),
+  ];
+
+  /** Every code from `knownCodes` that a producing shape in `text` names. */
+  function producedCodes(text: string, knownCodes: ReadonlySet<string>): Set<string> {
+    const produced = new Set<string>();
+    for (const pattern of PRODUCING_PATTERNS) {
+      for (const match of text.matchAll(pattern)) {
+        for (const group of match.slice(1)) {
+          if (group !== undefined && knownCodes.has(group)) produced.add(group);
+        }
+      }
+    }
+    return produced;
+  }
+
+  test('the scanner recognizes a construction, a code field, a return, and a chained ternary', () => {
+    const known = new Set([
+      'github_state_missing', 'github_config_conflict', 'provisioning_paused',
+      'github_app_unavailable', 'github_app_auth_failed', 'never_written',
+    ]);
+    const text = [
+      `throw new FlowFailure('github_state_missing');`,
+      `return failureResponse({ code: 'github_config_conflict', status: 409, retryAfterSeconds: null });`,
+      `function pick(): ProvisioningFailureCode { return 'provisioning_paused'; }`,
+      `this.code = status === 429 ? 'github_rate_limited' : status >= 500 ? 'github_app_unavailable' : 'github_app_auth_failed';`,
+    ].join('\n');
+    expect(producedCodes(text, known)).toEqual(new Set([
+      'github_state_missing', 'github_config_conflict', 'provisioning_paused',
+      'github_app_unavailable', 'github_app_auth_failed',
+    ]));
+  });
+
+  /**
+   * Registry entries with no producing site today. Each one names why the
+   * lint doesn't fail the build over it instead of silently ignoring it.
+   */
+  const ALLOWED_ORPHANS: Readonly<Record<string, string>> = {
+    notion_template_not_validated:
+      'The registry describes a preflight gate ("no stored template resolution, or a schema ' +
+      'version mismatch") that nothing in src/ calls: loadNotionTemplateResolution is exported ' +
+      'from notion-template.ts and has no caller. Tracked in notiongit#78 instead of building the ' +
+      'gate inside this lint issue.',
+  };
+
+  test('every registry code not named as an exception has a producing site in src/', () => {
+    const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
+    const registryFile = join(srcDir, 'failures.ts');
+
+    const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) return walk(path);
+      return entry.name.endsWith('.ts') && path !== registryFile ? [path] : [];
+    });
+
+    const knownCodes = new Set(ALL_CODES);
+    const reachable = new Set<string>();
+    for (const file of walk(srcDir)) {
+      for (const code of producedCodes(readFileSync(file, 'utf8'), knownCodes)) reachable.add(code);
+    }
+
+    const orphans = ALL_CODES.filter((code) => !reachable.has(code) && !(code in ALLOWED_ORPHANS));
+    expect(orphans).toEqual([]);
+
+    const staleExceptions = Object.keys(ALLOWED_ORPHANS).filter((code) => reachable.has(code));
+    expect(staleExceptions).toEqual([]);
   });
 });
