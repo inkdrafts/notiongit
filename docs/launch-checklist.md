@@ -24,10 +24,11 @@ git diff --check
 | Item | Evidence | Status |
 | --- | --- | --- |
 | Privacy policy, Terms of Service, security/data-handling, acceptable use, support, and leaving pages are published by the Worker | `test/policy-pages.test.ts`, `bun run scripts/launch-gate.ts` | PASS |
-| Every policy is linked from the landing page before the consent CTA, from the Notion consent handoff, from the dashboard, and from the error page | `test/policy-pages.test.ts` ("links every policy before the consent CTA", "the Notion consent handoff links the privacy policy") | PASS |
+| Every policy is linked from a consent-adjacent surface: the landing page links all six before the CTA, the Notion consent handoff links the privacy policy, the dashboard's leaving card links the leaving page, and the error page links support | `test/policy-pages.test.ts` (one reachability test per surface) | PASS |
 | Policy claims match real retention and token behavior | Retention numbers are computed from `PROVISIONING_JOB_TTL_SECONDS` and `STATUS_SESSION_TTL_SECONDS` in `src/policy-pages.ts`; platform figures (three months of aggregates, at most seven days of logs) are pinned by test and documented in [`observability.md`](observability.md#retention) | PASS |
 | Policies meet the accessibility bar | axe scan of all six documents in `test/a11y.test.ts` | PASS |
 | No policy claims certification or perfect security | `test/policy-pages.test.ts` ("no policy claims certification or perfect security") | PASS |
+| Owner decisions the pages cannot invent are confirmed: the operator or legal entity behind InkDrafts for the Terms page, governing-law wording, and a content-report path | Written around honestly for now; the owner's wording and a counsel read land before launch | PENDING |
 
 ## B. URL, branding, and callback verification
 
@@ -65,7 +66,7 @@ each with its evidence. The dependency/license audit is automated:
 
 | Item | Evidence | Status |
 | --- | --- | --- |
-| Rate-limit budgets inside GitHub's app-wide secondary limits | `wrangler.toml`: 30 mutations/min and 240/hour configured against GitHub's ~80/min and ~500/hour; `provisioningThrottleConfig` clamps operator values to ceilings inside those bounds; `test/provisioning-throttle.test.ts` pins the clamps | PASS |
+| Rate-limit budgets inside GitHub's app-wide secondary limits | `wrangler.toml`: 30 mutations/min and 240/hour configured against GitHub's ~80/min and ~500/hour (GitHub's documented secondary rate limits, docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api); `provisioningThrottleConfig` clamps operator values to ceilings inside those bounds; `test/provisioning-throttle.test.ts` pins the clamps | PASS |
 | Abuse admission controls active | `PROVISIONING_CONTROL_MODE=active` in every environment; per-account, burst, and identity-cooldown limits configured; `test/provisioning-throttle.test.ts` | PASS |
 | Observability events, alerts, and dashboards operational | [`observability.md`](observability.md) | PASS for the event sinks and queries; alerting is PENDING on the drill in §C |
 | Fresh-account rehearsal evidence exists | The script and report template exist ([`rehearsal-script.md`](rehearsal-script.md)), but issue #25 was closed on the committable half only: **the live rehearsal has not run**. Run it per the script and commit the redacted report as `docs/rehearsal-report-launch-gate.md` | PENDING |

@@ -28,6 +28,15 @@ import worker, {
   type ProvisioningMessage,
 } from '../src/index';
 import { userCopy, type ProvisioningFailureCode } from '../src/failures';
+import {
+  readStatusSession,
+  signStatusState,
+  statusRerunKey,
+  statusStatePayload,
+  STATUS_RERUN_WINDOW_SECONDS,
+  STATUS_SESSION_COOKIE,
+  STATUS_STATE_COOKIE,
+} from '../src/status';
 
 /** Consent-handoff failures render the shared HTML error page; assert the
  * status, the visible machine code, and the registry's canonical copy. */
@@ -395,6 +404,7 @@ const FUNNEL_EVENT_TYPES = new Set([
   'rate_limited',
   'job_succeeded',
   'job_dead_lettered',
+  'status_rerun_dispatched',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1300,6 +1310,177 @@ describe('J6 progress route journey', () => {
     expect(kv.writes).toEqual([]);
     expect(kv.deletes).toEqual([]);
     expect(queue.sent).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// J7 — the status surface through `route()`: the OAuth sign-in proves identity
+// and writes nothing to KV, the page and manual re-run re-derive the site with
+// on-the-spot installation mints, and a foreign-signed state is refused.
+// ---------------------------------------------------------------------------
+
+async function driveStatusSignInAndRerun(): Promise<Journey & { env: Partial<Env>; sessionCookie: string }> {
+  const kv = new RecordingKV();
+  const queue = new RecordingQueue();
+  const journey: Journey & { env: Partial<Env>; sessionCookie: string } = {
+    ...emptyJourney(kv, queue),
+    env: { ...(await canaryEnv(kv, queue)), GITHUB_APP_ID: '123' },
+    sessionCookie: '',
+  };
+
+  const generatedRepository = {
+    id: 1001,
+    name: 'alice.github.io',
+    full_name: 'alice/alice.github.io',
+    html_url: 'https://github.com/alice/alice.github.io',
+    default_branch: 'main',
+    description: 'Notion-powered site published with InkDrafts',
+    fork: false,
+  };
+  const completedRun = {
+    id: 555,
+    html_url: 'https://github.com/alice/alice.github.io/actions/runs/555',
+    status: 'completed',
+    conclusion: 'success',
+    head_sha: 'head-sha',
+    created_at: '2026-09-01T10:00:00Z',
+    updated_at: '2026-09-01T10:05:00Z',
+    event: 'workflow_dispatch',
+  };
+
+  const trackError = captureThrownErrors(journey);
+  let mints = 0;
+  const { calls, fetcher } = scriptedFetch((request) => {
+    const url = new URL(request.url);
+    if (url.href === 'https://github.com/login/oauth/access_token') {
+      return Response.json({ access_token: GITHUB_USER_TOKEN, token_type: 'bearer' });
+    }
+    if (url.href === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
+    if (url.href === 'https://api.github.com/user/installations') {
+      return Response.json({ installations: [{ id: 123, app_id: 123, account: { id: 42 } }] });
+    }
+    if (url.href === 'https://api.github.com/app/installations/123') {
+      return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null, suspended_by: null });
+    }
+    if (url.href === 'https://api.github.com/app/installations/123/access_tokens') {
+      mints += 1;
+      return Response.json({ token: INSTALLATION_TOKENS[mints - 1] });
+    }
+    if (url.href.startsWith('https://api.github.com/installation/repositories')) {
+      return Response.json({ total_count: 1, repositories: [generatedRepository] });
+    }
+    if (url.href.includes('/actions/workflows/sync-notion.yml/runs')) {
+      return Response.json({ workflow_runs: [completedRun] });
+    }
+    if (url.href.includes('/pages/builds/latest')) {
+      return Response.json({ status: 'built', commit: 'head-sha' });
+    }
+    if (url.href.endsWith('/actions/workflows/sync-notion.yml/dispatches')) {
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`unexpected provider request: ${request.method} ${url.pathname}`);
+  });
+  journey.calls = calls;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetcher;
+  try {
+    const connect = await route(new Request('https://staging.example/status?connect=1'), journey.env);
+    await addResponse(journey, connect);
+    expect(connect.status).toBe(302);
+    const authorizeUrl = new URL(connect.headers.get('location')!);
+    expect(authorizeUrl.origin).toBe('https://github.com');
+    expect(authorizeUrl.pathname).toBe('/login/oauth/authorize');
+    const stateCookie = connect.headers.getSetCookie()
+      .find((cookie) => cookie.startsWith(`${STATUS_STATE_COOKIE}=`))!.split(';', 1)[0];
+
+    const callback = await route(
+      new Request(
+        `https://staging.example/auth/github/callback?state=${encodeURIComponent(authorizeUrl.searchParams.get('state')!)}&code=${ONE_TIME_CODE}`,
+        { headers: { Cookie: stateCookie } },
+      ),
+      journey.env,
+    );
+    await addResponse(journey, callback);
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get('location')).toBe('https://staging.example/status');
+    const sessionCookie = callback.headers.getSetCookie()
+      .find((cookie) => cookie.startsWith(`${STATUS_SESSION_COOKIE}=`))!.split(';', 1)[0];
+    expect(callback.headers.getSetCookie().some((cookie) => cookie.startsWith(`${STATUS_STATE_COOKIE}=;`))).toBe(true);
+    journey.sessionCookie = sessionCookie;
+    expect(journey.kv.writes).toEqual([]);
+
+    const page = await route(
+      new Request('https://staging.example/status', { headers: { Cookie: sessionCookie } }),
+      journey.env,
+    );
+    await addResponse(journey, page);
+    expect(page.status).toBe(200);
+    const rerunToken = (await page.text()).match(/name="token" value="([^"]+)"/u)?.[1];
+    expect(rerunToken).toBeDefined();
+
+    const rerun = await route(new Request('https://staging.example/status/rerun', {
+      method: 'POST',
+      headers: { Origin: 'https://staging.example', Cookie: sessionCookie },
+      body: new URLSearchParams({ token: rerunToken! }),
+    }), journey.env);
+    await addResponse(journey, rerun);
+    expect(rerun.status).toBe(303);
+    expect(rerun.headers.get('location')).toBe('https://staging.example/status?notice=sync_triggered');
+
+    const foreignState = await signStatusState(statusStatePayload(Math.floor(Date.now() / 1000)), 'other-key');
+    const refused = await route(
+      new Request(`https://staging.example/auth/github/callback?state=${encodeURIComponent(foreignState)}&code=${ONE_TIME_CODE}`),
+      journey.env,
+    );
+    await addResponse(journey, refused);
+    await expectErrorPage(refused, 400, 'github_state_invalid');
+  } catch (error) {
+    trackError(error);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  return journey;
+}
+
+describe('J7 status sign-in and re-run journey', () => {
+  test('the sign-in token dies inside the callback, discovery and re-run spend only fresh mints, and sign-in writes nothing to KV', async () => {
+    const journey = await withCapturedConsole(async (recorder) => {
+      const driven = await driveStatusSignInAndRerun();
+      assertJourneyClean(driven, recorder);
+      expect(recorder.reportErrorTexts()).toEqual([]);
+      return driven;
+    });
+
+    const exchange = journey.calls.find((call) => call.url === 'https://github.com/login/oauth/access_token');
+    expect(exchange?.body).toContain(ONE_TIME_CODE);
+    let mint = 0;
+    for (const call of journey.calls) {
+      if (!call.url.startsWith('https://api.github.com/')) continue;
+      if (call.url === 'https://api.github.com/user' || call.url === 'https://api.github.com/user/installations') {
+        expect(call.authorization).toBe(`Bearer ${GITHUB_USER_TOKEN}`);
+        continue;
+      }
+      if (call.url.endsWith('/access_tokens')) mint += 1;
+      if (call.url.includes('/app/installations/')) continue;
+      expect(call.authorization).toBe(`Bearer ${INSTALLATION_TOKENS[mint - 1]}`);
+    }
+    expect(mint).toBe(4);
+    const dispatch = journey.calls.find((call) => call.url.endsWith('/actions/workflows/sync-notion.yml/dispatches'));
+    expect(JSON.parse(dispatch!.body!)).toEqual({ ref: 'main', inputs: { allow_bulk_delete: 'false' } });
+
+    const session = await readStatusSession(
+      new Request('https://staging.example/status', { headers: { Cookie: journey.sessionCookie } }),
+      journey.env.GITHUB_CLIENT_SECRET!,
+    );
+    expect(session).toMatchObject({ accountId: 42, login: 'alice', installationId: 123 });
+
+    const burstKeys = journey.kv.keysWithPrefix('provisioning:admission:burst:');
+    expect(burstKeys).toHaveLength(1);
+    expect(journey.kv.writes.map((write) => write.key)).toEqual([burstKeys[0], 'github:rate:global', statusRerunKey(42)]);
+    expect(journey.kv.ttlLog(statusRerunKey(42))).toEqual([STATUS_RERUN_WINDOW_SECONDS]);
+    expect(journey.kv.deletes).toEqual([]);
+    expect(journey.queue.sent).toEqual([]);
   });
 });
 

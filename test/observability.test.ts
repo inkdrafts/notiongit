@@ -125,6 +125,11 @@ const EVENTS: Array<{ event: ProvisioningEvent; blobs: string[]; doubles: number
     blobs: ['job_dead_lettered', 'job-1', 'verify_deploy', 'github_deploy_url_unreachable'],
     doubles: [2_000, 240_000],
   },
+  {
+    event: { type: 'status_rerun_dispatched', requestLabel: 'request-label-1', ts: 2_100 },
+    blobs: ['status_rerun_dispatched', 'request-label-1'],
+    doubles: [2_100],
+  },
 ];
 
 class MemoryKV {
@@ -276,7 +281,8 @@ describe('emitProvisioningEvent', () => {
     const types = EVENTS.map(({ event }) => event.type);
     expect(new Set(types).size).toBe(types.length);
     expect(types).toContain('job_succeeded');
-    expect(types).toHaveLength(11);
+    expect(types).toContain('status_rerun_dispatched');
+    expect(types).toHaveLength(12);
   });
 
   test('still logs when no metrics dataset is bound', async () => {

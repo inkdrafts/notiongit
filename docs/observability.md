@@ -15,6 +15,13 @@ already used as the KV key, the queue message body, and the `202` response field
 Nothing else identifies the user. Correlation therefore costs no user identity and
 no second identifier.
 
+`status_rerun_dispatched` is the one exception: `POST /status/rerun` has no
+durable job to key on, so it carries a `requestLabel` field instead of
+`jobId` — the same per-request random label `statusRerun` already mints for
+the admission audit (see `docs/security-data-flow.md` §3), not a
+`ProvisioningJob` id. It never correlates across requests and never links to
+an account.
+
 ## Event schema
 
 `src/observability.ts` is the schema. Read it there rather than here: the field
@@ -24,7 +31,7 @@ the allowlist too. That is the mechanism that keeps a free-text field — an
 `Error.message`, a provider body, a Notion or GitHub identifier — from being added
 by habit.
 
-Eleven event types:
+Twelve event types:
 
 | Event | Emitted when |
 | --- | --- |
@@ -39,6 +46,7 @@ Eleven event types:
 | `rate_limited` | The same failure carried a `Retry-After`. Emitted **in addition to** `step_failed`, never instead of it. |
 | `job_succeeded` | Every step succeeded. |
 | `job_dead_lettered` | A step failure was terminal, either unretryable or the fifth attempt. |
+| `status_rerun_dispatched` | `POST /status/rerun` dispatched the sync workflow. See "Manual sync re-runs" below. |
 
 `job_succeeded` doubles as the first-successful-deploy metric: `verify_deploy` is
 the last entry in `PROVISIONING_STEP_ORDER`, and it only succeeds once the public
@@ -50,6 +58,32 @@ There is no job-expiry event. A job that neither succeeds nor dead-letters withi
 `PROVISIONING_JOB_TTL_SECONDS` (24 hours) is removed by KV's own TTL with nothing
 emitted, so expiry is visible only as a `jobId` whose event stream stops
 mid-funnel. The query for that is under "Incident triage" below.
+
+### Manual sync re-runs
+
+`status_rerun_dispatched` is emitted once, after `statusRerun` dispatches the
+sync workflow, so a count of this event over a window answers "how many manual
+re-runs happened, and when." A refused attempt (IP burst, a paused or
+kill-switched admission stage, or the per-account spacing and daily-cap window
+in `admitStatusRerun`) emits no funnel event. The admission-audit KV rows
+(`docs/security-data-flow.md` §3) already carry every refusal with its reason;
+an Analytics Engine event is worth the added surface only if an operator would
+act on an aggregate refusal count, and none of these refusal reasons are an
+anomaly rather than the throttle working as designed — an operator who pauses
+the stage already knows it is paused, and a spacing or daily-cap refusal is a
+user hitting their own quota, not a funnel problem. This mirrors the decision
+already made for alert thresholds: refusals are not wired into
+`observability-alerts.ts` either.
+
+```sql
+SELECT
+    toStartOfHour(timestamp) AS hour,
+    SUM(_sample_interval) AS manual_reruns
+FROM notiongit_provisioning_events
+WHERE timestamp > NOW() - INTERVAL '7' DAY AND blob1 = 'status_rerun_dispatched'
+GROUP BY hour
+ORDER BY hour
+```
 
 ## Analytics Engine column map
 
@@ -74,10 +108,13 @@ every query below filters on.
 | `rate_limited` | `step` | `errorCode` | `retryAfterSeconds` | | | |
 | `job_succeeded` | | | `totalDurationMs` | | | |
 | `job_dead_lettered` | `step` | `errorCode` | `totalDurationMs` | | | |
+| `status_rerun_dispatched` | | | | | | |
 
 `eventDataPoint` in `src/observability.ts` is the authority for this table, and
 `test/observability.test.ts` asserts the exact blob and double arrays for all
-eleven variants, so a column that moves breaks a test rather than a dashboard.
+twelve variants, so a column that moves breaks a test rather than a dashboard.
+`blob2` for `status_rerun_dispatched` is the per-request label described above,
+not a `ProvisioningJob` id — see "Every event is correlated by `jobId`" above.
 
 ## Dashboard queries
 
