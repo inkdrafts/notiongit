@@ -160,6 +160,11 @@ The GitHub App settings, least-privilege permission matrix, callback URLs, and
 credential rotation procedure are documented in
 [`docs/github-app-runbook.md`](docs/github-app-runbook.md).
 
+The launch-gate rehearsal procedure lives in
+[`docs/rehearsal-script.md`](docs/rehearsal-script.md), and the report
+template it commits is
+[`docs/rehearsal-report-template.md`](docs/rehearsal-report-template.md).
+
 The read-only development-repository Pages acceptance check is opt-in:
 
 ```sh
