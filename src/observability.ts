@@ -78,6 +78,14 @@ export interface JobDeadLetteredEvent extends ProvisioningEventBase {
   totalDurationMs: number;
 }
 
+export interface StatusRerunDispatchedEvent {
+  type: 'status_rerun_dispatched';
+  /** Per-request random label `statusRerun` mints for the admission audit;
+   * this leg has no durable job, so this is not a `jobId`. */
+  requestLabel: string;
+  ts: number;
+}
+
 /** No variant may carry a caught `Error`, a provider body, or a user identity.
  * `OBSERVABILITY_EVENT_FIELDS` below makes that a typecheck, not a convention. */
 export type ProvisioningEvent =
@@ -91,7 +99,8 @@ export type ProvisioningEvent =
   | StepFailedEvent
   | RateLimitedEvent
   | JobSucceededEvent
-  | JobDeadLetteredEvent;
+  | JobDeadLetteredEvent
+  | StatusRerunDispatchedEvent;
 
 /** Adding a field to any variant without listing its name here fails
  * `bun run typecheck` at `AllowlistedEventFields`. That failure is the prompt
@@ -99,6 +108,7 @@ export type ProvisioningEvent =
 export const OBSERVABILITY_EVENT_FIELDS = [
   'type',
   'jobId',
+  'requestLabel',
   'ts',
   'provider',
   'templateDuplicated',
@@ -177,6 +187,8 @@ function eventDataPoint(event: ProvisioningEvent): AnalyticsEngineDataPoint {
         doubles: [event.ts, event.totalDurationMs],
         indexes,
       };
+    case 'status_rerun_dispatched':
+      return { blobs: [event.type, event.requestLabel], doubles: [event.ts], indexes };
   }
 }
 

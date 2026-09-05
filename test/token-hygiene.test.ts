@@ -395,6 +395,7 @@ const FUNNEL_EVENT_TYPES = new Set([
   'rate_limited',
   'job_succeeded',
   'job_dead_lettered',
+  'status_rerun_dispatched',
 ]);
 
 // ---------------------------------------------------------------------------

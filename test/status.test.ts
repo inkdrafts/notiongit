@@ -73,6 +73,40 @@ class MemoryKV {
   }
 }
 
+class FakeMetrics {
+  readonly points: AnalyticsEngineDataPoint[] = [];
+
+  writeDataPoint(event?: AnalyticsEngineDataPoint): void {
+    this.points.push(event ?? {});
+  }
+}
+
+class ThrowingMetrics {
+  writeDataPoint(): void {
+    throw new Error('analytics engine is unavailable');
+  }
+}
+
+interface EmittedFunnelEvent {
+  type: string;
+  requestLabel: string;
+  ts: number;
+}
+
+async function captureFunnelEvents(run: () => Promise<void>): Promise<EmittedFunnelEvent[]> {
+  const original = console.log;
+  const events: EmittedFunnelEvent[] = [];
+  console.log = (...args: unknown[]) => {
+    events.push(JSON.parse(args.map((argument) => String(argument)).join(' ')) as EmittedFunnelEvent);
+  };
+  try {
+    await run();
+  } finally {
+    console.log = original;
+  }
+  return events;
+}
+
 const ACCOUNT_ID = 42;
 const START = 1_700_000_000_000;
 const START_SECONDS = Math.floor(START / 1000);
@@ -877,6 +911,89 @@ describe('status routes', () => {
       expect(kv.keysWithPrefix('provisioning:admission:burst:')).toHaveLength(1);
       expect(kv.value('github:rate:global')).toBeDefined();
     });
+  });
+
+  test('a healthy rerun emits exactly one status_rerun_dispatched event keyed on a fresh request label', async () => {
+    const kv = new MemoryKV();
+    const metrics = new FakeMetrics();
+    const env = { ...(await statusEnvWithAppKey(kv)), PROVISIONING_METRICS: metrics as unknown as AnalyticsEngineDataset };
+    const token = await signRerunToken(VIEWER, 'client-secret');
+
+    const events = await captureFunnelEvents(() => withScriptedFetch(healthySiteHandler, async () => {
+      const response = await route(
+        new Request('https://example.com/status/rerun', {
+          method: 'POST',
+          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+          body: new URLSearchParams({ token }),
+        }),
+        env,
+      );
+      expect(response.status).toBe(303);
+    }));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: 'status_rerun_dispatched' });
+    expect(events[0]!.requestLabel).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(metrics.points).toEqual([{ blobs: ['status_rerun_dispatched', events[0]!.requestLabel], doubles: [events[0]!.ts], indexes: ['status_rerun_dispatched'] }]);
+  });
+
+  test('a throwing metrics sink still lets the dispatch through', async () => {
+    const kv = new MemoryKV();
+    const env = { ...(await statusEnvWithAppKey(kv)), PROVISIONING_METRICS: new ThrowingMetrics() as unknown as AnalyticsEngineDataset };
+    const token = await signRerunToken(VIEWER, 'client-secret');
+
+    const events = await captureFunnelEvents(() => withScriptedFetch(healthySiteHandler, async () => {
+      const response = await route(
+        new Request('https://example.com/status/rerun', {
+          method: 'POST',
+          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+          body: new URLSearchParams({ token }),
+        }),
+        env,
+      );
+      expect(response.status).toBe(303);
+      expect(response.headers.get('location')).toBe('https://example.com/status?notice=sync_triggered');
+    }));
+
+    expect(events).toHaveLength(1);
+  });
+
+  test('refused reruns (admission pause, daily cap) emit no funnel event', async () => {
+    const paused = new MemoryKV();
+    const pausedEnv = await statusEnvWithAppKey(paused, { PROVISIONING_CONTROL_MODE: 'pause' });
+    const pausedToken = await signRerunToken(VIEWER, 'client-secret');
+    const pausedEvents = await captureFunnelEvents(async () => {
+      const response = await route(
+        new Request('https://example.com/status/rerun', {
+          method: 'POST',
+          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+          body: new URLSearchParams({ token: pausedToken }),
+        }),
+        pausedEnv,
+      );
+      expect(response.status).toBe(503);
+    });
+    expect(pausedEvents).toEqual([]);
+
+    const capped = new MemoryKV();
+    const cappedEnv = await statusEnvWithAppKey(capped);
+    const cappedToken = await signRerunToken(VIEWER, 'client-secret');
+    const nowMs = Date.now();
+    await capped.put(statusRerunKey(42), JSON.stringify({
+      version: 1, windowStartedAt: nowMs, lastRerunAt: nowMs, count: STATUS_RERUN_DAILY_LIMIT,
+    }), { expirationTtl: 60 });
+    const cappedEvents = await captureFunnelEvents(() => withScriptedFetch(healthySiteHandler, async () => {
+      const response = await route(
+        new Request('https://example.com/status/rerun', {
+          method: 'POST',
+          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
+          body: new URLSearchParams({ token: cappedToken }),
+        }),
+        cappedEnv,
+      );
+      expect(response.status).toBe(429);
+    }));
+    expect(cappedEvents).toEqual([]);
   });
 
   test('a live run converges the rerun to already_running without consuming the window', async () => {
