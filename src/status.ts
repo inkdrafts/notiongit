@@ -30,6 +30,7 @@ import {
   withKeyLock,
   type ProvisioningThrottleVars,
 } from './provisioning-throttle';
+import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
 import {
   findReusableGeneratedRepository,
   type GeneratedRepositoryIdentity,
@@ -50,7 +51,7 @@ import {
  * `Env`, declared here so this module never imports `index.ts`. The throttle
  * vars ride along because the rerun POST feeds the whole env to the shared
  * admission and budget config parsers. */
-export interface StatusEnv extends GithubAppAuthEnv, ProvisioningThrottleVars {
+export interface StatusEnv extends GithubAppAuthEnv, ProvisioningThrottleVars, ObservabilityEnv {
   JOBS: KVNamespace;
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
@@ -803,6 +804,7 @@ export async function statusRerun(request: Request, env: Partial<StatusEnv>): Pr
     return refusedResponse('github_app_unavailable', 502, null);
   }
 
+  emitProvisioningEvent(env as StatusEnv, { type: 'status_rerun_dispatched', requestLabel, ts: Date.now() });
   return redirectResponse(303, new URL('/status?notice=sync_triggered', request.url).toString());
 }
 
