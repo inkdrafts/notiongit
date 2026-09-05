@@ -97,10 +97,15 @@ repository `USER.github.io` and publish at `https://USER.github.io`.
 ## Publish on the schedule (run A)
 
 1. In Notion, make one more edit. Record the time. Do not press "Sync now".
-2. Wait for the next scheduled run of `sync-notion.yml` in the repository's
-   Actions tab. It runs every 10 minutes.
-3. Reload the live site. The edit should appear without any manual step.
-   Record the elapsed time.
+2. Watch for the next scheduled run of `sync-notion.yml` in the repository's
+   Actions tab. The workflow tries to run every 10 minutes, but GitHub delays
+   scheduled runs under load and can take hours to fire one: a live site
+   measured on 2026-09-05 delivered completed runs 3.5 to 4.6 hours apart.
+   If no run has started after 30 minutes, choose "Run workflow" on that page
+   to trigger one by hand, and record that the scheduled run was late.
+3. Reload the live site once the run finishes. The edit should appear.
+   Record the elapsed time and whether the scheduled run delivered it or the
+   manual run did.
 
 ## Disconnect guidance (run A)
 
@@ -111,9 +116,10 @@ needs a fresh setup.
    say in their own words what each of the three paths does. Record the
    restatements.
 2. Revoke the InkDrafts connection in Notion (Settings, then Connections).
-   Wait for the next scheduled run in the Actions tab. It should fail on
-   invalid credentials. Confirm the site itself still answers. Record all
-   three observations.
+   Wait for the next scheduled run in the Actions tab, or choose "Run
+   workflow" there if the scheduled run is late. It should fail on invalid
+   credentials. Confirm the site itself still answers. Record all three
+   observations.
 3. Uninstall the InkDrafts GitHub App (GitHub Settings, then Applications,
    then Installed GitHub Apps). Open the dashboard again. It should say the
    InkDrafts App is no longer installed. Confirm the site still answers.
