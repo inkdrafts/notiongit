@@ -29,10 +29,10 @@ import {
 } from './github-app-auth';
 import {
   createProvisioningJob,
+  isSucceededProvisioningJob,
   loadProvisioningJob,
   saveProvisioningJob,
   type NotionTemplateLinks,
-  type SucceededProvisioningJob,
 } from './provisioning-job';
 import { callbackFailure, codedFailureCode, FlowFailure } from './failures';
 import {
@@ -205,6 +205,7 @@ export type { GithubAppAuthEnv, GithubInstallationAccount } from './github-app-a
 
 export {
   createProvisioningJob,
+  isSucceededProvisioningJob,
   isTerminalProvisioningStatus,
   loadProvisioningJob,
   nextPendingStep,
@@ -1039,9 +1040,7 @@ async function progressPageResponse(request: Request, env: Partial<Env>): Promis
   // No-JS retry: only an explicit ?check=1 on a succeeded job probes, and the
   // probe is the same one-shot the site-check endpoint runs. A plain render
   // never fetches, so it never adds latency.
-  const succeeded: SucceededProvisioningJob | null = job?.status === 'succeeded'
-    ? { ...job, status: 'succeeded' }
-    : null;
+  const succeeded = job !== null && isSucceededProvisioningJob(job) ? job : null;
   const siteCheck: SiteCheckOutcome | null = succeeded && url.searchParams.get('check') === '1'
     ? { reachable: await checkPublicSiteReachable(succeeded.data.repository.url), checkedAt: Date.now() }
     : null;
@@ -1057,9 +1056,8 @@ async function progressSiteCheckResponse(request: Request, env: Partial<Env>): P
   // non-succeeded jobs all read as the same not-found; there is no distinction
   // to leak. The probed URL comes from the record, never from the request.
   const job = validJobId(jobId) && env.JOBS ? await loadProvisioningJob(env.JOBS, jobId) : null;
-  if (job?.status !== 'succeeded') return json({ error: 'not_found' }, 404);
-  const succeeded: SucceededProvisioningJob = { ...job, status: 'succeeded' };
-  const reachable = await checkPublicSiteReachable(succeeded.data.repository.url);
+  if (job === null || !isSucceededProvisioningJob(job)) return json({ error: 'not_found' }, 404);
+  const reachable = await checkPublicSiteReachable(job.data.repository.url);
   return json({ reachable, checkedAt: Date.now() });
 }
 
