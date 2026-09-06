@@ -120,21 +120,15 @@ of truth, so a message carries nothing else.
   credential-named key cannot reach the body. Provider response bodies are
   never echoed.
 - **Queue messages** are exactly `{ jobId }`.
-- **Platform logs** carry output from three sanctioned producers only:
+- **Platform logs** carry output from two sanctioned producers only:
   `reportError` (`console.error('[notiongit] <context>', serializeForLog(error))`,
   whose serializer renders `Secret`s as `"[redacted]"`, redacts
   credential-named keys regardless of value, bounds depth and cycles, and
-  renders `Error`s as `{name, message, …own fields}`); the provisioning
+  renders `Error`s as `{name, message, …own fields}`); and the provisioning
   funnel events (`emitProvisioningEvent` writes one
   `JSON.stringify(event)` line, whose fields are a typechecked closed
   allowlist — job id, step names, classified error codes, durations — never
-  an `Error`, a provider body, or a credential); and the observability
-  alert adapter's closed `{type, kind}` status lines.
-- **Analytics Engine** (`PROVISIONING_METRICS`, optional binding) receives
-  one data point per funnel event, built from the same allowlisted fields.
-  The alert evaluator queries aggregated windows and POSTs findings to an
-  operator webhook; an alert carries a step name, a closed `kind`, and
-  counts — never a job id, a token, or a provider body.
+  an `Error`, a provider body, or a credential). Workers Logs ingest both.
 
 ## 5. Enforcement
 
@@ -145,16 +139,14 @@ of truth, so a message carries nothing else.
   `Secret`. Serialization yields `"[redacted]"`; the value leaves only
   through the greppable `.raw` / `.bearer()` unwraps at provider-call sites.
 - **Diagnostic:** error diagnostics are produced only by
-  `src/safe-serialize.ts`; funnel and alert telemetry only by
-  `src/observability.ts` / `src/observability-alerts.ts`, whose event
-  fields are a typechecked closed allowlist.
+  `src/safe-serialize.ts`; funnel telemetry only by `src/observability.ts`,
+  whose event fields are a typechecked closed allowlist.
 - **Systematic:** `test/token-hygiene.test.ts` drives five journeys (Notion
   callback, GitHub callback, the full seven-step pipeline, the three error
   funnels, the disconnect timeline) with synthetic canary credentials and
   fails if any canary or credential-shaped key name appears in KV writes,
   queue messages, response bodies and redirect headers, thrown errors,
-  console output, or the Analytics Engine data points captured through a
-  fake metrics binding — and it fails if a journey passes vacuously,
+  or console output — and it fails if a journey passes vacuously,
   because each also asserts the canary genuinely flowed (the recorded
   provider `Authorization` headers). Per-write TTL logs pin the retention
   table in §3; the journeys additionally assert that the only delete

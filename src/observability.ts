@@ -132,76 +132,7 @@ type AllowlistedEventFields<Field extends AllowedEventField> = Field;
 
 type _EveryEventFieldIsAllowlisted = AllowlistedEventFields<EventFieldName>;
 
-export interface ObservabilityEnv {
-  PROVISIONING_METRICS?: AnalyticsEngineDataset;
-}
-
-function eventDataPoint(event: ProvisioningEvent): AnalyticsEngineDataPoint {
-  const indexes = [event.type];
-  switch (event.type) {
-    case 'consent_started':
-      return { blobs: [event.type, event.jobId, event.provider], doubles: [event.ts], indexes };
-    case 'consent_completed':
-      return {
-        blobs: [event.type, event.jobId, event.provider],
-        doubles: [event.ts, event.templateDuplicated ? 1 : 0],
-        indexes,
-      };
-    case 'consent_failed':
-      return {
-        blobs: [event.type, event.jobId, event.errorCode, event.provider],
-        doubles: [event.ts],
-        indexes,
-      };
-    case 'job_queued':
-      return { blobs: [event.type, event.jobId], doubles: [event.ts], indexes };
-    case 'job_enqueue_failed':
-      return { blobs: [event.type, event.jobId, event.errorCode], doubles: [event.ts], indexes };
-    case 'step_started':
-      return { blobs: [event.type, event.jobId, event.step], doubles: [event.ts, event.attempt], indexes };
-    case 'step_succeeded':
-      return {
-        blobs: [event.type, event.jobId, event.step],
-        doubles: [event.ts, event.attempt, event.durationMs],
-        indexes,
-      };
-    case 'step_failed':
-      return {
-        blobs: [event.type, event.jobId, event.step, event.errorCode],
-        doubles: [event.ts, event.attempt, event.durationMs, event.retryable ? 1 : 0, event.terminal ? 1 : 0],
-        indexes,
-      };
-    case 'rate_limited':
-      return {
-        blobs: [event.type, event.jobId, event.step, event.errorCode],
-        doubles: [event.ts, event.retryAfterSeconds],
-        indexes,
-      };
-    case 'job_succeeded':
-      // `verify_deploy` is last in `PROVISIONING_STEP_ORDER`, so this event is
-      // also the funnel's first-successful-deploy metric.
-      return { blobs: [event.type, event.jobId], doubles: [event.ts, event.totalDurationMs], indexes };
-    case 'job_dead_lettered':
-      return {
-        blobs: [event.type, event.jobId, event.step, event.errorCode],
-        doubles: [event.ts, event.totalDurationMs],
-        indexes,
-      };
-    case 'status_rerun_dispatched':
-      return { blobs: [event.type, event.requestLabel], doubles: [event.ts], indexes };
-  }
-}
-
-/** Record one funnel event to both sinks. Never throws. */
-export function emitProvisioningEvent(env: ObservabilityEnv, event: ProvisioningEvent): void {
+/** Record one funnel event as a structured log line for Workers Logs. */
+export function emitProvisioningEvent(event: ProvisioningEvent): void {
   console.log(JSON.stringify(event));
-
-  const dataset = env.PROVISIONING_METRICS;
-  if (!dataset) return;
-  try {
-    dataset.writeDataPoint(eventDataPoint(event));
-  } catch {
-    // A metrics sink must never fail the operation it observes; the log line
-    // above already recorded this event.
-  }
 }

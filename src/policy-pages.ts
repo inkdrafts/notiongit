@@ -172,8 +172,8 @@ the template was duplicated correctly. No page content is in it.</td>
 <td>Operational metrics</td>
 <td>Step names, outcomes, error codes, and durations for each setup, correlated
 only by the random job id. No account name, no repository name, no content.</td>
-<td>Aggregates are kept for three months. Structured logs, where enabled, are
-kept for at most seven days.</td>
+<td>Written to operational logs kept for at most three days. InkDrafts keeps no
+long-lived aggregate of them.</td>
 </tr>
 <tr>
 <td>Abuse controls</td>
@@ -330,9 +330,8 @@ repositories you grant, and can be uninstalled by you at any time.</p>
 
 <h2>Retention</h2>
 <p>Setup records and the Notion template validation record are deleted after
-${JOB_RETENTION_HOURS} hours. Operational aggregates are kept for three
-months. Structured logs are kept for at most seven days. Details are in the
-<a href="/privacy">Privacy Policy</a>.</p>
+${JOB_RETENTION_HOURS} hours. Operational logs are kept for at most three
+days. Details are in the <a href="/privacy">Privacy Policy</a>.</p>
 
 <h2>What this page does not claim</h2>
 <p>No security control is perfect. InkDrafts runs on GitHub, Notion, and
@@ -469,8 +468,8 @@ ${SESSION_HOURS} hours.</p>
 <h2>What remains on InkDrafts' side</h2>
 <p>InkDrafts keeps no copy of any of your tokens, so there is nothing to
 revoke there. Setup records delete themselves within
-${JOB_RETENTION_HOURS} hours. The anonymous operational aggregates described
-in the <a href="/privacy">Privacy Policy</a> age out within three months.</p>
+${JOB_RETENTION_HOURS} hours. The anonymous operational log entries described
+in the <a href="/privacy">Privacy Policy</a> age out within three days.</p>
 
 <p>Questions about leaving go through ${SUPPORT}.</p>
 `,

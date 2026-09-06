@@ -434,18 +434,17 @@ Every stage of the funnel — consent, enqueue, each step attempt, and the
 terminal job outcome — emits one typed event (`observability.ts`) correlated by
 the same random `jobId` that already keys the KV record and the queue message,
 so no second identifier and no user identity is needed to follow a job from
-consent to first deploy. Each event goes to two sinks: a structured
-`console.log` line, which Workers Logs ingests with no binding and which
-answers "what happened to this job", and the optional `PROVISIONING_METRICS`
-Analytics Engine dataset, which answers "how is the funnel doing" without
-scanning logs. Every event field is a closed error code, an enum, a boolean, or
-a number, and `OBSERVABILITY_EVENT_FIELDS` turns "no free-text field" into a
-typecheck rather than a convention — the canary tests in
-`test/observability.test.ts` push a token-bearing error through the real
-emission path and assert it reaches neither sink. Threshold alerting over the
-dataset (`observability-alerts.ts`) is wired into the `scheduled` handler and
-unit-tested, but `wrangler.toml` leaves its cron trigger commented out until
-the Analytics Engine SQL response shape is verified against a live dataset. The
+consent to first deploy. Each event is a structured `console.log` line, which
+Workers Logs ingests with no binding and no paid plan. Every event field is a
+closed error code, an enum, a boolean, or a number, and
+`OBSERVABILITY_EVENT_FIELDS` turns "no free-text field" into a typecheck rather
+than a convention — the canary tests in `test/observability.test.ts` push a
+token-bearing error through the real emission path and assert it never reaches
+the log. The log schema, retention, and the triage runbook are in
+[`Observability`](observability.md). An Analytics Engine sink and threshold
+alerting existed until 2026-09-05, when they were removed for the free tier;
+the design is preserved in
+[ADR 0004](decisions/0004-observability.md) and git history. The
 event schema, column map, dashboard queries, retention, access, and the triage
 runbook are in [`Observability`](observability.md); the two-sink decision is
 [ADR 0004](decisions/0004-observability.md).

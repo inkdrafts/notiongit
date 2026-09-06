@@ -17,7 +17,7 @@
 
 import { createGithubInstallationToken, type GithubAppAuthEnv } from './github-app-auth';
 import { classifyProvisioningError, type ProvisioningErrorClassification } from './failures';
-import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
+import { emitProvisioningEvent } from './observability';
 import { PROVISIONING_STEP_HANDLERS, type StepRunnerContext } from './provisioning-steps';
 import type { Secret } from './secret';
 import {
@@ -46,7 +46,7 @@ import {
 export { classifyProvisioningError };
 export type { ProvisioningErrorClassification };
 
-export interface ProvisioningQueueEnv extends GithubAppAuthEnv, ObservabilityEnv, ProvisioningThrottleVars {
+export interface ProvisioningQueueEnv extends GithubAppAuthEnv, ProvisioningThrottleVars {
   JOBS: KVNamespace;
   PROVISIONING_QUEUE: Queue<{ jobId: string }>;
 }
@@ -68,7 +68,7 @@ export type ProvisioningMessageOutcome =
 const defaultSleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 
 async function recordStepFailure(
-  env: Pick<ProvisioningQueueEnv, 'JOBS' | 'PROVISIONING_QUEUE' | 'PROVISIONING_METRICS'>,
+  env: Pick<ProvisioningQueueEnv, 'JOBS' | 'PROVISIONING_QUEUE'>,
   job: ProvisioningJob,
   step: ProvisioningStepName,
   error: unknown,
@@ -110,7 +110,7 @@ async function recordStepFailure(
   } else {
     await saveProvisioningJob(env.JOBS, updated);
   }
-  emitProvisioningEvent(env, {
+  emitProvisioningEvent({
     type: 'step_failed',
     jobId: base.jobId,
     ts: now,
@@ -122,7 +122,7 @@ async function recordStepFailure(
     durationMs: now - stepStartedMs,
   });
   if (retryAfterSeconds !== null) {
-    emitProvisioningEvent(env, {
+    emitProvisioningEvent({
       type: 'rate_limited',
       jobId: base.jobId,
       ts: now,
@@ -132,7 +132,7 @@ async function recordStepFailure(
     });
   }
   if (terminal) {
-    emitProvisioningEvent(env, {
+    emitProvisioningEvent({
       type: 'job_dead_lettered',
       jobId: base.jobId,
       ts: now,
@@ -236,7 +236,7 @@ export async function processProvisioningMessage(
   if (!step) {
     const finishedMs = now();
     await saveTerminalProvisioningJob(env, { ...locked, status: 'succeeded', lock: null, completedAt: finishedMs, updatedAt: finishedMs });
-    emitProvisioningEvent(env, {
+    emitProvisioningEvent({
       type: 'job_succeeded',
       jobId,
       ts: finishedMs,
@@ -293,7 +293,7 @@ export async function processProvisioningMessage(
   // Before the token mint, so a mint failure still pairs a `step_started` with
   // a `step_failed` over the same interval every other failure path reports.
   const stepStartedMs = now();
-  emitProvisioningEvent(env, {
+  emitProvisioningEvent({
     type: 'step_started',
     jobId,
     ts: stepStartedMs,
@@ -360,7 +360,7 @@ export async function processProvisioningMessage(
 
   // After the save, not before: a KV write failure routes to
   // `recordStepFailure`, so one attempt never both succeeds and fails.
-  emitProvisioningEvent(env, {
+  emitProvisioningEvent({
     type: 'step_succeeded',
     jobId,
     ts: stepSucceeded.updatedAt,
@@ -369,7 +369,7 @@ export async function processProvisioningMessage(
     durationMs: stepSucceeded.updatedAt - stepStartedMs,
   });
   if (!remainingStep) {
-    emitProvisioningEvent(env, {
+    emitProvisioningEvent({
       type: 'job_succeeded',
       jobId,
       ts: finalJob.updatedAt,

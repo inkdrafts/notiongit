@@ -7,7 +7,7 @@
  * returned to the browser.
  */
 
-import { emitProvisioningEvent, type ObservabilityEnv } from './observability';
+import { emitProvisioningEvent } from './observability';
 import type { GithubActionsSecretsErrorCode } from './actions-secrets';
 import type { NotionTemplateErrorCode } from './notion-template';
 import { callbackFailure, codedFailureCode, type ProvisioningFailureCode } from './failures';
@@ -36,7 +36,7 @@ const JSON_HEADERS = {
   'cache-control': 'no-store',
 };
 
-export interface NotionOAuthEnv extends ObservabilityEnv, ProvisioningThrottleVars {
+export interface NotionOAuthEnv extends ProvisioningThrottleVars {
   JOBS: KVNamespace;
   NOTION_CLIENT_ID: string;
   NOTION_CLIENT_SECRET: string;
@@ -281,7 +281,7 @@ export async function beginNotionAuthorization(
   const requestedJobId = url.searchParams.get('job_id') || url.searchParams.get('jobId');
   const jobId = requestedJobId || crypto.randomUUID();
   if (!validJobId(jobId)) return notionFailureResponse({ code: 'invalid_job_id', status: 400, retryAfterSeconds: null });
-  emitProvisioningEvent(env, { type: 'consent_started', jobId, ts: Date.now(), provider: 'notion' });
+  emitProvisioningEvent({ type: 'consent_started', jobId, ts: Date.now(), provider: 'notion' });
 
   const now = Math.floor(Date.now() / 1000);
   const payload: NotionStatePayload = {
@@ -460,7 +460,7 @@ export async function finishNotionCallback(
     };
     await options.continueOnboarding?.(continuation);
 
-    emitProvisioningEvent(env, {
+    emitProvisioningEvent({
       type: 'consent_completed',
       jobId: payload.jobId,
       ts: Date.now(),
@@ -480,7 +480,7 @@ export async function finishNotionCallback(
     });
   } catch (error) {
     const failure = callbackFailure(error, 'notion');
-    emitProvisioningEvent(env, {
+    emitProvisioningEvent({
       type: 'consent_failed',
       jobId: payload.jobId,
       ts: Date.now(),

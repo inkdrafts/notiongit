@@ -113,8 +113,9 @@ describe('policy pages', () => {
   test('retention claims match the constants and documented platform figures', () => {
     const privacy = POLICY_PAGES['/privacy']!.document;
     expect(privacy).toContain(`${JOB_RETENTION_HOURS} hours`);
-    expect(privacy).toContain('three months');
-    expect(privacy).toContain('seven days');
+    expect(privacy).toContain('logs kept for at most three days');
+    expect(privacy).not.toContain('three months');
+    expect(privacy).not.toContain('Aggregates are kept');
     expect(privacy).toContain(`${SESSION_HOURS} hours`);
     expect(privacy).toContain('libsodium');
   });

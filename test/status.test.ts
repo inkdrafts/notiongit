@@ -74,20 +74,6 @@ class MemoryKV {
   }
 }
 
-class FakeMetrics {
-  readonly points: AnalyticsEngineDataPoint[] = [];
-
-  writeDataPoint(event?: AnalyticsEngineDataPoint): void {
-    this.points.push(event ?? {});
-  }
-}
-
-class ThrowingMetrics {
-  writeDataPoint(): void {
-    throw new Error('analytics engine is unavailable');
-  }
-}
-
 interface EmittedFunnelEvent {
   type: string;
   requestLabel: string;
@@ -979,8 +965,7 @@ describe('status routes', () => {
 
   test('a healthy rerun emits exactly one status_rerun_dispatched event keyed on a fresh request label', async () => {
     const kv = new MemoryKV();
-    const metrics = new FakeMetrics();
-    const env = { ...(await statusEnvWithAppKey(kv)), PROVISIONING_METRICS: metrics as unknown as AnalyticsEngineDataset };
+    const env = await statusEnvWithAppKey(kv);
     const token = await signRerunToken(VIEWER, 'client-secret');
 
     const events = await captureFunnelEvents(() => withScriptedFetch(healthySiteHandler, async () => {
@@ -998,28 +983,6 @@ describe('status routes', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ type: 'status_rerun_dispatched' });
     expect(events[0]!.requestLabel).toMatch(/^[0-9a-f-]{36}$/u);
-    expect(metrics.points).toEqual([{ blobs: ['status_rerun_dispatched', events[0]!.requestLabel], doubles: [events[0]!.ts], indexes: ['status_rerun_dispatched'] }]);
-  });
-
-  test('a throwing metrics sink still lets the dispatch through', async () => {
-    const kv = new MemoryKV();
-    const env = { ...(await statusEnvWithAppKey(kv)), PROVISIONING_METRICS: new ThrowingMetrics() as unknown as AnalyticsEngineDataset };
-    const token = await signRerunToken(VIEWER, 'client-secret');
-
-    const events = await captureFunnelEvents(() => withScriptedFetch(healthySiteHandler, async () => {
-      const response = await route(
-        new Request('https://example.com/status/rerun', {
-          method: 'POST',
-          headers: { Origin: 'https://example.com', Cookie: await sessionCookie() },
-          body: new URLSearchParams({ token }),
-        }),
-        env,
-      );
-      expect(response.status).toBe(303);
-      expect(response.headers.get('location')).toBe('https://example.com/status?notice=sync_triggered');
-    }));
-
-    expect(events).toHaveLength(1);
   });
 
   test('refused reruns (admission pause, daily cap) emit no funnel event', async () => {

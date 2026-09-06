@@ -26,17 +26,11 @@ PROVISIONING_REQUEST_BURST_WINDOW_SECONDS = "60"
 PROVISIONING_REQUEST_BURST_LIMIT = "10"
 PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS = "3600"
 PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS = "604800"
-CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
-PROVISIONING_METRICS_DATASET = "notiongit_provisioning_events"
 
-[[analytics_engine_datasets]]
-binding = "PROVISIONING_METRICS"
-dataset = "notiongit_provisioning_events"
-
-# Enable only after the Analytics Engine SQL row shape in
-# `observability-alerts.ts` is verified against a real staging dataset (see
-# `docs/decisions/0004-observability.md`). Until then `scheduled` stays wired
-# and tested but is never invoked.
+# Alerting needs the Analytics Engine dataset, which the free tier cannot
+# deploy (owner decision 2026-09-05), so the cron trigger ships commented out
+# and `scheduled` stays wired and tested but is never invoked. The re-enable
+# recipe is in `docs/observability.md`.
 # [triggers]
 # crons = ["*/15 * * * *"]
 
@@ -92,12 +86,6 @@ PROVISIONING_REQUEST_BURST_WINDOW_SECONDS = "60"
 PROVISIONING_REQUEST_BURST_LIMIT = "10"
 PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS = "3600"
 PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS = "604800"
-CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
-PROVISIONING_METRICS_DATASET = "notiongit_staging_provisioning_events"
-
-[[env.staging.analytics_engine_datasets]]
-binding = "PROVISIONING_METRICS"
-dataset = "notiongit_staging_provisioning_events"
 
 [[env.staging.kv_namespaces]]
 binding = "JOBS"
@@ -134,12 +122,6 @@ PROVISIONING_REQUEST_BURST_WINDOW_SECONDS = "60"
 PROVISIONING_REQUEST_BURST_LIMIT = "10"
 PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS = "3600"
 PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS = "604800"
-CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
-PROVISIONING_METRICS_DATASET = "notiongit_provisioning_events"
-
-[[env.production.analytics_engine_datasets]]
-binding = "PROVISIONING_METRICS"
-dataset = "notiongit_provisioning_events"
 
 [[env.production.kv_namespaces]]
 binding = "JOBS"
