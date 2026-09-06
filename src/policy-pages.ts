@@ -247,6 +247,16 @@ is public in the repository. Material changes are announced on the
 own GitHub account. By connecting your accounts you agree to these terms. If
 you do not agree, do not connect your accounts.</p>
 
+<h2>Who runs InkDrafts</h2>
+<p>InkDrafts is a free, open-source project maintained by
+<a href="https://github.com/leandro-llosa">@leandro-llosa</a>. It has no
+legal entity behind it, and it sells nothing.</p>
+
+<h2>Who can use the service</h2>
+<p>You need a GitHub account and a Notion account, and you must be
+at least 13 years old, the same minimum GitHub's own terms set. By
+connecting your accounts you confirm you meet these requirements.</p>
+
 <h2>What the service does</h2>
 <p>InkDrafts creates a repository in your GitHub account from a public
 template, writes encrypted secrets for your repository's own sync workflow,
@@ -268,15 +278,22 @@ the service, for example during an abuse or provider incident. Because your
 site runs from your own repository, it keeps working without InkDrafts.</p>
 
 <h2>Limitation of liability</h2>
-<p>Nothing in these terms limits liability that cannot be limited under
-applicable law. To the extent the law allows, neither party is liable to the
-other for indirect or consequential damages.</p>
+<p>To the extent the law allows, the service is provided as is, without
+warranties of any kind, and neither party is liable to the other for indirect
+or consequential damages. Because InkDrafts is free, any liability is limited
+to the amount you paid for it. Nothing in these terms limits liability that
+cannot be limited under applicable law.</p>
 
 <h2>Stopping</h2>
-<p>You can stop using InkDrafts at any time. See
+<p>You can stop using InkDrafts at any time, and that ends these terms for
+your accounts. See
 <a href="/leaving">Leaving InkDrafts</a> for the steps and what happens to
 your data. We can block use that violates these terms or the
 <a href="/acceptable-use">Acceptable Use Policy</a>.</p>
+
+<h2>Governing law</h2>
+<p>These terms are governed by the laws of the United States, without regard
+to its conflict-of-laws rules.</p>
 
 <h2>Changes to these terms</h2>
 <p>Changes are published on this page. The full history of this page is public
@@ -380,7 +397,9 @@ an incident, a full provisioning pause. Content that breaks a provider's terms
 is a matter between you and that provider, and the provider will act on your
 account or repository directly.</p>
 
-<p>Report a violation through ${SUPPORT}.</p>
+<p>Report a violation by opening an issue on
+<a href="${REPO}/issues">inkdrafts/notiongit</a>. It is the same public route
+${SUPPORT} describes, and no email address is published for reports.</p>
 `,
   },
   {

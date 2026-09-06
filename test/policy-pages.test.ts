@@ -120,6 +120,20 @@ describe('policy pages', () => {
     expect(privacy).toContain('libsodium');
   });
 
+  test('the terms page carries the owner-confirmed operator, age, and governing-law wording', () => {
+    const terms = POLICY_PAGES['/terms']!.document;
+    expect(terms).toContain('open-source project maintained by');
+    expect(terms).toContain('github.com/leandro-llosa');
+    expect(terms).toContain('at least 13 years old');
+    expect(terms).toContain('governed by the laws of the United States');
+  });
+
+  test('the acceptable-use policy routes reports to the public repository issues', () => {
+    const acceptableUse = POLICY_PAGES['/acceptable-use']!.document;
+    expect(acceptableUse).toContain('href="https://github.com/inkdrafts/notiongit/issues"');
+    expect(acceptableUse).not.toMatch(/mailto:/u);
+  });
+
   test('no policy claims certification or perfect security', () => {
     for (const path of POLICY_PATHS) {
       const document = POLICY_PAGES[path]!.document.toLowerCase();
