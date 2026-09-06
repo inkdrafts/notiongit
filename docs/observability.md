@@ -3,7 +3,9 @@
 The provisioning funnel emits one event stream. `src/observability.ts` defines
 the events; `emitProvisioningEvent` writes each one as a structured `console.log`
 line, which Cloudflare Workers Logs ingests with no binding and no paid plan. The
-log line answers "what happened to this job". There is no second sink: the
+log line answers "what happened to this job". Workers Logs and Traces are pinned
+in `wrangler.toml`'s `[observability]` block, so a deploy can never silently
+turn them off. There is no second sink: the
 Analytics Engine dataset and its alert check were removed on 2026-09-05 so the
 project runs entirely on the Cloudflare free tier — the design lives in
 [`docs/decisions/0004-observability.md`](decisions/0004-observability.md) and in

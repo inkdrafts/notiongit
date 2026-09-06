@@ -8,6 +8,19 @@ preview_urls = true
 libsodium = "./src/libsodium-worker.ts"
 libsodium-raw = "./spikes/libsodium-workers/node_modules/libsodium/dist/modules-esm/libsodium.mjs"
 
+# Pinned from the dashboard toggle (2026-09-05): Workers Logs is the funnel's
+# only sink on the free tier, so a deploy must never silently turn it off.
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+persist = true
+
 [vars]
 GITHUB_APP_ID = "4798518"
 GITHUB_APP_SLUG = "inkdrafts"
