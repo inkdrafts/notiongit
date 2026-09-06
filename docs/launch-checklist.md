@@ -49,8 +49,8 @@ runs (2026-09-05):
 | --- | --- | --- |
 | InkDrafts GitHub App is public and resolvable at its install URL | launch-gate run: `https://github.com/apps/inkdrafts` answers 200 (ADR 0003 made the App public; the launch moment is advertising it, not a visibility change) | PASS |
 | The three technical repositories are public | launch-gate run: notiongit, notiongit-template, notiongit-sync all answer 200 | PASS |
-| OAuth callback URLs registered at GitHub and Notion match the final production domain | Recheck in the GitHub App settings and the Notion integration settings after the DNS row in E lands. Current registrations point at the workers.dev origin | PENDING |
-| Provider branding (App name, description, homepage) reads correctly on the install page | Manual check of `https://github.com/apps/inkdrafts` after deploy | PENDING |
+| OAuth callback URLs registered at GitHub and Notion match the final production domain | Owner registered `https://inkdrafts.com/auth/github/callback` on the GitHub App and `https://inkdrafts.com/auth/notion/callback` on the Notion integration, 2026-09-05, keeping the workers.dev URLs as fallbacks | PASS |
+| Provider branding (App name, description, homepage) reads correctly on the install page | Homepage on `https://github.com/apps/inkdrafts` links `https://inkdrafts.com/` (verified 2026-09-05); owner set it during the callback registration | PASS |
 
 ## C. Final reviews
 
@@ -81,9 +81,9 @@ each with its evidence. The dependency/license audit is automated:
 
 | Item | Evidence | Status |
 | --- | --- | --- |
-| Deploy merged `main` to production | Deployed 2026-09-05 from the `remove-analytics-engine` tree (version `c6c14632`) with the account's Cloudflare identity; no paid plan involved since the Analytics Engine bindings are gone. The repository deploy secrets are still unset, so the manual Deploy workflow cannot run until `gh secret set` supplies them | PASS |
-| `inkdrafts.com` serves the Worker | Custom-domain routing is a dashboard step (Workers & Pages → `notiongit` → Settings → Domains & Routes → Add Custom Domain); after it, `https://inkdrafts.com/healthz` must answer. Until then production is `https://notiongit.notiongit.workers.dev` | PENDING |
-| Full launch-gate run is green against the final production domain | `bun run scripts/launch-gate.ts https://inkdrafts.com` (or the workers.dev origin if launch precedes DNS) after the deploy row passes | PENDING |
+| Deploy merged `main` to production | Deployed 2026-09-05 from the `remove-analytics-engine` tree (version `c6c14632`, redeployed as `dd4fe5ce` with the observability block pinned) with the account's Cloudflare identity; no paid plan involved since the Analytics Engine bindings are gone. The repository deploy secrets are still unset, so the manual Deploy workflow cannot run until `gh secret set` supplies them | PASS |
+| `inkdrafts.com` serves the Worker | Owner attached the custom domain 2026-09-05; `https://inkdrafts.com/healthz` answers `{"ok":true}` and the landing serves | PASS |
+| Full launch-gate run is green against the final production domain | `bun run scripts/launch-gate.ts https://inkdrafts.com`: **14/14** on 2026-09-05 | PASS |
 | Production OAuth/install/provisioning smoke test | Repeat a real onboarding on a fresh account per [`rehearsal-script.md`](rehearsal-script.md) run A, after the deploy and DNS rows | PENDING |
 
 ## F. Launch decision
