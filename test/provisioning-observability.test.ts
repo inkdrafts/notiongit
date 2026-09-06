@@ -34,14 +34,6 @@ class MemoryQueue<T> {
   }
 }
 
-class FakeMetrics {
-  readonly points: AnalyticsEngineDataPoint[] = [];
-
-  writeDataPoint(event?: AnalyticsEngineDataPoint): void {
-    this.points.push(event ?? {});
-  }
-}
-
 interface EmittedEvent {
   type: string;
   jobId: string;
@@ -184,11 +176,10 @@ function fullPipelineFetch(overrides: { siteReachable?: boolean } = {}): typeof 
   }) as typeof fetch;
 }
 
-async function funnelEnv(metrics: FakeMetrics): Promise<ProvisioningQueueEnv> {
+async function funnelEnv(): Promise<ProvisioningQueueEnv> {
   return {
     JOBS: new MemoryKV() as unknown as KVNamespace,
     PROVISIONING_QUEUE: new MemoryQueue<{ jobId: string }>() as unknown as Queue<{ jobId: string }>,
-    PROVISIONING_METRICS: metrics as unknown as AnalyticsEngineDataset,
     GITHUB_APP_ID: '4798518',
     GITHUB_APP_PRIVATE_KEY: await generateThrowawayPrivateKey(),
   };
@@ -196,8 +187,7 @@ async function funnelEnv(metrics: FakeMetrics): Promise<ProvisioningQueueEnv> {
 
 describe('synthetic provisioning funnel', () => {
   test('a job that succeeds emits a started/succeeded pair per step and one job_succeeded', async () => {
-    const metrics = new FakeMetrics();
-    const env = await funnelEnv(metrics);
+    const env = await funnelEnv();
     await saveProvisioningJob(env.JOBS, freshJob());
     const fetcher = fullPipelineFetch();
 
@@ -224,13 +214,10 @@ describe('synthetic provisioning funnel', () => {
     expect(events.filter((event) => event.type === 'step_succeeded').every((event) => event.attempt === 1)).toBe(true);
     expect(events.at(-1)?.totalDurationMs).toBeGreaterThan(0);
     expect((await loadProvisioningJob(env.JOBS, JOB_ID))?.status).toBe('succeeded');
-    expect(metrics.points).toHaveLength(events.length);
-    expect(metrics.points.map((point) => point.indexes?.[0])).toEqual(events.map((event) => event.type));
   });
 
   test('a job that exhausts its retries emits a failure per attempt and one job_dead_lettered', async () => {
-    const metrics = new FakeMetrics();
-    const env = await funnelEnv(metrics);
+    const env = await funnelEnv();
     const job = freshJob();
     for (const step of PROVISIONING_STEP_ORDER) {
       if (step !== 'verify_deploy') job.steps[step].status = 'succeeded';
@@ -272,6 +259,5 @@ describe('synthetic provisioning funnel', () => {
     expect(new Set(failures.map((event) => event.errorCode))).toEqual(new Set(['github_deploy_url_unreachable']));
     expect(events.at(-1)?.errorCode).toBe('github_deploy_url_unreachable');
     expect((await loadProvisioningJob(env.JOBS, JOB_ID))?.status).toBe('dead_letter');
-    expect(metrics.points).toHaveLength(events.length);
   });
 });

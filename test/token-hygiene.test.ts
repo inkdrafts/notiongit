@@ -988,16 +988,9 @@ function queuePhaseFetch(): {
 
 describe('J3 queue pipeline journey', () => {
   test('seven batches: each step spends its own fresh mint, the user token never reappears, every job write keeps the 24h TTL, zero deletes', async () => {
-    const { journey, queueCalls, mintCount, analyticsPoints } = await withCapturedConsole(async (recorder) => {
+    const { journey, queueCalls, mintCount } = await withCapturedConsole(async (recorder) => {
       const driven = await runFullOnboarding();
       expect(driven.responses[3].status).toBe(303);
-
-      const analyticsPoints: unknown[] = [];
-      (driven.env as Record<string, unknown>).PROVISIONING_METRICS = {
-        writeDataPoint: (data: unknown) => {
-          analyticsPoints.push(data);
-        },
-      };
 
       const phase = queuePhaseFetch();
       const originalFetch = globalThis.fetch;
@@ -1034,15 +1027,12 @@ describe('J3 queue pipeline journey', () => {
       expect(funnel.filter((type) => type === 'step_succeeded')).toHaveLength(7);
       expect(funnel.at(-1)).toBe('job_succeeded');
       expect(recorder.reportErrorTexts()).toEqual([]);
-      assertClean('analytics data points', JSON.stringify(analyticsPoints));
-      return { journey: driven, queueCalls: phase.calls, mintCount: phase.mintCount(), analyticsPoints };
+      return { journey: driven, queueCalls: phase.calls, mintCount: phase.mintCount() };
     });
 
     expect(mintCount).toBe(7);
     expect(queueCalls.every((call) => call.authorization !== `Bearer ${GITHUB_USER_TOKEN}`)).toBe(true);
     expect(journey.queue.sent).toEqual(Array.from({ length: 7 }, () => ({ jobId: GITHUB_JOB_ID })));
-    expect(analyticsPoints).toHaveLength(15);
-
     const jobKey = provisioningJobKey(GITHUB_JOB_ID);
     const job = await journey.kv.get<Record<string, unknown>>(jobKey, 'json');
     expect(job?.status).toBe('succeeded');
@@ -1499,12 +1489,12 @@ function srcFiles(directory: string = SRC_DIR): string[] {
 }
 
 describe('static tripwires', () => {
-  test('S1: console.* appears in src/ only in the three sanctioned sinks', () => {
+  test('S1: console.* appears in src/ only in the two sanctioned sinks', () => {
     const offenders = srcFiles()
       .filter((file) => /console\./u.test(readFileSync(file, 'utf8')))
       .map((file) => relative(SRC_DIR, file))
       .sort();
-    expect(offenders).toEqual(['observability-alerts.ts', 'observability.ts', 'safe-serialize.ts']);
+    expect(offenders).toEqual(['observability.ts', 'safe-serialize.ts']);
   });
 
   test('S2: no error message in src/ is built from interpolation or concatenation', () => {

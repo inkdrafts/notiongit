@@ -1,5 +1,11 @@
 # ADR 0004: Two observability sinks over one event schema
 
+> **Superseded 2026-09-05.** The owner removed the Analytics Engine sink,
+> its alert check, and the cron path so the project runs entirely on the
+> Cloudflare free tier; the event stream is the Workers Logs line only.
+> Kept unmodified as the design record — `git log -- src/observability-alerts.ts`
+> holds the removed implementation.
+
 - Status: Accepted
 - Date: 2026-09-03
 - Decision: Emit every provisioning funnel event twice from one typed schema —

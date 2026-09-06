@@ -15,27 +15,19 @@ those rows put in force.
 2. **Dead letters.** Any `job_dead_lettered` is one user whose site never
    published. Triage per [`observability.md`](observability.md#incident-triage)
    §Incident triage, step by step, starting from the `jobId`.
-3. **Alerts.** Inactive on the free tier (see "Enablement" below); triage
-   starts from Workers Logs and the dead-letter queue instead. With the paid
-   tier and the cron trigger enabled, the webhook delivers step failure rate,
-   dead-letter, and rate-limit alerts hourly. Alerts carry no `jobId`, so
-   step 1 of triage turns them into job ids from Workers Logs.
+3. **Alerts.** None. The Analytics Engine alert path was removed with the
+   2026-09-05 free-tier decision; triage starts from Workers Logs and the
+   dead-letter queue ([`observability.md`](observability.md)).
 4. **Provider status.** GitHub and Notion incidents masquerade as funnel
    failures. Check provider status pages before changing anything
    (admission-runbook "Roll back safely", step 3).
 
 ## Enablement
 
-These steps happen at launch; each is pending in the checklist until done.
-The alert-specific steps are deferred with the paid tier (owner decision
-2026-09-05; the recipe is in [`observability.md`](observability.md#re-enabling-the-paid-tier)):
+These steps happen at launch; each is pending in the checklist until done:
 
 - [ ] Deploy merged `main` to production (#86) and confirm the funnel's
       `job_queued` through `job_succeeded` lines reach Workers Logs.
-- [ ] Deferred with the paid tier: enable Analytics Engine, set
-      `CF_ANALYTICS_API_TOKEN` and `OBSERVABILITY_ALERT_WEBHOOK_URL`, verify
-      the SQL row shape with `scripts/drill-alerts.ts`, uncomment the cron,
-      and fire one synthetic breach with `--dead-letter-threshold 0`.
 
 ## Rollback ladder
 

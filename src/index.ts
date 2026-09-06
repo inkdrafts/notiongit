@@ -63,7 +63,6 @@ import {
 } from './provisioning-throttle';
 import { processProvisioningMessage } from './provisioning-queue';
 import { emitProvisioningEvent } from './observability';
-import { runObservabilityAlertCheck } from './observability-alerts';
 import {
   beginNotionAuthorization,
   finishNotionCallback,
@@ -248,26 +247,9 @@ export type { ProvisioningStepHandler, StepRunnerContext } from './provisioning-
 
 export { emitProvisioningEvent, OBSERVABILITY_EVENT_FIELDS } from './observability';
 export type {
-  ObservabilityEnv,
   ProvisioningEvent,
   ProvisioningEventErrorCode,
 } from './observability';
-
-export {
-  DEFAULT_ALERT_THRESHOLDS,
-  evaluateObservabilityAlerts,
-  runObservabilityAlertCheck,
-  summarizeAlertWindow,
-} from './observability-alerts';
-export type {
-  AlertCheckEnv,
-  AlertThresholds,
-  AlertWindowSummary,
-  AnalyticsEngineSqlResponse,
-  AnalyticsEngineSqlRow,
-  ObservabilityAlert,
-  StepFailureWindow,
-} from './observability-alerts';
 
 export { classifyProvisioningError, processProvisioningMessage } from './provisioning-queue';
 export type {
@@ -468,10 +450,6 @@ export interface Env extends ProvisioningThrottleVars {
   JOBS: KVNamespace;
   /** Work queue for resumable provisioning jobs. */
   PROVISIONING_QUEUE: Queue<ProvisioningMessage>;
-  /** Aggregate provisioning-funnel metrics (`src/observability.ts`). */
-  PROVISIONING_METRICS?: AnalyticsEngineDataset;
-  /** Non-secret Cloudflare account ID, read only by the alert check's SQL query. */
-  CLOUDFLARE_ACCOUNT_ID?: string;
   /** Non-secret GitHub App identifier from the App settings. */
   GITHUB_APP_ID: string;
   /** Non-secret GitHub App slug used to build the installation URL. */
@@ -988,7 +966,7 @@ export function continueNotionOnboarding(
       // already durable, so re-authorizing Notion for this job comes back
       // here and retries only the handoff. Marking the job dead — or
       // reporting success — would strand it with nothing able to advance it.
-      emitProvisioningEvent(env, {
+      emitProvisioningEvent({
         type: 'job_enqueue_failed',
         jobId,
         ts: Date.now(),
@@ -1007,7 +985,7 @@ export function continueNotionOnboarding(
     if (handedOff?.status === 'awaiting_notion') {
       await saveProvisioningJob(env.JOBS, { ...handedOff, status: 'queued', updatedAt: queuedAt });
     }
-    emitProvisioningEvent(env, { type: 'job_queued', jobId, ts: queuedAt });
+    emitProvisioningEvent({ type: 'job_queued', jobId, ts: queuedAt });
   };
 }
 
@@ -1168,12 +1146,6 @@ const worker: ExportedHandler<Env, ProvisioningMessage> = {
         message.retry();
       }
     }
-  },
-
-  // Inert until the alert secrets are set, and `wrangler.toml` ships its cron
-  // trigger commented out, so nothing invokes this on a schedule yet.
-  async scheduled(_controller, env) {
-    await runObservabilityAlertCheck(env);
   },
 };
 

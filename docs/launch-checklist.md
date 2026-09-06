@@ -17,7 +17,6 @@ bun run scripts/launch-gate.ts                       # against production
 bun run scripts/launch-gate.ts http://127.0.0.1:8787 # against a deployment
 bun run scripts/license-audit.ts
 bun run scripts/drill-admission-control.ts <staging URL> <staging JOBS namespace id>
-bun run scripts/drill-alerts.ts <dataset> <webhook URL>
 git diff --check
 ```
 
@@ -43,8 +42,8 @@ runs (2026-09-05):
 | Run | Result | Reading |
 | --- | --- | --- |
 | Against current code served locally | 13/14. The one failure is the callback route answering 500 with the error page, which is what an unconfigured environment returns; a deployed Worker with its secrets returns 400 for the same request | The code under review passes every URL check it can answer |
-| Against production (`notiongit.notiongit.workers.dev`) | 5/14. healthz, the public App, and the three repositories pass. The landing page, policies, and callback checks fail because production runs the 2026-09-01 foundation deploy and has not received any code since | **Production is stale.** Deploy merged `main` (with this PR) before any launch step, then re-run for the full 14/14 |
-| Against staging (`notiongit-staging.notiongit.workers.dev`), 2026-09-05 | 14/14, including the callback-route check the local run cannot answer | Current `main` passes every URL check when the environment carries its secrets. The staging deploy ran a config identical to what `wrangler.toml` became after the 2026-09-05 free-tier decision removed the Analytics Engine bindings |
+| Against production (`notiongit.notiongit.workers.dev`), 2026-09-05 after the deploy below | 14/14 — the first full-green production run. Until this deploy, production ran the 2026-09-01 foundation deploy and scored 5/14 | Production serves current code; what remains is the custom domain and the provider callback re-registration |
+| Against staging (`notiongit-staging.notiongit.workers.dev`), 2026-09-05 | 14/14, including the callback-route check the local run cannot answer | Current `main` passes every URL check when the environment carries its secrets. The staging deploy ran the same configuration shape `wrangler.toml` has since the 2026-09-05 free-tier decision |
 
 | Item | Evidence | Status |
 | --- | --- | --- |
@@ -66,7 +65,7 @@ each with its evidence. The dependency/license audit is automated:
 | Threat-model review | Reviews doc §3 | PASS |
 | Backup and rollback review | Reviews doc §4 | PASS |
 | Incident drill: kill switch exercised in staging | `bun run scripts/drill-admission-control.ts` against staging, 2026-09-05: 6/6 steps. Baseline admits (302 to github.com); `kill` refuses with 503 `provisioning_rejected` and writes a `global_kill` audit record; `pause` holds with 503 `provisioning_paused` and a `global_pause` audit record; resume with `active` admits again | PASS |
-| Incident drill: alert path exercised | The drill is a command: `bun run scripts/drill-alerts.ts`, proven offline (both alert kinds fire and reach the webhook; a string `count` is flagged as the silent row-drop it would be). **Waived 2026-09-05, owner decision**: the project runs on the Cloudflare free tier, so the Analytics Engine dataset, its alert check, and its cron stay undeployed; incident triage uses free Workers Logs and the dead-letter queue. The re-enable recipe lives in `observability.md` | WAIVED |
+| Incident drill: alert path exercised | **Waived 2026-09-05, owner decision**: the Analytics Engine dataset, its alert check, and the drill were removed from the codebase so the project runs entirely on the Cloudflare free tier. Incident triage uses free Workers Logs and the dead-letter queue ([`observability.md`](observability.md)); the design survives in ADR 0004 and git history if it is ever wanted again | WAIVED |
 
 ## D. Provider and funnel verification
 
@@ -82,8 +81,8 @@ each with its evidence. The dependency/license audit is automated:
 
 | Item | Evidence | Status |
 | --- | --- | --- |
-| Deploy merged `main` to production | `bun run build` dry-run passes. The 2026-09-05 free-tier decision removed the Analytics Engine bindings, so no paid plan is needed; the deploy itself needs the `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets (not yet set, `gh secret set`, never commit them) or an operator deploying from a machine with Cloudflare access | PENDING |
-| `inkdrafts.com` serves the Worker | Custom-domain routing is configured in the Cloudflare dashboard, not in `wrangler.toml`; after DNS, `https://inkdrafts.com/healthz` must answer. Until then production is `https://notiongit.notiongit.workers.dev` | PENDING |
+| Deploy merged `main` to production | Deployed 2026-09-05 from the `remove-analytics-engine` tree (version `c6c14632`) with the account's Cloudflare identity; no paid plan involved since the Analytics Engine bindings are gone. The repository deploy secrets are still unset, so the manual Deploy workflow cannot run until `gh secret set` supplies them | PASS |
+| `inkdrafts.com` serves the Worker | Custom-domain routing is a dashboard step (Workers & Pages → `notiongit` → Settings → Domains & Routes → Add Custom Domain); after it, `https://inkdrafts.com/healthz` must answer. Until then production is `https://notiongit.notiongit.workers.dev` | PENDING |
 | Full launch-gate run is green against the final production domain | `bun run scripts/launch-gate.ts https://inkdrafts.com` (or the workers.dev origin if launch precedes DNS) after the deploy row passes | PENDING |
 | Production OAuth/install/provisioning smoke test | Repeat a real onboarding on a fresh account per [`rehearsal-script.md`](rehearsal-script.md) run A, after the deploy and DNS rows | PENDING |
 
