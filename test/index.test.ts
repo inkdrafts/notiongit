@@ -17,10 +17,12 @@ import {
   saveProvisioningJob,
   selectGithubRepositoryDestination,
   selectRepositoryDestination,
+  signGithubState,
   type Env,
   type GlobalRateState,
   type ProvisioningJob,
   type ProvisioningMessage,
+  type SignedStatePayload,
 } from '../src/index';
 import worker from '../src/index';
 
@@ -262,6 +264,14 @@ describe('HTTP foundation', () => {
 
     expect(response.status).toBe(404);
     expect(response.headers.get('content-type')).toContain('application/json');
+  });
+
+  test('redirects plaintext requests to HTTPS ahead of every route', async () => {
+    for (const path of ['/', '/healthz', '/connect/github']) {
+      const response = route(new Request(`http://example.com${path}`));
+      expect(response.status).toBe(301);
+      expect(response.headers.get('location')).toBe(`https://example.com${path}`);
+    }
   });
 });
 
@@ -753,6 +763,22 @@ describe('GitHub App install and authorize flow', () => {
       env,
     );
     await expectErrorPage(missing, 400, 'github_installation_missing');
+  });
+
+  test('reports a well-signed state past its expiry as expired, not tampered', async () => {
+    const env = await githubEnv();
+    const payload: SignedStatePayload = {
+      v: 1,
+      jobId: 'job-123',
+      nonce: crypto.randomUUID(),
+      exp: Math.floor(Date.now() / 1000) - 1,
+    };
+    const state = await signGithubState(payload, 'client-secret');
+    const expired = await route(
+      new Request(`https://example.com/auth/github/callback?state=${encodeURIComponent(state)}`),
+      env,
+    );
+    await expectErrorPage(expired, 400, 'github_state_expired');
   });
 });
 

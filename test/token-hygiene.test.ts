@@ -597,7 +597,7 @@ async function driveNotionCallback(options: {
 }
 
 describe('J1 Notion callback journey', () => {
-  test('happy path: the canary token authenticates only Notion calls and is sealed into Actions secrets; retention is 600/3600/86400', async () => {
+  test('happy path: the canary token authenticates only Notion calls and is sealed into Actions secrets; retention is 3600/3600/86400', async () => {
     const journey = await withCapturedConsole(async (recorder) => {
       const driven = await driveNotionCallback();
       assertJourneyClean(driven, recorder);
@@ -638,11 +638,11 @@ describe('J1 Notion callback journey', () => {
     // The handoff happens here: the Notion callback is what enqueues the job.
     expect(journey.queue.sent).toEqual([{ jobId: NOTION_JOB_ID }]);
 
-    // Retention: state pending 600s then consumed 3600s; resolution 86400s;
+    // Retention: state pending 3600s then consumed 3600s; resolution 86400s;
     // every job write 86400s.
     const stateKeys = journey.kv.keysWithPrefix(NOTION_STATE_PREFIX);
     expect(stateKeys).toHaveLength(1);
-    expect(journey.kv.ttlLog(stateKeys[0])).toEqual([600, 3600]);
+    expect(journey.kv.ttlLog(stateKeys[0])).toEqual([3600, 3600]);
     expect(journey.kv.ttlLog(`${NOTION_TEMPLATE_RESOLUTION_PREFIX}${NOTION_JOB_ID}`))
       .toEqual([NOTION_TEMPLATE_RESOLUTION_TTL_SECONDS]);
     const jobTtls = journey.kv.ttlLog(provisioningJobKey(NOTION_JOB_ID));
@@ -706,7 +706,7 @@ beforeAll(async () => {
 // ---------------------------------------------------------------------------
 // J2 — GitHub callback end-to-end through `route()`: user token spent only in
 // the synchronous phase, queue message is exactly {jobId}, retention
-// 600 -> 3600 for state and 86400 for the job record.
+// 3600 for state (pending and consumed alike) and 86400 for the job record.
 // ---------------------------------------------------------------------------
 
 async function runGithubOnboarding(options: {
@@ -840,7 +840,7 @@ async function runFullOnboarding(): Promise<Journey & { env: Partial<Env> }> {
 }
 
 describe('J2 GitHub callback journey', () => {
-  test('happy path: user token spent only on the synchronous calls; the browser is sent on to Notion with nothing queued; retention 600/3600/86400', async () => {
+  test('happy path: user token spent only on the synchronous calls; the browser is sent on to Notion with nothing queued; retention 3600/3600/86400', async () => {
     const journey = await withCapturedConsole(async (recorder) => {
       const driven = await runGithubOnboarding();
       const callback = driven.responses[1];
@@ -872,7 +872,7 @@ describe('J2 GitHub callback journey', () => {
 
     const stateKeys = journey.kv.keysWithPrefix(GITHUB_STATE_PREFIX);
     expect(stateKeys).toHaveLength(1);
-    expect(journey.kv.ttlLog(stateKeys[0])).toEqual([600, 3600]);
+    expect(journey.kv.ttlLog(stateKeys[0])).toEqual([3600, 3600]);
     expect(journey.kv.ttlLog(provisioningJobKey(GITHUB_JOB_ID))).toEqual([PROVISIONING_JOB_TTL_SECONDS]);
     expect(journey.kv.deletes).toEqual([]);
   });
@@ -1112,7 +1112,7 @@ describe('J4 error funnels', () => {
     });
 
     const stateKeys = kv.keysWithPrefix(NOTION_STATE_PREFIX);
-    expect(kv.ttlLog(stateKeys[0])).toEqual([600, 3600]);
+    expect(kv.ttlLog(stateKeys[0])).toEqual([3600, 3600]);
     expect(kv.keysWithPrefix(NOTION_TEMPLATE_RESOLUTION_PREFIX)).toEqual([]);
   });
 
@@ -1251,7 +1251,7 @@ describe('J5 disconnect timeline journey', () => {
     expect(ttls.length).toBeGreaterThanOrEqual(3);
     expect(ttls.every((ttl) => ttl === PROVISIONING_JOB_TTL_SECONDS)).toBe(true);
     const stateKeys = journey.kv.keysWithPrefix(GITHUB_STATE_PREFIX);
-    expect(journey.kv.ttlLog(stateKeys[0])).toEqual([600, 3600]);
+    expect(journey.kv.ttlLog(stateKeys[0])).toEqual([3600, 3600]);
     expect(journey.kv.deletes).toEqual(['github:account-lease:42']);
   });
 });

@@ -58,7 +58,13 @@ const CHECKS: readonly Check[] = [
     name: `policy page ${path} serves`,
     run: async () => {
       const { status, body } = await fetchText(trim(path));
-      const shaped = body.includes('<h1') && body.includes('Skip to content') && !body.includes('<script');
+      // Cloudflare's edge appends its own platform scripts to proxied HTML
+      // after the worker responds (JS Detections, Web Analytics); those two
+      // markers are exempt so the check keeps meaning "the page ships no
+      // scripts of ours".
+      const edgePlatformScript = /<script[^>]*>[^<]*(?:challenge-platform|__CF\$cv\$params|cloudflareinsights)[\s\S]*?<\/script>/u;
+      const withoutEdgeScripts = body.replace(new RegExp(edgePlatformScript, 'gu'), '');
+      const shaped = body.includes('<h1') && body.includes('Skip to content') && !withoutEdgeScripts.includes('<script');
       return status === 200 && shaped ? null : `status ${status}, shaped ${shaped}`;
     },
   })),
