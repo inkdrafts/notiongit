@@ -26,7 +26,9 @@ import {
 export const NOTION_AUTHORIZATION_URL = 'https://api.notion.com/v1/oauth/authorize';
 export const NOTION_TOKEN_URL = 'https://api.notion.com/v1/oauth/token';
 export const NOTION_API_VERSION = '2022-06-28';
-export const NOTION_STATE_TTL_SECONDS = 10 * 60;
+// Matched to the GitHub install state: the Notion authorize leg is also a
+// human-paced journey and may include creating the Notion account itself.
+export const NOTION_STATE_TTL_SECONDS = 60 * 60;
 export const NOTION_STATE_REPLAY_TTL_SECONDS = 60 * 60;
 export const NOTION_STATE_PREFIX = 'notion:oauth-state:';
 export const NOTION_STATE_COOKIE = '__Host-notion-oauth-state';

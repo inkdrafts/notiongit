@@ -473,7 +473,10 @@ export interface GithubIdentity {
 }
 
 const GITHUB_INSTALL_URL = 'https://github.com/apps';
-const STATE_TTL_SECONDS = 10 * 60;
+// One hour, not the OAuth-textbook ten minutes: a first install journey can
+// include creating the GitHub account itself, and an expired state must not
+// be indistinguishable from a tampered one.
+const STATE_TTL_SECONDS = 60 * 60;
 const STATE_REPLAY_TTL_SECONDS = 60 * 60;
 const STATE_PREFIX = 'github:oauth-state:';
 
@@ -521,7 +524,7 @@ function html(document: string, status = 200): Response {
 
 type StatePhase = 'pending' | 'setup_received' | 'consumed';
 
-interface SignedStatePayload {
+export interface SignedStatePayload {
   v: 1;
   jobId: string;
   nonce: string;
@@ -550,7 +553,8 @@ export async function signGithubState(
  * A payload with no `k` kind is an install state, so states signed before
  * the status leg shipped keep verifying across a deploy. Status-leg payloads
  * carry a `k` mark and are refused here; the callback dispatches on the
- * payload kind before this verifier runs.
+ * payload kind before this verifier runs. Expiry is the caller's report: it
+ * must surface as `github_state_expired`, not collapse into this null.
  */
 async function verifyGithubState(
   encodedState: string,
@@ -560,8 +564,7 @@ async function verifyGithubState(
     payload.k === undefined &&
     payload.v === 1 &&
     typeof payload.jobId === 'string' &&
-    typeof payload.nonce === 'string' &&
-    !payloadExpired(payload.exp, Math.floor(Date.now() / 1000)));
+    typeof payload.nonce === 'string');
 }
 
 function stateSecret(env: Pick<Env, 'GITHUB_CLIENT_SECRET'>): string {
@@ -691,6 +694,9 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
   if (!encodedState) return failureResponse({ code: 'github_state_missing', status: 400, retryAfterSeconds: null });
   const payload = await verifyGithubState(encodedState, stateSecret(env as Pick<Env, 'GITHUB_CLIENT_SECRET'>));
   if (!payload) return failureResponse({ code: 'github_state_invalid', status: 400, retryAfterSeconds: null });
+  if (payloadExpired(payload.exp, Math.floor(Date.now() / 1000))) {
+    return failureResponse({ code: 'github_state_expired', status: 400, retryAfterSeconds: null });
+  }
 
   const record = await env.JOBS.get<GithubStateRecord>(stateKey(payload.nonce), 'json');
   if (!record || record.jobId !== payload.jobId || record.nonce !== payload.nonce || record.version !== 1) {
@@ -1056,6 +1062,14 @@ export function route(
   options: NotionOAuthRouteOptions = {},
 ): Response | Promise<Response> {
   const url = new URL(request.url);
+
+  // A custom domain serves plaintext until the zone's Always Use HTTPS is
+  // enabled — a dashboard setting deploy automation cannot reach — so the
+  // redirect is owned here, ahead of every route.
+  if (url.protocol === 'http:') {
+    url.protocol = 'https:';
+    return new Response(null, { status: 301, headers: { Location: url.toString() } });
+  }
 
   if (request.method === 'GET' && url.pathname === '/') {
     return html(LANDING_PAGE);
