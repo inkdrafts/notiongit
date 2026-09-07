@@ -32,8 +32,19 @@ interface GithubUserResponse {
   type?: string;
 }
 
+interface GithubInstallationSummary {
+  id?: number;
+  app_id?: number;
+  app_slug?: string;
+  account?: { id?: number; login?: string; type?: string };
+  suspended_at?: string | null;
+  suspended_by?: unknown;
+}
+
 interface GithubInstallationsResponse {
-  installations?: Array<{ id?: number; app_id?: number; app_slug?: string; account?: { id?: number } }>;
+  // The item shape mirrors GithubInstallationAccount so the list response can
+  // stand in for per-installation reads.
+  installations?: GithubInstallationSummary[];
 }
 
 interface GithubAccessTokenResponse {
@@ -53,10 +64,15 @@ export class GithubApiError extends Error {
 
 const GITHUB_API = 'https://api.github.com';
 const GITHUB_API_VERSION = '2022-11-28';
+const GITHUB_USER_AGENT = 'InkDrafts (https://github.com/inkdrafts/notiongit)';
 
 function githubHeaders(authorization?: string): Headers {
   const headers = new Headers({
     Accept: 'application/vnd.github+json',
+    // GitHub rejects api.github.com requests without a User-Agent with a
+    // bare 403, and workerd's fetch sends none by default — every caller
+    // must go through this helper so the header is always present.
+    'User-Agent': GITHUB_USER_AGENT,
     'X-GitHub-Api-Version': GITHUB_API_VERSION,
   });
   if (authorization) headers.set('Authorization', authorization);
@@ -100,6 +116,7 @@ export async function exchangeGithubCode(
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': GITHUB_USER_AGENT,
     },
     body,
   });
@@ -123,17 +140,8 @@ export async function getAuthenticatedGithubUser(authorization: string): Promise
   return { id: id as number, login: login as string, accountType: type as 'User' | 'Organization' };
 }
 
-export async function getUserInstallation(
-  authorization: string,
-  installationId: number,
-): Promise<GithubInstallationAccount> {
-  return githubRequest<GithubInstallationAccount>(`/user/installations/${installationId}`, {
-    headers: githubHeaders(authorization),
-  });
-}
-
 /**
- * The id of the user's installation of the App. `/user/installations` also
+ * The user's installation record of the App. `/user/installations` also
  * lists organization installations the account can access, in unspecified
  * order, so `preferredAccountId` selects the installation owned by the
  * authenticated user when one exists; callers that prove the account first
@@ -143,22 +151,52 @@ export async function findUserInstallation(
   authorization: string,
   appId: string,
   preferredAccountId?: number,
-): Promise<number> {
+): Promise<GithubInstallationAccount & { id: number }> {
+  const installation = await findInstallation(appId, undefined, authorization, preferredAccountId);
+  return installation as GithubInstallationAccount & { id: number };
+}
+
+/**
+ * Reads one installation of this App the user has access to, by id. GitHub's
+ * `GET /user/installations/{id}` answers 404 for user tokens even when the
+ * list endpoint returns the installation, so the record is taken from the
+ * list instead.
+ */
+export async function findInstallationRecord(
+  authorization: string,
+  appId: string,
+  installationId: number,
+): Promise<GithubInstallationAccount & { id: number }> {
+  const installation = await findInstallation(appId, installationId, authorization);
+  return installation as GithubInstallationAccount & { id: number };
+}
+
+async function findInstallation(
+  appId: string,
+  requiredId: number | undefined,
+  authorization: string,
+  preferredAccountId?: number,
+): Promise<GithubInstallationAccount> {
   const response = await githubRequest<GithubInstallationsResponse>('/user/installations', {
     headers: githubHeaders(authorization),
   });
   const matches = (response.installations ?? []).filter(
     (candidate) => Number(candidate.app_id) === Number(appId) && Number.isSafeInteger(candidate.id) && candidate.id! > 0,
   );
-  const own = matches.find(
-    (candidate) =>
-      preferredAccountId !== undefined &&
-      Number.isSafeInteger(candidate.account?.id) &&
-      candidate.account!.id === preferredAccountId,
-  );
-  const installation = own ?? matches[0];
+  let installation: GithubInstallationSummary | undefined;
+  if (requiredId !== undefined) {
+    installation = matches.find((candidate) => candidate.id === requiredId);
+  } else {
+    const own = matches.find(
+      (candidate) =>
+        preferredAccountId !== undefined &&
+        Number.isSafeInteger(candidate.account?.id) &&
+        candidate.account!.id === preferredAccountId,
+    );
+    installation = own ?? matches[0];
+  }
   if (!installation?.id) throw new GithubApiError(404);
-  return installation.id;
+  return installation;
 }
 
 function installationIdentity(

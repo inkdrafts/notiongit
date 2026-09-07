@@ -57,6 +57,9 @@ const GITHUB_LOGIN = /^[A-Za-z0-9-]{1,39}$/u;
 function githubHeaders(accessToken: string): Headers {
   return new Headers({
     Accept: 'application/vnd.github+json',
+    // GitHub rejects api.github.com requests without a User-Agent with a
+    // bare 403, and workerd's fetch sends none by default.
+    'User-Agent': 'InkDrafts (https://github.com/inkdrafts/notiongit)',
     Authorization: `Bearer ${accessToken}`,
     'X-GitHub-Api-Version': GITHUB_API_VERSION,
   });
