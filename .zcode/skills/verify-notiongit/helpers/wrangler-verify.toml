@@ -1,0 +1,63 @@
+# Verification scaffolding, shipped by .zcode/skills/verify-notiongit.
+# Local-only config for driving the real worker over HTTP. Never deploy with
+# this file: pass it to wrangler only via
+#   wrangler dev --config .zcode/skills/verify-notiongit/helpers/wrangler-verify.toml
+#
+# It differs from the repo's wrangler.toml in exactly two ways:
+# 1. `main` points at verify-entry.ts (same directory), which re-exports only
+#    the default handler so workerd can start despite the barrel re-exports
+#    in src/index.ts.
+# 2. OAuth secrets are inline placeholder values (never real credentials), so
+#    no .dev.vars is needed to boot. Every route that only renders or reads
+#    local KV works as-is; routes that mint provider redirects produce the
+#    real redirect shape with a placeholder client id.
+
+name = "notiongit-verify"
+main = "verify-entry.ts"
+compatibility_date = "2026-08-31"
+
+[alias]
+libsodium = "../../../../src/libsodium-worker.ts"
+libsodium-raw = "../../../../spikes/libsodium-workers/node_modules/libsodium/dist/modules-esm/libsodium.mjs"
+
+[vars]
+GITHUB_APP_ID = "local-placeholder"
+GITHUB_APP_SLUG = "local-placeholder"
+GITHUB_APP_PRIVATE_KEY = "local-placeholder"
+GITHUB_CLIENT_ID = "local-placeholder"
+GITHUB_CLIENT_SECRET = "local-placeholder"
+NOTION_CLIENT_ID = "local-placeholder"
+NOTION_CLIENT_SECRET = "local-placeholder"
+PROVISIONING_MUTATIONS_PER_MINUTE = "30"
+PROVISIONING_MUTATIONS_PER_HOUR = "240"
+PROVISIONING_LEASE_TTL_SECONDS = "1800"
+PROVISIONING_CONTROL_MODE = "active"
+PROVISIONING_PAUSED_STAGES = ""
+PROVISIONING_REJECTED_STAGES = ""
+PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_SECONDS = "86400"
+PROVISIONING_ACCOUNT_ATTEMPT_LIMIT = "3"
+PROVISIONING_REQUEST_BURST_WINDOW_SECONDS = "60"
+PROVISIONING_REQUEST_BURST_LIMIT = "10"
+PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS = "3600"
+PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS = "604800"
+CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
+PROVISIONING_METRICS_DATASET = "notiongit_verify_provisioning_events"
+
+[[analytics_engine_datasets]]
+binding = "PROVISIONING_METRICS"
+dataset = "notiongit_verify_provisioning_events"
+
+# Local mode simulates KV in memory; the id is only a namespace key.
+[[kv_namespaces]]
+binding = "JOBS"
+id = "verify-local-jobs"
+
+[[queues.producers]]
+binding = "PROVISIONING_QUEUE"
+queue = "notiongit-verify-provisioning"
+
+[[queues.consumers]]
+queue = "notiongit-verify-provisioning"
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 6

@@ -1,0 +1,65 @@
+# Verification scaffolding, shipped by .zcode/skills/verify-notiongit.
+# Local-only config for the OAuth replay rig: it boots the real worker with
+# replay-entry.ts, which rewrites every request's origin to
+# https://inkdrafts.com so minted redirect URIs match GitHub's callback
+# registration. Never deploy with this file.
+#
+# It differs from the repo's wrangler.toml in exactly two ways:
+# 1. `main` points at replay-entry.ts (same directory), which re-exports only
+#    the default handler so workerd can start despite the barrel re-exports
+#    in src/index.ts, and rewrites request origins for the replay.
+# 2. Credentials come from .dev.vars in this directory (gitignored, real
+#    values owned by the account operators). wrangler only loads a .dev.vars
+#    that sits next to the config it is given, which is why this rig lives in
+#    its own directory: the plain verification instance must never pick these
+#    credentials up.
+
+name = "notiongit-replay"
+main = "replay-entry.ts"
+compatibility_date = "2026-08-31"
+
+[alias]
+libsodium = "../../../../../src/libsodium-worker.ts"
+libsodium-raw = "../../../../../spikes/libsodium-workers/node_modules/libsodium/dist/modules-esm/libsodium.mjs"
+
+[vars]
+GITHUB_APP_ID = "local-placeholder"
+GITHUB_APP_SLUG = "local-placeholder"
+GITHUB_APP_PRIVATE_KEY = "local-placeholder"
+GITHUB_CLIENT_ID = "local-placeholder"
+GITHUB_CLIENT_SECRET = "local-placeholder"
+NOTION_CLIENT_ID = "local-placeholder"
+NOTION_CLIENT_SECRET = "local-placeholder"
+PROVISIONING_MUTATIONS_PER_MINUTE = "30"
+PROVISIONING_MUTATIONS_PER_HOUR = "240"
+PROVISIONING_LEASE_TTL_SECONDS = "1800"
+PROVISIONING_CONTROL_MODE = "active"
+PROVISIONING_PAUSED_STAGES = ""
+PROVISIONING_REJECTED_STAGES = ""
+PROVISIONING_ACCOUNT_ATTEMPT_WINDOW_SECONDS = "86400"
+PROVISIONING_ACCOUNT_ATTEMPT_LIMIT = "3"
+PROVISIONING_REQUEST_BURST_WINDOW_SECONDS = "60"
+PROVISIONING_REQUEST_BURST_LIMIT = "10"
+PROVISIONING_DENIED_IDENTITY_COOLDOWN_SECONDS = "3600"
+PROVISIONING_ADMISSION_AUDIT_TTL_SECONDS = "604800"
+CLOUDFLARE_ACCOUNT_ID = "58fbcc5baba3339f96fe72fe81f5ee6f"
+PROVISIONING_METRICS_DATASET = "notiongit_verify_provisioning_events"
+
+[[analytics_engine_datasets]]
+binding = "PROVISIONING_METRICS"
+dataset = "notiongit_verify_provisioning_events"
+
+# Local mode simulates KV in memory; the id is only a namespace key.
+[[kv_namespaces]]
+binding = "JOBS"
+id = "verify-local-jobs"
+
+[[queues.producers]]
+binding = "PROVISIONING_QUEUE"
+queue = "notiongit-verify-provisioning"
+
+[[queues.consumers]]
+queue = "notiongit-verify-provisioning"
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 6
