@@ -1,0 +1,5 @@
+# Flow evidence contains personal data (account state, repository names,
+# Notion pages). The committed record is docs/rehearsal-report-*.md with
+# redactions applied; raw artifacts stay local.
+*
+!.gitignore
