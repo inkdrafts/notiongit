@@ -39,10 +39,10 @@ import { errorPageResponse, restartHrefFor } from './error-page';
 import {
   assertUsablePersonalInstallation,
   exchangeGithubCode,
+  findInstallationRecord,
   findUserInstallation,
   getAuthenticatedGithubUser,
   GithubApiError,
-  getUserInstallation,
 } from './github-user-auth';
 import { payloadExpired, signSignedPayload, verifySignedPayload } from './signed-payload';
 import {
@@ -761,12 +761,18 @@ async function finishGithubCallback(request: Request, env: Partial<Env>): Promis
           jobId: record.jobId,
         }, Date.now());
         if (accountAdmission.action !== 'allow') throw new ProvisioningAdmissionRefusedError(accountAdmission, 'github');
-        if (!selectedInstallationId) {
-          selectedInstallationId = await findUserInstallation(userToken.bearer(), env.GITHUB_APP_ID as string);
-        }
         let userInstallation: GithubInstallationAccount;
         try {
-          userInstallation = await getUserInstallation(userToken.bearer(), selectedInstallationId);
+          if (!selectedInstallationId) {
+            // The record comes from the list endpoint: GitHub's per-id user
+            // endpoint answers 404 for user tokens even when the installation
+            // exists (see findInstallationRecord).
+            const found = await findUserInstallation(userToken.bearer(), env.GITHUB_APP_ID as string);
+            selectedInstallationId = found.id;
+            userInstallation = found;
+          } else {
+            userInstallation = await findInstallationRecord(userToken.bearer(), env.GITHUB_APP_ID as string, selectedInstallationId);
+          }
         } catch (error) {
           if (error instanceof GithubApiError && error.status === 403) {
             await recordProvisioningIdentityDenial(jobs, admissionConfig, { accountId: authenticatedUser.id, reason: 'provider_denied' }, Date.now());

@@ -89,6 +89,9 @@ const GITHUB_API_VERSION = '2022-11-28';
 function githubHeaders(authorization: string): Headers {
   return new Headers({
     Accept: 'application/vnd.github+json',
+    // GitHub rejects api.github.com requests without a User-Agent with a
+    // bare 403, and workerd's fetch sends none by default.
+    'User-Agent': 'InkDrafts (https://github.com/inkdrafts/notiongit)',
     Authorization: authorization,
     'X-GitHub-Api-Version': GITHUB_API_VERSION,
   });

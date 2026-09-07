@@ -106,8 +106,8 @@ async function runProvisioningCallback(options: GenerationMockOptions = {}) {
       if (request.url === 'https://api.github.com/user') {
         return Response.json({ id: 42, login: 'alice', type: 'User' });
       }
-      if (request.url === 'https://api.github.com/user/installations/123') {
-        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+      if (request.url === 'https://api.github.com/user/installations') {
+        return Response.json({ installations: [{ id: 123, app_id: 4798518, account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null, suspended_by: null }] });
       }
       if (request.url.startsWith('https://api.github.com/user/repos?')) {
         return Response.json(options.owned ?? []);
@@ -305,9 +305,9 @@ describe('GitHub App install and authorize flow', () => {
         expect(request.headers.get('authorization')).toBe('Bearer user-token');
         return Response.json({ id: 42, login: 'alice', type: 'User' });
       }
-      if (request.url === 'https://api.github.com/user/installations/123') {
+      if (request.url === 'https://api.github.com/user/installations') {
         expect(request.headers.get('authorization')).toBe('Bearer user-token');
-        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+        return Response.json({ installations: [{ id: 123, app_id: 4798518, account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null, suspended_by: null }] });
       }
       if (request.url.startsWith('https://api.github.com/user/repos?')) {
         expect(request.headers.get('authorization')).toBe('Bearer user-token');
@@ -404,8 +404,8 @@ describe('GitHub App install and authorize flow', () => {
       if (request.url === 'https://api.github.com/user') {
         return Response.json({ id: 42, login: 'alice', type: 'User' });
       }
-      if (request.url === 'https://api.github.com/user/installations/123') {
-        return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+      if (request.url === 'https://api.github.com/user/installations') {
+        return Response.json({ installations: [{ id: 123, app_id: 4798518, account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null, suspended_by: null }] });
       }
       if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
       if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') {
@@ -578,7 +578,7 @@ describe('GitHub App install and authorize flow', () => {
       const request = new Request(input, init);
       if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
       if (request.url === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
-      if (request.url === 'https://api.github.com/user/installations/123') return Response.json({ account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null });
+      if (request.url === 'https://api.github.com/user/installations') return Response.json({ installations: [{ id: 123, app_id: 4798518, account: { id: 42, login: 'alice', type: 'User' }, suspended_at: null, suspended_by: null }] });
       if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
       if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
       if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/generate') return Response.json(generatedRepositoryBody('alice.github.io'), { status: 201 });
@@ -669,7 +669,7 @@ describe('GitHub App install and authorize flow', () => {
       const request = new Request(input, init);
       if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
       if (request.url === 'https://api.github.com/user') return Response.json({ id: 43, login: 'bob', type: 'User' });
-      if (request.url === 'https://api.github.com/user/installations/123') return Response.json({ account: { id: 43, login: 'bob', type: 'User' }, suspended_at: null });
+      if (request.url === 'https://api.github.com/user/installations') return Response.json({ installations: [{ id: 123, app_id: 4798518, account: { id: 43, login: 'bob', type: 'User' }, suspended_at: null, suspended_by: null }] });
       if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
       if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
       if (request.url === 'https://api.github.com/repos/inkdrafts/notiongit-template/generate') return Response.json(generatedRepositoryBody('bob.github.io'), { status: 201 });
@@ -708,7 +708,7 @@ describe('GitHub App install and authorize flow', () => {
       const request = new Request(input, init);
       if (request.url === 'https://github.com/login/oauth/access_token') return Response.json({ access_token: 'user-token' });
       if (request.url === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
-      if (request.url === 'https://api.github.com/user/installations/123') return Response.json(installation);
+      if (request.url === 'https://api.github.com/user/installations') return Response.json({ installations: [{ id: 123, app_id: 4798518, ...installation }] });
       if (request.url.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
       throw new Error(`unexpected URL: ${request.url}`);
     };

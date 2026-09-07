@@ -477,7 +477,7 @@ async function canaryEnv(kv: RecordingKV, queue: RecordingQueue): Promise<Partia
   return {
     JOBS: kv as unknown as KVNamespace,
     PROVISIONING_QUEUE: queue as unknown as Queue<ProvisioningMessage>,
-    GITHUB_APP_ID: 'synthetic-app-id',
+    GITHUB_APP_ID: '123', // numeric: findInstallation filters list entries by Number(app_id)
     GITHUB_APP_SLUG: 'inkdrafts',
     GITHUB_APP_PRIVATE_KEY: await generateThrowawayPrivateKey(),
     GITHUB_CLIENT_ID: 'synthetic-github-client-id',
@@ -723,8 +723,13 @@ async function runGithubOnboarding(options: {
     token_type: 'bearer',
   }));
   const installation = options.installation ?? (() => Response.json({
-    account: { id: 42, login: 'alice', type: 'User' },
-    suspended_at: null,
+    installations: [{
+      id: 123,
+      app_id: 123,
+      account: { id: 42, login: 'alice', type: 'User' },
+      suspended_at: null,
+      suspended_by: null,
+    }],
   }));
   const generate = options.generate ?? (() => Response.json({
     id: 1001,
@@ -745,7 +750,7 @@ async function runGithubOnboarding(options: {
       return result;
     }
     if (url.href === 'https://api.github.com/user') return Response.json({ id: 42, login: 'alice', type: 'User' });
-    if (url.href === 'https://api.github.com/user/installations/123') return installation();
+    if (url.href === 'https://api.github.com/user/installations') return installation();
     if (url.href.startsWith('https://api.github.com/user/repos?')) return Response.json([]);
     if (url.href === 'https://api.github.com/repos/inkdrafts/notiongit-template/commits/main') {
       return Response.json({ sha: 'template-head-sha', commit: { tree: { sha: 'template-tree-sha' } } });
@@ -881,8 +886,12 @@ describe('J2 GitHub callback journey', () => {
     const journey = await withCapturedConsole(async (recorder) => {
       const driven = await runGithubOnboarding({
         installation: () => Response.json({
-          account: { id: 42, login: 'alice', type: 'User' },
-          suspended_at: '2026-09-02T00:00:00Z',
+          installations: [{
+            id: 123,
+            app_id: 123,
+            account: { id: 42, login: 'alice', type: 'User' },
+            suspended_at: '2026-09-02T00:00:00Z',
+          }],
         }),
       });
       const callback = driven.responses[1];

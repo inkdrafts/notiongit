@@ -743,7 +743,7 @@ export async function statusCallback(request: Request, env: Partial<StatusEnv>):
       new URL('/auth/github/callback', request.url).toString(),
     );
     const authenticatedUser = await getAuthenticatedGithubUser(userToken.bearer());
-    const installationId = await findUserInstallation(userToken.bearer(), GITHUB_APP_ID, authenticatedUser.id);
+    const installationId = (await findUserInstallation(userToken.bearer(), GITHUB_APP_ID, authenticatedUser.id)).id;
     const session: StatusSession = {
       v: 1,
       accountId: authenticatedUser.id,
